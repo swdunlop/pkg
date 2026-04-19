@@ -1,0 +1,52 @@
+# jsonfacts config for LDBC FinBench cyclic-ownership analysis.
+#
+# Run setup.sh first to download the SF0.01 dataset and convert to JSONL.
+# Then:
+#   datalog -c finbench.yaml -d . rules.dl
+#
+# IDs are kept as strings (they are identifiers, not quantities).
+
+sources:
+  - file: data/jsonl/person_own_account.jsonl
+    mappings:
+      - predicate: person_own_account
+        args:
+          - "value.personId"
+          - "value.accountId"
+
+  - file: data/jsonl/account_transfer.jsonl
+    mappings:
+      - predicate: account_transfer
+        args:
+          - "value.fromId"
+          - "value.toId"
+          - "value.amount"
+
+  # Optional: entity attributes for richer queries.
+  - file: data/jsonl/person.jsonl
+    mappings:
+      - predicate: person_name
+        args:
+          - "value.personId"
+          - "value.personName"
+
+  - file: data/jsonl/company_own_account.jsonl
+    mappings:
+      - predicate: company_own_account
+        args:
+          - "value.companyId"
+          - "value.accountId"
+
+  - file: data/jsonl/company.jsonl
+    mappings:
+      - predicate: company_name
+        args:
+          - "value.companyId"
+          - "value.companyName"
+
+  - file: data/jsonl/account.jsonl
+    mappings:
+      - predicate: account_type
+        args:
+          - "value.accountId"
+          - "value.accoutType"

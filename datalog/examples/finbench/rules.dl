@@ -1,0 +1,40 @@
+% Cyclic ownership detection over LDBC FinBench data.
+%
+% Based on the DuckPGQ FinBench example:
+%   https://duckdb.org/2025/10/22/duckdb-graph-queries-duckpgq
+
+% -- Base predicates -----------------------------------------------
+% Unify person and company ownership into a single "owns" relation.
+owns(Owner, Account) :- person_own_account(Owner, Account).
+owns(Owner, Account) :- company_own_account(Owner, Account).
+
+% Drop the amount column for transfer reachability.
+transfer(From, To) :- account_transfer(From, To, _).
+
+% -- Transitive closure of transfers (depth-free) ------------------
+% Bounded by |accounts|^2 -- no exponential blowup from path-length
+% tracking. Use depth-free reachability for cycle detection; add a
+% separate shortest-path aggregate if lengths are needed.
+reachable(From, To) :- transfer(From, To).
+reachable(From, To) :- reachable(From, Mid), transfer(Mid, To).
+
+% -- Cycle detection -----------------------------------------------
+% An owner has a cycle when two of their accounts are connected
+% by a chain of transfers.
+cycle(Owner, A1, A2) :-
+    owns(Owner, A1),
+    owns(Owner, A2),
+    A1 != A2,
+    reachable(A1, A2).
+
+% -- Example queries -----------------------------------------------
+% Find all cycles:
+%   ?- cycle(Owner, A1, A2).
+%
+% Count how many owners have cycles:
+%   has_cycle(Owner) :- cycle(Owner, _, _).
+%   cycle_count(N) :- N = count : has_cycle(_).
+%   ?- cycle_count(N).
+%
+% Look up the person name for a cycle owner:
+%   ?- cycle(Owner, A1, A2), person_name(Owner, Name).
