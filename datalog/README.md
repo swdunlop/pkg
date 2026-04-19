@@ -198,7 +198,50 @@ Comments start with `%`. Anonymous variables use `?`.
 | Comparison | `X != Y`, `Amt > 1000`, `X <= Y` |
 | Arithmetic | `Y is X * 2 + 1` |
 | Aggregate | `N = count : pred(X).` / `T = sum(V) : pred(X, V).` |
-| Builtin | `@contains(Str, "needle")` |
+| Builtin (constraint) | `@contains(Str, "needle")` |
+| Builtin (binding) | `@time_diff(T2, T1, D)` |
+
+### Custom Builtins
+
+Register custom binding builtins with `WithBuiltin` to extend the engine with application-specific functions. In rule bodies, all arguments except the last are inputs; the last is the output variable:
+
+```go
+engine := seminaive.New(
+    seminaive.WithBuiltin("@double", func(inputs []any) (any, bool) {
+        v, ok := inputs[0].(int64)
+        if !ok { return nil, false }
+        return v * 2, true
+    }),
+)
+```
+
+```prolog
+doubled(Name, D) :- val(Name, V), @double(V, D).
+```
+
+Builtin names start with `@` by convention. Inputs are resolved Go values (`int64`, `float64`, `string`, or `datalog.ID`). The package includes `seminaive.TimeDiff` for computing timestamp differences in seconds:
+
+```go
+engine := seminaive.New(seminaive.WithBuiltin("@time_diff", seminaive.TimeDiff))
+```
+
+```prolog
+% @time_diff accepts RFC3339 strings or numeric epoch values.
+duration(A, B, D) :- event(A, T1), event(B, T2), @time_diff(T2, T1, D), A != B.
+```
+
+### Profiling
+
+Use `WithProfile` to receive per-stratum evaluation metrics:
+
+```go
+engine := seminaive.New(seminaive.WithProfile(func(stats []seminaive.StratumStats) {
+    for _, s := range stats {
+        fmt.Printf("%v: %d facts in %d iterations (%v)\n",
+            s.Predicates, s.FactCount, s.Iterations, s.Duration)
+    }
+}))
+```
 
 ## Querying Results
 

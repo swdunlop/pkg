@@ -3,6 +3,7 @@ package seminaive
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"swdunlop.dev/pkg/datalog"
 	"swdunlop.dev/pkg/datalog/syntax"
@@ -10,9 +11,26 @@ import (
 
 const defaultMaxIter = 10000
 
+// BuiltinFunc computes a derived value from resolved input arguments.
+// Convention: all args except the last in the atom are inputs; the last is the output.
+// Returns the result value to intern, or (nil, false) if the builtin cannot produce a result.
+type BuiltinFunc func(inputs []any) (any, bool)
+
+// StratumStats records evaluation metrics for a single stratum.
+type StratumStats struct {
+	Predicates []string
+	RuleCount  int
+	AggCount   int
+	FactCount  int
+	Iterations int
+	Duration   time.Duration
+}
+
 // Engine implements syntax.Engine using semi-naive evaluation.
 type Engine struct {
-	maxIter int
+	maxIter  int
+	builtins map[string]BuiltinFunc
+	profile  func([]StratumStats)
 }
 
 var _ syntax.Engine = (*Engine)(nil)
@@ -23,6 +41,23 @@ type Option func(*Engine)
 // WithMaxIterations sets the maximum number of fixpoint iterations.
 func WithMaxIterations(n int) Option {
 	return func(e *Engine) { e.maxIter = n }
+}
+
+// WithBuiltin registers a named binding builtin that can be used in rule bodies.
+// The builtin predicate should start with "@" by convention.
+func WithBuiltin(name string, fn BuiltinFunc) Option {
+	return func(e *Engine) {
+		if e.builtins == nil {
+			e.builtins = make(map[string]BuiltinFunc)
+		}
+		e.builtins[name] = fn
+	}
+}
+
+// WithProfile registers a callback that receives per-stratum evaluation statistics
+// after each call to Transform.
+func WithProfile(fn func([]StratumStats)) Option {
+	return func(e *Engine) { e.profile = fn }
 }
 
 // New creates a new semi-naive Engine.
@@ -43,7 +78,7 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 		if r.IsFact() {
 			facts = append(facts, r.ToFact())
 		} else {
-			if err := checkRuleSafety(r); err != nil {
+			if err := checkRuleSafety(r, e.builtins); err != nil {
 				return nil, err
 			}
 			rules = append(rules, r)
@@ -59,6 +94,8 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 		aggRules: ruleset.AggRules,
 		facts:    facts,
 		maxIter:  e.maxIter,
+		builtins: e.builtins,
+		profile:  e.profile,
 	}, nil
 }
 
@@ -67,7 +104,7 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 //   - The is-bound variable is then available for subsequent atoms and the head.
 //   - Variables in negated atoms and comparison constraints are bound.
 //   - All head variables are bound.
-func checkRuleSafety(r syntax.Rule) error {
+func checkRuleSafety(r syntax.Rule, builtins map[string]BuiltinFunc) error {
 	bound := map[string]bool{}
 	for _, a := range r.Body {
 		switch {
@@ -80,7 +117,7 @@ func checkRuleSafety(r syntax.Rule) error {
 			if v, ok := a.Terms[0].(datalog.Variable); ok {
 				bound[string(v)] = true
 			}
-		case isBindBuiltin(a):
+		case isBindBuiltin(a, builtins):
 			// Input args (all except last) must be bound.
 			for _, t := range a.Terms[:len(a.Terms)-1] {
 				if v, ok := t.(datalog.Variable); ok {

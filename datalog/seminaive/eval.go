@@ -26,9 +26,12 @@ func isConstraint(a syntax.Atom) bool {
 
 // isBindBuiltin reports whether an atom is a binding builtin (produces a new variable binding).
 // Convention: all args except the last are inputs; the last is the output.
-// Currently no builtins are registered; this is an extensibility hook.
-func isBindBuiltin(a syntax.Atom) bool {
-	return false
+func isBindBuiltin(a syntax.Atom, builtins map[string]BuiltinFunc) bool {
+	if builtins == nil {
+		return false
+	}
+	_, ok := builtins[a.Pred]
+	return ok
 }
 
 func cachedRegexp(pattern string) (*regexp.Regexp, error) {
@@ -148,9 +151,24 @@ func checkConstraintV(pred string, terms []interned.CompiledTerm, sub *interned.
 }
 
 // evalBindBuiltin evaluates a binding builtin and returns the interned result ID.
-// Currently no builtins are registered; this is an extensibility hook.
-func evalBindBuiltin(a syntax.Atom, sub interned.InternedSub, dict *interned.Dict) (uint64, bool) {
-	return 0, false
+func evalBindBuiltin(a syntax.Atom, sub interned.InternedSub, dict *interned.Dict, builtins map[string]BuiltinFunc) (uint64, bool) {
+	fn, ok := builtins[a.Pred]
+	if !ok {
+		return 0, false
+	}
+	inputs := make([]any, len(a.Terms)-1)
+	for i, t := range a.Terms[:len(a.Terms)-1] {
+		id, ok := resolveTermID(t, sub, dict)
+		if !ok {
+			return 0, false
+		}
+		inputs[i] = dict.Resolve(id)
+	}
+	result, ok := fn(inputs)
+	if !ok {
+		return 0, false
+	}
+	return dict.Intern(result), true
 }
 
 // compareValues compares two values of the same type.
@@ -415,8 +433,9 @@ type bodyItem struct {
 
 // evaluator holds per-evaluation state.
 type evaluator struct {
-	dict    *interned.Dict
-	maxIter int
+	dict     *interned.Dict
+	maxIter  int
+	builtins map[string]BuiltinFunc
 }
 
 // evalRules runs semi-naive evaluation for a set of rules to fixpoint.
@@ -457,7 +476,7 @@ func (ev *evaluator) evalRules(rules []syntax.Rule, existing interned.InternedFa
 				cr.body = append(cr.body, bodyItem{kind: bodyItemIs, atom: a, cExpr: ce, outVarIdx: outVarIdx})
 			case isConstraint(a):
 				cr.body = append(cr.body, bodyItem{kind: bodyItemCompare, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap)})
-			case isBindBuiltin(a):
+			case isBindBuiltin(a, ev.builtins):
 				registerAtomVars(a, varMap)
 				outVarIdx := int8(-1)
 				if v, ok := a.Terms[len(a.Terms)-1].(datalog.Variable); ok {
@@ -469,7 +488,7 @@ func (ev *evaluator) evalRules(rules []syntax.Rule, existing interned.InternedFa
 						varMap[name] = outVarIdx
 					}
 				}
-				cr.body = append(cr.body, bodyItem{kind: bodyItemBind, atom: a, outVarIdx: outVarIdx})
+				cr.body = append(cr.body, bodyItem{kind: bodyItemBind, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap), outVarIdx: outVarIdx})
 			default:
 				cr.body = append(cr.body, bodyItem{kind: bodyItemJoin, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap), joinIdx: cr.joinCount})
 				cr.joinCount++
@@ -644,7 +663,7 @@ func (ev *evaluator) evalBodyRecursiveV(
 
 	case bodyItemBind:
 		isub := varSubToInternedSub(sub, varNames)
-		valID, ok := evalBindBuiltin(item.atom, isub, ev.dict)
+		valID, ok := evalBindBuiltin(item.atom, isub, ev.dict, ev.builtins)
 		if !ok {
 			return
 		}
@@ -948,7 +967,7 @@ func (ev *evaluator) queryInternedFacts(body []syntax.Atom, memFacts interned.In
 			items = append(items, bodyItem{kind: bodyItemIs, atom: a, cExpr: ce, outVarIdx: outVarIdx})
 		case isConstraint(a):
 			items = append(items, bodyItem{kind: bodyItemCompare, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap)})
-		case isBindBuiltin(a):
+		case isBindBuiltin(a, ev.builtins):
 			registerAtomVars(a, varMap)
 			outVarIdx := int8(-1)
 			if v, ok := a.Terms[len(a.Terms)-1].(datalog.Variable); ok {
@@ -960,7 +979,7 @@ func (ev *evaluator) queryInternedFacts(body []syntax.Atom, memFacts interned.In
 					varMap[name] = outVarIdx
 				}
 			}
-			items = append(items, bodyItem{kind: bodyItemBind, atom: a, outVarIdx: outVarIdx})
+			items = append(items, bodyItem{kind: bodyItemBind, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap), outVarIdx: outVarIdx})
 		default:
 			items = append(items, bodyItem{kind: bodyItemJoin, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap)})
 		}
@@ -1036,7 +1055,7 @@ func (ev *evaluator) queryRecursiveV(
 
 	case bodyItemBind:
 		isub := varSubToInternedSub(sub, varNames)
-		valID, ok := evalBindBuiltin(item.atom, isub, ev.dict)
+		valID, ok := evalBindBuiltin(item.atom, isub, ev.dict, ev.builtins)
 		if !ok {
 			return
 		}

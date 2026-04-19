@@ -21,14 +21,14 @@ type depEdge struct {
 }
 
 // stratify partitions rules into strata based on predicate dependencies.
-func stratify(rules []syntax.Rule, aggRules []syntax.AggregateRule) ([]stratum, error) {
+func stratify(rules []syntax.Rule, aggRules []syntax.AggregateRule, builtins map[string]BuiltinFunc) ([]stratum, error) {
 	edges := []depEdge{}
 	allPreds := map[string]bool{}
 
 	for _, r := range rules {
 		allPreds[r.Head.Pred] = true
 		for _, b := range r.Body {
-			if isConstraint(b) || isBindBuiltin(b) || b.Pred == "is" {
+			if isConstraint(b) || isBindBuiltin(b, builtins) || b.Pred == "is" {
 				continue
 			}
 			allPreds[b.Pred] = true
@@ -38,7 +38,7 @@ func stratify(rules []syntax.Rule, aggRules []syntax.AggregateRule) ([]stratum, 
 	for _, ar := range aggRules {
 		allPreds[ar.Head.Pred] = true
 		for _, b := range ar.Body {
-			if isConstraint(b) || isBindBuiltin(b) || b.Pred == "is" {
+			if isConstraint(b) || isBindBuiltin(b, builtins) || b.Pred == "is" {
 				continue
 			}
 			allPreds[b.Pred] = true

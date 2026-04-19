@@ -46,6 +46,48 @@
 //   - Arithmetic via 'is' atoms: +, -, *, /, mod
 //   - String builtins: @contains, @starts_with, @ends_with, @regex_match
 //   - Aggregates: count, sum, min, max with group-by
+//   - Custom binding builtins via [WithBuiltin]
+//
+// # Custom Builtins
+//
+// Register custom binding builtins that compute a derived value from resolved
+// input arguments. In rule bodies, all arguments except the last are inputs;
+// the last is the output variable that receives the result:
+//
+//	double := func(inputs []any) (any, bool) {
+//	    v, ok := inputs[0].(int64)
+//	    if !ok { return nil, false }
+//	    return v * 2, true
+//	}
+//	engine := seminaive.New(seminaive.WithBuiltin("@double", double))
+//
+// Then use it in rules:
+//
+//	doubled(X, D) :- val(X, V), @double(V, D).
+//
+// Builtin predicate names should start with "@" by convention to distinguish them
+// from regular predicates. Inputs are resolved Go values (int64, float64, string,
+// or [datalog.ID]); the result is interned into the dictionary automatically.
+//
+// The package provides [TimeDiff] as a ready-to-use builtin for computing the
+// difference between two timestamps (RFC3339 strings or numeric epoch values)
+// in seconds:
+//
+//	engine := seminaive.New(seminaive.WithBuiltin("@time_diff", seminaive.TimeDiff))
+//
+// # Profiling
+//
+// Use [WithProfile] to receive per-stratum evaluation statistics after each
+// call to Transform:
+//
+//	engine := seminaive.New(seminaive.WithProfile(func(stats []seminaive.StratumStats) {
+//	    for _, s := range stats {
+//	        fmt.Printf("%v: %d facts in %d iterations (%v)\n",
+//	            s.Predicates, s.FactCount, s.Iterations, s.Duration)
+//	    }
+//	}))
+//
+// Stats collection is zero-cost when no profile callback is registered.
 //
 // # Options
 //

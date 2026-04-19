@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"iter"
 	"sort"
+	"time"
 
 	"swdunlop.dev/pkg/datalog"
 	"swdunlop.dev/pkg/datalog/internal/interned"
@@ -18,6 +19,8 @@ type transformer struct {
 	aggRules []syntax.AggregateRule
 	facts    []datalog.Fact
 	maxIter  int
+	builtins map[string]BuiltinFunc
+	profile  func([]StratumStats)
 }
 
 var _ datalog.Transformer = (*transformer)(nil)
@@ -64,22 +67,48 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 
 	// Run evaluation if we have rules.
 	if len(t.rules) > 0 || len(t.aggRules) > 0 {
-		strata, err := stratify(t.rules, t.aggRules)
+		strata, err := stratify(t.rules, t.aggRules, t.builtins)
 		if err != nil {
 			return nil, fmt.Errorf("stratification: %w", err)
 		}
 
-		ev := &evaluator{dict: dict, maxIter: t.maxIter}
+		ev := &evaluator{dict: dict, maxIter: t.maxIter, builtins: t.builtins}
+
+		var stats []StratumStats
+		if t.profile != nil {
+			stats = make([]StratumStats, 0, len(strata))
+		}
 
 		for _, s := range strata {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 
+			var ss StratumStats
+			if stats != nil {
+				preds := make([]string, 0, len(s.predicates))
+				for p := range s.predicates {
+					preds = append(preds, p)
+				}
+				sort.Strings(preds)
+				ss.Predicates = preds
+				ss.RuleCount = len(s.rules)
+				ss.AggCount = len(s.aggRules)
+			}
+
+			var stratumStart time.Time
+			if stats != nil {
+				stratumStart = time.Now()
+			}
+
 			if len(s.rules) > 0 {
-				_, _, err := ev.evalRules(s.rules, existing, t.maxIter)
+				factCount, iterations, err := ev.evalRules(s.rules, existing, t.maxIter)
 				if err != nil {
 					return nil, err
+				}
+				if stats != nil {
+					ss.FactCount += factCount
+					ss.Iterations = iterations
 				}
 			}
 
@@ -88,8 +117,20 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 				if err != nil {
 					return nil, err
 				}
+				if stats != nil {
+					ss.FactCount += len(aggDerived.Index)
+				}
 				existing.Merge(aggDerived)
 			}
+
+			if stats != nil {
+				ss.Duration = time.Since(stratumStart)
+				stats = append(stats, ss)
+			}
+		}
+
+		if t.profile != nil {
+			t.profile(stats)
 		}
 	}
 
@@ -189,7 +230,7 @@ func (t *transformer) loadFromGeneric(input datalog.Database) (*interned.Dict, i
 
 	// Load facts for predicates referenced in rules but not declared.
 	loadUndeclaredPred := func(a syntax.Atom) {
-		if isConstraint(a) || isBindBuiltin(a) || a.Pred == "is" {
+		if isConstraint(a) || isBindBuiltin(a, t.builtins) || a.Pred == "is" {
 			return
 		}
 		arity := len(a.Terms)

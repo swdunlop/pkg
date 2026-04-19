@@ -465,3 +465,228 @@ func TestParseAndTransform(t *testing.T) {
 		t.Errorf("expected 1 child fact, got %d", count)
 	}
 }
+
+func TestBuiltin(t *testing.T) {
+	// Register a custom builtin that doubles a number.
+	double := func(inputs []any) (any, bool) {
+		if len(inputs) != 1 {
+			return nil, false
+		}
+		switch v := inputs[0].(type) {
+		case int64:
+			return v * 2, true
+		case float64:
+			return v * 2, true
+		}
+		return nil, false
+	}
+
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "val", Terms: []datalog.Constant{datalog.String("x"), datalog.Integer(5)}})
+	b.AddFact(datalog.Fact{Name: "val", Terms: []datalog.Constant{datalog.String("y"), datalog.Integer(10)}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`doubled(N, D) :- val(N, V), @double(V, D).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithBuiltin("@double", double))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for row := range output.Query("doubled", datalog.String("x"), datalog.Variable("D")) {
+		d := int64(row[1].(datalog.Integer))
+		if d != 10 {
+			t.Errorf("expected doubled(x) = 10, got %d", d)
+		}
+	}
+	for row := range output.Query("doubled", datalog.String("y"), datalog.Variable("D")) {
+		d := int64(row[1].(datalog.Integer))
+		if d != 20 {
+			t.Errorf("expected doubled(y) = 20, got %d", d)
+		}
+	}
+
+	count := 0
+	for range output.Facts("doubled", 2) {
+		count++
+	}
+	if count != 2 {
+		t.Errorf("expected 2 doubled facts, got %d", count)
+	}
+}
+
+func TestBuiltinWithAggregates(t *testing.T) {
+	// Builtin in a rule, then aggregate over derived facts.
+	negate := func(inputs []any) (any, bool) {
+		if len(inputs) != 1 {
+			return nil, false
+		}
+		switch v := inputs[0].(type) {
+		case int64:
+			return -v, true
+		case float64:
+			return -v, true
+		}
+		return nil, false
+	}
+
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "val", Terms: []datalog.Constant{datalog.Integer(3)}})
+	b.AddFact(datalog.Fact{Name: "val", Terms: []datalog.Constant{datalog.Integer(7)}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`
+		neg(N) :- val(V), @negate(V, N).
+		total(S) :- S = sum(N) : neg(N).
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithBuiltin("@negate", negate))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for row := range output.Facts("total", 1) {
+		s := int64(row[0].(datalog.Integer))
+		if s != -10 {
+			t.Errorf("expected total = -10, got %d", s)
+		}
+	}
+}
+
+func TestTimeDiff(t *testing.T) {
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "event", Terms: []datalog.Constant{
+		datalog.String("a"), datalog.String("2024-01-01T00:00:00Z"),
+	}})
+	b.AddFact(datalog.Fact{Name: "event", Terms: []datalog.Constant{
+		datalog.String("b"), datalog.String("2024-01-01T01:00:00Z"),
+	}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`
+		diff(X, Y, D) :- event(X, T1), event(Y, T2), @time_diff(T2, T1, D), X != Y.
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithBuiltin("@time_diff", seminaive.TimeDiff))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for row := range output.Query("diff", datalog.String("a"), datalog.String("b"), datalog.Variable("D")) {
+		d := int64(row[2].(datalog.Integer))
+		if d != 3600 {
+			t.Errorf("expected diff(a, b) = 3600, got %d", d)
+		}
+	}
+	for row := range output.Query("diff", datalog.String("b"), datalog.String("a"), datalog.Variable("D")) {
+		d := int64(row[2].(datalog.Integer))
+		if d != -3600 {
+			t.Errorf("expected diff(b, a) = -3600, got %d", d)
+		}
+	}
+}
+
+func TestTimeDiffEpoch(t *testing.T) {
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "ts", Terms: []datalog.Constant{
+		datalog.String("a"), datalog.Integer(1000),
+	}})
+	b.AddFact(datalog.Fact{Name: "ts", Terms: []datalog.Constant{
+		datalog.String("b"), datalog.Integer(1060),
+	}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`
+		delta(X, Y, D) :- ts(X, T1), ts(Y, T2), @time_diff(T2, T1, D), X != Y.
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithBuiltin("@time_diff", seminaive.TimeDiff))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for row := range output.Query("delta", datalog.String("a"), datalog.String("b"), datalog.Variable("D")) {
+		d := int64(row[2].(datalog.Integer))
+		if d != 60 {
+			t.Errorf("expected delta(a, b) = 60, got %d", d)
+		}
+	}
+}
+
+func TestWithProfile(t *testing.T) {
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "edge", Terms: []datalog.Constant{datalog.String("a"), datalog.String("b")}})
+	b.AddFact(datalog.Fact{Name: "edge", Terms: []datalog.Constant{datalog.String("b"), datalog.String("c")}})
+	input := b.Build()
+
+	var captured []seminaive.StratumStats
+
+	rs, err := syntax.ParseAll(`
+		reachable(X, Y) :- edge(X, Y).
+		reachable(X, Y) :- edge(X, Z), reachable(Z, Y).
+		out_degree(X, N) :- N = count : reachable(X, ?).
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithProfile(func(stats []seminaive.StratumStats) {
+		captured = stats
+	}))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(captured) == 0 {
+		t.Fatal("expected stratum stats, got none")
+	}
+
+	// Should have at least one stratum with rules that derived facts.
+	totalFacts := 0
+	for _, s := range captured {
+		totalFacts += s.FactCount
+		if s.Duration < 0 {
+			t.Errorf("stratum duration should not be negative: %v", s.Duration)
+		}
+	}
+	if totalFacts == 0 {
+		t.Error("expected some derived facts across strata")
+	}
+}
