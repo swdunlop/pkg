@@ -409,3 +409,138 @@ func BenchmarkJoin1_5000(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkNegation benchmarks negation checking in a stratified program.
+func BenchmarkNegation(b *testing.B) {
+	builder := memory.NewBuilder()
+	// 200 nodes in a chain, query for unreachable pairs.
+	for i := range 199 {
+		builder.AddFact(datalog.Fact{
+			Name:  "edge",
+			Terms: []datalog.Constant{datalog.Integer(int64(i)), datalog.Integer(int64(i + 1))},
+		})
+		builder.AddFact(datalog.Fact{
+			Name:  "node",
+			Terms: []datalog.Constant{datalog.Integer(int64(i))},
+		})
+	}
+	builder.AddFact(datalog.Fact{
+		Name:  "node",
+		Terms: []datalog.Constant{datalog.Integer(199)},
+	})
+	input := builder.Build()
+
+	rs, err := syntax.ParseAll(`
+		reachable(X, Y) :- edge(X, Y).
+		reachable(X, Y) :- reachable(X, Z), edge(Z, Y).
+		unreachable(X, Y) :- node(X), node(Y), not reachable(X, Y).
+	`)
+	if err != nil {
+		b.Fatal(err)
+	}
+	tr, err := seminaive.New().Compile(rs)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		output, err := tr.Transform(context.Background(), input)
+		if err != nil {
+			b.Fatal(err)
+		}
+		count := 0
+		for range output.Facts("unreachable", 2) {
+			count++
+		}
+		// 200*200 = 40000 total pairs, 200*199/2 = 19900 reachable (X<Y)
+		// unreachable = 40000 - 19900 = 20100
+		if count != 20100 {
+			b.Fatalf("expected 20100 unreachable pairs, got %d", count)
+		}
+	}
+}
+
+// BenchmarkJoinReorder benchmarks a rule where join reordering matters.
+// The selective join (with a constant) is placed last in source order.
+func BenchmarkJoinReorder(b *testing.B) {
+	builder := memory.NewBuilder()
+	for i := range 1000 {
+		builder.AddFact(datalog.Fact{
+			Name:  "big",
+			Terms: []datalog.Constant{datalog.Integer(int64(i)), datalog.Integer(int64(i % 100))},
+		})
+		builder.AddFact(datalog.Fact{
+			Name:  "link",
+			Terms: []datalog.Constant{datalog.Integer(int64(i % 100)), datalog.String(fmt.Sprintf("v%d", i%10))},
+		})
+	}
+	// Only 1 fact in "filter" -- highly selective.
+	builder.AddFact(datalog.Fact{
+		Name:  "filter",
+		Terms: []datalog.Constant{datalog.String("v0")},
+	})
+	input := builder.Build()
+
+	// Source order: big(X, Y), link(Y, Z), filter(Z) -- filter is last.
+	// Optimal order: filter(Z), link(Y, Z), big(X, Y) -- filter first.
+	rs, err := syntax.ParseAll(`result(X) :- big(X, Y), link(Y, Z), filter(Z).`)
+	if err != nil {
+		b.Fatal(err)
+	}
+	tr, err := seminaive.New().Compile(rs)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		output, err := tr.Transform(context.Background(), input)
+		if err != nil {
+			b.Fatal(err)
+		}
+		count := 0
+		for range output.Facts("result", 1) {
+			count++
+		}
+		if count == 0 {
+			b.Fatal("expected results")
+		}
+	}
+}
+
+// BenchmarkArithmeticExpr benchmarks rules with is-expressions (arithmetic).
+func BenchmarkArithmeticExpr(b *testing.B) {
+	builder := memory.NewBuilder()
+	for i := range 1000 {
+		builder.AddFact(datalog.Fact{
+			Name:  "val",
+			Terms: []datalog.Constant{datalog.String(fmt.Sprintf("k%d", i)), datalog.Integer(int64(i))},
+		})
+	}
+	input := builder.Build()
+
+	rs, err := syntax.ParseAll(`computed(K, R) :- val(K, V), R is V * V + 1.`)
+	if err != nil {
+		b.Fatal(err)
+	}
+	tr, err := seminaive.New().Compile(rs)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		output, err := tr.Transform(context.Background(), input)
+		if err != nil {
+			b.Fatal(err)
+		}
+		count := 0
+		for range output.Facts("computed", 2) {
+			count++
+		}
+		if count != 1000 {
+			b.Fatalf("expected 1000, got %d", count)
+		}
+	}
+}

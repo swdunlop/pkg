@@ -6,6 +6,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/pprof"
 
 	flag "github.com/spf13/pflag"
 	"gopkg.in/yaml.v3"
@@ -16,10 +18,24 @@ import (
 var (
 	configPath = flag.StringP("config", "c", "", "path to a JSON or YAML jsonfacts config file")
 	dataDir    = flag.StringP("data-dir", "d", "", "directory containing JSONL data files (defaults to config file's directory)")
+	cpuProfile = flag.String("cpuprofile", "", "write CPU profile to file")
+	memProfile = flag.String("memprofile", "", "write memory profile to file")
 )
 
 func main() {
 	flag.Parse()
+
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal(err)
+		}
+		defer pprof.StopCPUProfile()
+	}
 
 	r := newREPL(seminaive.New())
 
@@ -47,6 +63,18 @@ func main() {
 
 	if err := r.run(); err != nil {
 		log.Fatal(err)
+	}
+
+	if *memProfile != "" {
+		f, err := os.Create(*memProfile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer f.Close()
+		runtime.GC()
+		if err := pprof.WriteHeapProfile(f); err != nil {
+			log.Fatal(err)
+		}
 	}
 }
 

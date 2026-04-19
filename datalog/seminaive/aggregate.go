@@ -12,7 +12,7 @@ import (
 // evalAggregates evaluates aggregate rules against the current facts,
 // returning new derived facts. All computation stays in interned space.
 func (ev *evaluator) evalAggregates(aggRules []syntax.AggregateRule, memFacts interned.InternedFactSet) (interned.InternedFactSet, error) {
-	result := interned.NewInternedFactSet()
+	result := interned.NewLightInternedFactSet()
 
 	for _, ar := range aggRules {
 		bindings := ev.queryInternedFacts(ar.Body, memFacts)

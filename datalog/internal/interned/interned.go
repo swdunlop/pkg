@@ -1,6 +1,9 @@
 package interned
 
 import (
+	"maps"
+	"math/bits"
+
 	"swdunlop.dev/pkg/datalog"
 )
 
@@ -119,7 +122,7 @@ func CompileAtomV(pred string, terms []datalog.Term, dict *Dict, varMap map[stri
 // Uses a bitmask and fixed-size array -- zero allocation.
 type BoundSet struct {
 	Vals [MaxFactArity]uint64
-	Mask uint8
+	Mask uint16
 }
 
 func (b *BoundSet) Set(pos int, val uint64) {
@@ -132,6 +135,20 @@ func (b *BoundSet) Get(pos int) (uint64, bool) {
 		return b.Vals[pos], true
 	}
 	return 0, false
+}
+
+// MatchesBound returns true if all bound positions in bs match the fact's values.
+// Use as a fast pre-filter before calling UnifyV.
+func MatchesBound(bs *BoundSet, fact *InternedFact) bool {
+	mask := bs.Mask
+	for mask != 0 {
+		pos := bits.TrailingZeros16(mask)
+		if fact.Values[pos] != bs.Vals[pos] {
+			return false
+		}
+		mask &= mask - 1
+	}
+	return true
 }
 
 // --- factChunks: growable slice of facts ---
@@ -164,14 +181,40 @@ type PredArityI struct {
 // InternedFactSet is an in-memory set of interned facts.
 type InternedFactSet struct {
 	ByPred map[PredArityI]*factChunks
-	ByArg0 map[PredArityI]map[uint64][]InternedFact // nil for light sets
+	ByArg0 map[PredArityI]map[uint64][]int32 // nil for light sets; values are indices into ByPred factChunks
 	Index  map[uint64]struct{}
+}
+
+// emptyIndices is a sentinel for "indexed scan, no matches" (distinct from nil = unindexed).
+var emptyIndices = make([]int32, 0)
+
+// ScanResult holds the result of a Scan operation. When indices is non-nil,
+// only the indexed facts should be iterated; when nil, iterate all facts.
+type ScanResult struct {
+	facts   []InternedFact
+	indices []int32 // nil = unindexed (iterate all facts); non-nil = indexed
+}
+
+// Len returns the number of facts in the scan result.
+func (r ScanResult) Len() int {
+	if r.indices != nil {
+		return len(r.indices)
+	}
+	return len(r.facts)
+}
+
+// Fact returns a pointer to the i-th fact in the scan result.
+func (r ScanResult) Fact(i int) *InternedFact {
+	if r.indices != nil {
+		return &r.facts[r.indices[i]]
+	}
+	return &r.facts[i]
 }
 
 func NewInternedFactSet() InternedFactSet {
 	return InternedFactSet{
 		ByPred: make(map[PredArityI]*factChunks),
-		ByArg0: make(map[PredArityI]map[uint64][]InternedFact),
+		ByArg0: make(map[PredArityI]map[uint64][]int32),
 		Index:  make(map[uint64]struct{}),
 	}
 }
@@ -179,7 +222,7 @@ func NewInternedFactSet() InternedFactSet {
 func NewInternedFactSetCap(indexCap int) InternedFactSet {
 	return InternedFactSet{
 		ByPred: make(map[PredArityI]*factChunks),
-		ByArg0: make(map[PredArityI]map[uint64][]InternedFact),
+		ByArg0: make(map[PredArityI]map[uint64][]int32),
 		Index:  make(map[uint64]struct{}, indexCap),
 	}
 }
@@ -366,7 +409,7 @@ func GroundV(ca CompiledAtom, sub *VarSub) (InternedFact, bool) {
 // UnifyV unifies a compiled atom against an InternedFact using a VarSub.
 // Returns true if unification succeeds. On success, sub is extended in place;
 // on failure, any partial bindings are rolled back.
-func UnifyV(ca CompiledAtom, fact InternedFact, sub *VarSub) bool {
+func UnifyV(ca CompiledAtom, fact *InternedFact, sub *VarSub) bool {
 	if ca.Pred != fact.Pred || ca.Arity != fact.Arity {
 		return false
 	}
@@ -436,14 +479,37 @@ func (fs InternedFactSet) AddWithKey(fact InternedFact, fk uint64) bool {
 	}
 	fc.append(fact)
 	if fs.ByArg0 != nil && fact.Arity > 0 {
+		idx := int32(len(fc.facts) - 1)
 		m := fs.ByArg0[k]
 		if m == nil {
-			m = make(map[uint64][]InternedFact)
+			m = make(map[uint64][]int32)
 			fs.ByArg0[k] = m
 		}
-		m[fact.Values[0]] = append(m[fact.Values[0]], fact)
+		m[fact.Values[0]] = append(m[fact.Values[0]], idx)
 	}
 	return true
+}
+
+// AddUnchecked adds a fact without checking the Index for duplicates.
+// The caller must have already verified that the fact is not present.
+func (fs InternedFactSet) AddUnchecked(fact InternedFact, fk uint64) {
+	fs.Index[fk] = struct{}{}
+	k := PredArityI{fact.Pred, fact.Arity}
+	fc := fs.ByPred[k]
+	if fc == nil {
+		fc = &factChunks{}
+		fs.ByPred[k] = fc
+	}
+	fc.append(fact)
+	if fs.ByArg0 != nil && fact.Arity > 0 {
+		idx := int32(len(fc.facts) - 1)
+		m := fs.ByArg0[k]
+		if m == nil {
+			m = make(map[uint64][]int32)
+			fs.ByArg0[k] = m
+		}
+		m[fact.Values[0]] = append(m[fact.Values[0]], idx)
+	}
 }
 
 func (fs InternedFactSet) Get(pred uint64, arity int) []InternedFact {
@@ -456,39 +522,84 @@ func (fs InternedFactSet) Get(pred uint64, arity int) []InternedFact {
 // Scan returns facts matching bound arguments. If arg0 is bound and the
 // ByArg0 index is available, uses it for O(1) lookup; otherwise falls back
 // to a full predicate scan.
-func (fs InternedFactSet) Scan(pred uint64, arity int, bound *BoundSet) []InternedFact {
+func (fs InternedFactSet) Scan(pred uint64, arity int, bound *BoundSet) ScanResult {
 	k := PredArityI{pred, arity}
 	if val, ok := bound.Get(0); ok && fs.ByArg0 != nil {
 		if m := fs.ByArg0[k]; m != nil {
-			return m[val]
+			fc := fs.ByPred[k]
+			if fc == nil {
+				return ScanResult{}
+			}
+			indices := m[val]
+			if indices == nil {
+				return ScanResult{indices: emptyIndices}
+			}
+			return ScanResult{facts: fc.facts, indices: indices}
 		}
 	}
 	if fc := fs.ByPred[k]; fc != nil {
-		return fc.toSlice()
+		return ScanResult{facts: fc.facts}
 	}
-	return nil
+	return ScanResult{}
 }
 
 // Merge copies all facts from other into fs in bulk.
 func (fs InternedFactSet) Merge(other InternedFactSet) {
-	for fk := range other.Index {
-		fs.Index[fk] = struct{}{}
-	}
+	maps.Copy(fs.Index, other.Index)
 	for k, ofc := range other.ByPred {
 		if dfc := fs.ByPred[k]; dfc != nil {
+			oldLen := int32(len(dfc.facts))
 			dfc.appendFrom(ofc)
+			if fs.ByArg0 != nil {
+				if other.ByArg0 != nil {
+					// Full-to-full: offset other's indices.
+					if om := other.ByArg0[k]; om != nil {
+						dm := fs.ByArg0[k]
+						if dm == nil {
+							dm = make(map[uint64][]int32, len(om))
+							fs.ByArg0[k] = dm
+						}
+						for val, indices := range om {
+							for _, idx := range indices {
+								dm[val] = append(dm[val], oldLen+idx)
+							}
+						}
+					}
+				} else {
+					// Light-to-full: build indices from facts.
+					dm := fs.ByArg0[k]
+					if dm == nil {
+						dm = make(map[uint64][]int32)
+						fs.ByArg0[k] = dm
+					}
+					for i := range ofc.facts {
+						f := &ofc.facts[i]
+						if f.Arity > 0 {
+							dm[f.Values[0]] = append(dm[f.Values[0]], oldLen+int32(i))
+						}
+					}
+				}
+			}
 		} else {
 			fs.ByPred[k] = ofc
-		}
-	}
-	if fs.ByArg0 != nil && other.ByArg0 != nil {
-		for k, om := range other.ByArg0 {
-			dm := fs.ByArg0[k]
-			if dm == nil {
-				fs.ByArg0[k] = om
-			} else {
-				for val, facts := range om {
-					dm[val] = append(dm[val], facts...)
+			if fs.ByArg0 != nil {
+				if other.ByArg0 != nil {
+					// Full-to-full: steal other's ByArg0 entry (indices valid as-is).
+					if om := other.ByArg0[k]; om != nil {
+						fs.ByArg0[k] = om
+					}
+				} else {
+					// Light-to-full: build indices from facts.
+					m := make(map[uint64][]int32)
+					for i := range ofc.facts {
+						f := &ofc.facts[i]
+						if f.Arity > 0 {
+							m[f.Values[0]] = append(m[f.Values[0]], int32(i))
+						}
+					}
+					if len(m) > 0 {
+						fs.ByArg0[k] = m
+					}
 				}
 			}
 		}
@@ -510,12 +621,12 @@ func (fs InternedFactSet) Clone() InternedFactSet {
 		result.ByPred[k] = &factChunks{facts: cp}
 	}
 	if fs.ByArg0 != nil {
-		result.ByArg0 = make(map[PredArityI]map[uint64][]InternedFact, len(fs.ByArg0))
+		result.ByArg0 = make(map[PredArityI]map[uint64][]int32, len(fs.ByArg0))
 		for k, m := range fs.ByArg0 {
-			newM := make(map[uint64][]InternedFact, len(m))
-			for arg0, facts := range m {
-				cp := make([]InternedFact, len(facts))
-				copy(cp, facts)
+			newM := make(map[uint64][]int32, len(m))
+			for arg0, indices := range m {
+				cp := make([]int32, len(indices))
+				copy(cp, indices)
 				newM[arg0] = cp
 			}
 			result.ByArg0[k] = newM

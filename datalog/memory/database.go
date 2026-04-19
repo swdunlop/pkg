@@ -84,13 +84,15 @@ func (db *Database) Query(pred string, terms ...datalog.Term) iter.Seq[[]datalog
 	}
 
 	return func(yield func([]datalog.Constant) bool) {
-		for _, fact := range db.facts.Scan(predID, arity, &bs) {
+		scan := db.facts.Scan(predID, arity, &bs)
+		for i := range scan.Len() {
+			fact := scan.Fact(i)
 			if !matchFact(fact, terms, &bs) {
 				continue
 			}
 			row := make([]datalog.Constant, arity)
-			for i := range arity {
-				row[i] = db.dict.ResolveConstant(fact.Values[i])
+			for j := range arity {
+				row[j] = db.dict.ResolveConstant(fact.Values[j])
 			}
 			if !yield(row) {
 				return
@@ -102,7 +104,7 @@ func (db *Database) Query(pred string, terms ...datalog.Term) iter.Seq[[]datalog
 // matchFact checks whether an InternedFact matches a query pattern.
 // The boundSet already filters via the byArg0 index, but non-leading
 // constant positions still need manual checking.
-func matchFact(fact interned.InternedFact, terms []datalog.Term, bs *interned.BoundSet) bool {
+func matchFact(fact *interned.InternedFact, terms []datalog.Term, bs *interned.BoundSet) bool {
 	for i := range fact.Arity {
 		if val, ok := bs.Get(i); ok {
 			if fact.Values[i] != val {

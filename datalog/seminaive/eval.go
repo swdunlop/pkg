@@ -31,84 +31,6 @@ func isBindBuiltin(a syntax.Atom) bool {
 	return false
 }
 
-// checkConstraint evaluates a constraint under an interned substitution.
-func checkConstraint(a syntax.Atom, sub interned.InternedSub, dict *interned.Dict) bool {
-	switch a.Pred {
-	case "=":
-		lid, lok := resolveTermID(a.Terms[0], sub, dict)
-		rid, rok := resolveTermID(a.Terms[1], sub, dict)
-		return lok && rok && lid == rid
-	case "!=":
-		lid, lok := resolveTermID(a.Terms[0], sub, dict)
-		rid, rok := resolveTermID(a.Terms[1], sub, dict)
-		return lok && rok && lid != rid
-	case "@contains":
-		lhs, lok := resolveTermValue(a.Terms[0], sub, dict)
-		rhs, rok := resolveTermValue(a.Terms[1], sub, dict)
-		if !lok || !rok {
-			return false
-		}
-		ls, lOk := lhs.(string)
-		rs, rOk := rhs.(string)
-		return lOk && rOk && strings.Contains(ls, rs)
-	case "@starts_with":
-		lhs, lok := resolveTermValue(a.Terms[0], sub, dict)
-		rhs, rok := resolveTermValue(a.Terms[1], sub, dict)
-		if !lok || !rok {
-			return false
-		}
-		ls, lOk := lhs.(string)
-		rs, rOk := rhs.(string)
-		return lOk && rOk && strings.HasPrefix(ls, rs)
-	case "@ends_with":
-		lhs, lok := resolveTermValue(a.Terms[0], sub, dict)
-		rhs, rok := resolveTermValue(a.Terms[1], sub, dict)
-		if !lok || !rok {
-			return false
-		}
-		ls, lOk := lhs.(string)
-		rs, rOk := rhs.(string)
-		return lOk && rOk && strings.HasSuffix(ls, rs)
-	case "@regex_match":
-		lhs, lok := resolveTermValue(a.Terms[0], sub, dict)
-		rhs, rok := resolveTermValue(a.Terms[1], sub, dict)
-		if !lok || !rok {
-			return false
-		}
-		s, sOk := lhs.(string)
-		pattern, pOk := rhs.(string)
-		if !sOk || !pOk {
-			return false
-		}
-		re, err := cachedRegexp(pattern)
-		if err != nil {
-			return false
-		}
-		return re.MatchString(s)
-	default:
-		lhs, lok := resolveTermValue(a.Terms[0], sub, dict)
-		rhs, rok := resolveTermValue(a.Terms[1], sub, dict)
-		if !lok || !rok {
-			return false
-		}
-		c, ok := compareValues(lhs, rhs)
-		if !ok {
-			return false
-		}
-		switch a.Pred {
-		case "<":
-			return c < 0
-		case ">":
-			return c > 0
-		case "<=":
-			return c <= 0
-		case ">=":
-			return c >= 0
-		}
-	}
-	return false
-}
-
 func cachedRegexp(pattern string) (*regexp.Regexp, error) {
 	if v, ok := regexCache.Load(pattern); ok {
 		return v.(*regexp.Regexp), nil
@@ -389,11 +311,103 @@ const (
 	bodyItemBind                       // evaluate binding builtin
 )
 
+// compiledExpr is a pre-compiled arithmetic expression using VarSub indices.
+type compiledExpr interface {
+	compiledExpr()
+}
+
+type compiledTermExpr struct {
+	term interned.CompiledTerm
+}
+
+func (compiledTermExpr) compiledExpr() {}
+
+type compiledBinExpr struct {
+	op    string
+	left  compiledExpr
+	right compiledExpr
+}
+
+func (compiledBinExpr) compiledExpr() {}
+
+// compileExpr pre-compiles an expression using the variable index map.
+func compileExpr(expr syntax.Expr, dict *interned.Dict, varMap map[string]int8) compiledExpr {
+	if expr == nil {
+		return nil
+	}
+	switch e := expr.(type) {
+	case syntax.TermExpr:
+		return compiledTermExpr{term: compileTermV(e.Term, dict, varMap)}
+	case syntax.BinExpr:
+		return compiledBinExpr{
+			op:    e.Op,
+			left:  compileExpr(e.Left, dict, varMap),
+			right: compileExpr(e.Right, dict, varMap),
+		}
+	}
+	return nil
+}
+
+// compileTermV compiles a single term using the variable index map.
+func compileTermV(t datalog.Term, dict *interned.Dict, varMap map[string]int8) interned.CompiledTerm {
+	switch v := t.(type) {
+	case datalog.Variable:
+		name := string(v)
+		idx := int8(-1)
+		if varMap != nil {
+			if existing, ok := varMap[name]; ok {
+				idx = existing
+			}
+		}
+		return interned.CompiledTerm{VarName: name, VarIdx: idx}
+	case datalog.Constant:
+		return interned.CompiledTerm{VarIdx: -1, ConstID: dict.InternConstant(v)}
+	}
+	return interned.CompiledTerm{VarIdx: -1}
+}
+
+// evalExprIDV evaluates a compiled expression under a VarSub, returning an interned ID.
+func evalExprIDV(expr compiledExpr, sub *interned.VarSub, dict *interned.Dict) (uint64, bool) {
+	switch e := expr.(type) {
+	case compiledTermExpr:
+		return resolveCompiledTermID(e.term, sub)
+	case compiledBinExpr:
+		lval, lok := evalExprValueV(e.left, sub, dict)
+		rval, rok := evalExprValueV(e.right, sub, dict)
+		if !lok || !rok {
+			return 0, false
+		}
+		result, ok := applyBinOp(e.op, lval, rval)
+		if !ok {
+			return 0, false
+		}
+		return dict.Intern(result), true
+	}
+	return 0, false
+}
+
+// evalExprValueV evaluates a compiled expression under a VarSub, returning the raw value.
+func evalExprValueV(expr compiledExpr, sub *interned.VarSub, dict *interned.Dict) (any, bool) {
+	switch e := expr.(type) {
+	case compiledTermExpr:
+		return resolveCompiledTermValue(e.term, sub, dict)
+	case compiledBinExpr:
+		lval, lok := evalExprValueV(e.left, sub, dict)
+		rval, rok := evalExprValueV(e.right, sub, dict)
+		if !lok || !rok {
+			return nil, false
+		}
+		return applyBinOp(e.op, lval, rval)
+	}
+	return nil, false
+}
+
 // bodyItem is a single step in the rule body evaluation sequence.
 type bodyItem struct {
 	kind      bodyItemKind
 	atom      syntax.Atom          // original atom (for is/comparison -- needs Terms/Expr)
 	ca        interned.CompiledAtom // pre-compiled atom (for joins and negation)
+	cExpr     compiledExpr         // pre-compiled expression (for bodyItemIs)
 	joinIdx   int                  // for bodyItemJoin: index among join items (delta tracking)
 	negated   bool                 // for negated atoms in query body
 	outVarIdx int8                 // for bodyItemIs/bodyItemBind: VarSub index of output variable (-1 if unused)
@@ -407,13 +421,8 @@ type evaluator struct {
 
 // evalRules runs semi-naive evaluation for a set of rules to fixpoint.
 func (ev *evaluator) evalRules(rules []syntax.Rule, existing interned.InternedFactSet, maxIter int) (factCount int, iterations int, err error) {
-	emitted := interned.NewInternedFactSetCap(4096)
+	emitted := interned.NewLightInternedFactSet()
 	delta := interned.NewLightInternedFactSet()
-
-	type hashedFact struct {
-		fact interned.InternedFact
-		hash uint64
-	}
 
 	// Pre-compile all rules once, assigning per-rule variable indices.
 	type compiledRule struct {
@@ -444,7 +453,8 @@ func (ev *evaluator) evalRules(rules []syntax.Rule, existing interned.InternedFa
 						varMap[name] = outVarIdx
 					}
 				}
-				cr.body = append(cr.body, bodyItem{kind: bodyItemIs, atom: a, outVarIdx: outVarIdx})
+				ce := compileExpr(a.Expr, ev.dict, varMap)
+				cr.body = append(cr.body, bodyItem{kind: bodyItemIs, atom: a, cExpr: ce, outVarIdx: outVarIdx})
 			case isConstraint(a):
 				cr.body = append(cr.body, bodyItem{kind: bodyItemCompare, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap)})
 			case isBindBuiltin(a):
@@ -468,6 +478,7 @@ func (ev *evaluator) evalRules(rules []syntax.Rule, existing interned.InternedFa
 		if cr.joinCount == 0 {
 			continue
 		}
+		cr.body = reorderBody(cr.body)
 		cr.varNames = make([]string, len(varMap))
 		for name, idx := range varMap {
 			cr.varNames[idx] = name
@@ -476,7 +487,11 @@ func (ev *evaluator) evalRules(rules []syntax.Rule, existing interned.InternedFa
 	}
 
 	for iterations = range maxIter {
-		var newDeltaFacts []hashedFact
+		if iterations > 0 {
+			existing.Merge(emitted)
+			delta = emitted
+			emitted = interned.NewLightInternedFactSet()
+		}
 
 		for _, cr := range compiled {
 			emit := func(sub *interned.VarSub) {
@@ -490,9 +505,8 @@ func (ev *evaluator) evalRules(rules []syntax.Rule, existing interned.InternedFa
 				if _, exists := emitted.Index[fk]; exists {
 					return
 				}
-				emitted.AddWithKey(fact, fk)
+				emitted.AddUnchecked(fact, fk)
 				factCount++
-				newDeltaFacts = append(newDeltaFacts, hashedFact{fact, fk})
 			}
 
 			var sub interned.VarSub
@@ -519,13 +533,8 @@ func (ev *evaluator) evalRules(rules []syntax.Rule, existing interned.InternedFa
 			}
 		}
 
-		if len(newDeltaFacts) == 0 {
+		if len(emitted.Index) == 0 {
 			break
-		}
-
-		delta = interned.NewLightInternedFactSet()
-		for _, hf := range newDeltaFacts {
-			delta.AddWithKey(hf.fact, hf.hash)
 		}
 	}
 
@@ -591,12 +600,9 @@ func (ev *evaluator) evalBodyRecursiveV(
 	emit func(*interned.VarSub),
 ) {
 	if bodyIdx == len(body) {
-		if len(negativeBody) > 0 {
-			isub := varSubToInternedSub(sub, varNames)
-			for _, neg := range negativeBody {
-				if ev.matchesAnyCompiled(neg, isub, existing, emitted) {
-					return
-				}
+		for _, neg := range negativeBody {
+			if ev.matchesAnyV(neg, sub, existing, emitted) {
+				return
 			}
 		}
 		emit(sub)
@@ -611,8 +617,14 @@ func (ev *evaluator) evalBodyRecursiveV(
 		}
 
 	case bodyItemIs:
-		isub := varSubToInternedSub(sub, varNames)
-		valID, ok := evalExpr(item.atom.Expr, isub, ev.dict)
+		var valID uint64
+		var ok bool
+		if item.cExpr != nil {
+			valID, ok = evalExprIDV(item.cExpr, sub, ev.dict)
+		} else {
+			isub := varSubToInternedSub(sub, varNames)
+			valID, ok = evalExpr(item.atom.Expr, isub, ev.dict)
+		}
 		if !ok {
 			return
 		}
@@ -663,8 +675,14 @@ func (ev *evaluator) evalBodyRecursiveV(
 				}
 				return
 			}
+			dbs := interned.BoundArgsV(ca, sub)
 			savedMask := sub.Mask
-			for _, fact := range delta.Get(ca.Pred, ca.Arity) {
+			deltaFacts := delta.Get(ca.Pred, ca.Arity)
+			for i := range deltaFacts {
+				fact := &deltaFacts[i]
+				if !interned.MatchesBound(&dbs, fact) {
+					continue
+				}
 				if interned.UnifyV(ca, fact, sub) {
 					ev.evalBodyRecursiveV(body, negativeBody, varNames, deltaJoinIdx, delta, existing, emitted, sub, bodyIdx+1, emit)
 					sub.Mask = savedMask
@@ -685,13 +703,23 @@ func (ev *evaluator) evalBodyRecursiveV(
 			}
 			bs := interned.BoundArgsV(ca, sub)
 			savedMask := sub.Mask
-			for _, fact := range existing.Scan(ca.Pred, ca.Arity, &bs) {
+			existScan := existing.Scan(ca.Pred, ca.Arity, &bs)
+			for i := range existScan.Len() {
+				fact := existScan.Fact(i)
+				if !interned.MatchesBound(&bs, fact) {
+					continue
+				}
 				if interned.UnifyV(ca, fact, sub) {
 					ev.evalBodyRecursiveV(body, negativeBody, varNames, deltaJoinIdx, delta, existing, emitted, sub, bodyIdx+1, emit)
 					sub.Mask = savedMask
 				}
 			}
-			for _, fact := range emitted.Scan(ca.Pred, ca.Arity, &bs) {
+			emitScan := emitted.Scan(ca.Pred, ca.Arity, &bs)
+			for i := range emitScan.Len() {
+				fact := emitScan.Fact(i)
+				if !interned.MatchesBound(&bs, fact) {
+					continue
+				}
 				if interned.UnifyV(ca, fact, sub) {
 					ev.evalBodyRecursiveV(body, negativeBody, varNames, deltaJoinIdx, delta, existing, emitted, sub, bodyIdx+1, emit)
 					sub.Mask = savedMask
@@ -701,10 +729,11 @@ func (ev *evaluator) evalBodyRecursiveV(
 	}
 }
 
-// matchesAnyCompiled checks if a compiled (negated) atom matches any fact.
-func (ev *evaluator) matchesAnyCompiled(ca interned.CompiledAtom, sub interned.InternedSub, existing interned.InternedFactSet, emitted interned.InternedFactSet) bool {
-	if interned.AllTermsBound(ca, sub) {
-		fact, ok := interned.GroundCompiled(ca, sub)
+// matchesAnyV checks if a compiled (negated) atom matches any fact using VarSub.
+// The VarSub is not modified on return (mask is saved/restored).
+func (ev *evaluator) matchesAnyV(ca interned.CompiledAtom, sub *interned.VarSub, existing interned.InternedFactSet, emitted interned.InternedFactSet) bool {
+	if interned.AllTermsBoundV(ca, sub) {
+		fact, ok := interned.GroundV(ca, sub)
 		if !ok {
 			return false
 		}
@@ -717,133 +746,337 @@ func (ev *evaluator) matchesAnyCompiled(ca interned.CompiledAtom, sub interned.I
 		}
 		return false
 	}
-	bs := interned.BoundArgsCompiled(ca, sub)
-	for _, fact := range existing.Scan(ca.Pred, ca.Arity, &bs) {
-		if _, ok := interned.UnifyCompiled(ca, fact, sub); ok {
+	bs := interned.BoundArgsV(ca, sub)
+	savedMask := sub.Mask
+	existScan := existing.Scan(ca.Pred, ca.Arity, &bs)
+	for i := range existScan.Len() {
+		fact := existScan.Fact(i)
+		if !interned.MatchesBound(&bs, fact) {
+			continue
+		}
+		if interned.UnifyV(ca, fact, sub) {
+			sub.Mask = savedMask
 			return true
 		}
 	}
-	for _, fact := range emitted.Scan(ca.Pred, ca.Arity, &bs) {
-		if _, ok := interned.UnifyCompiled(ca, fact, sub); ok {
+	emitScan := emitted.Scan(ca.Pred, ca.Arity, &bs)
+	for i := range emitScan.Len() {
+		fact := emitScan.Fact(i)
+		if !interned.MatchesBound(&bs, fact) {
+			continue
+		}
+		if interned.UnifyV(ca, fact, sub) {
+			sub.Mask = savedMask
 			return true
 		}
 	}
 	return false
 }
 
-// compileQueryBody pre-compiles a query body into bodyItems.
-func compileQueryBody(body []syntax.Atom, dict *interned.Dict) []bodyItem {
+// reorderBody reorders rule body items for better join selectivity.
+// Joins with more bound arguments (constants + already-bound variables)
+// are placed first. Constraints and is-atoms are placed as soon as their
+// input variables become bound.
+func reorderBody(body []bodyItem) []bodyItem {
+	if len(body) <= 1 {
+		return body
+	}
+
+	n := len(body)
+	placed := make([]bool, n)
+	result := make([]bodyItem, 0, n)
+	boundVars := uint16(0)
+
+	for len(result) < n {
+		// Phase 1: place any ready constraints/is/bind atoms.
+		progress := true
+		for progress {
+			progress = false
+			for i := range n {
+				if placed[i] {
+					continue
+				}
+				item := body[i]
+				switch item.kind {
+				case bodyItemCompare:
+					if bodyItemVarsBound(item, boundVars) {
+						placed[i] = true
+						result = append(result, item)
+						progress = true
+					}
+				case bodyItemIs:
+					if exprVarsBound(item.cExpr, boundVars) {
+						placed[i] = true
+						result = append(result, item)
+						if item.outVarIdx >= 0 {
+							boundVars |= 1 << uint(item.outVarIdx)
+						}
+						progress = true
+					}
+				case bodyItemBind:
+					if bodyItemInputVarsBound(item, boundVars) {
+						placed[i] = true
+						result = append(result, item)
+						if item.outVarIdx >= 0 {
+							boundVars |= 1 << uint(item.outVarIdx)
+						}
+						progress = true
+					}
+				}
+			}
+		}
+
+		// Phase 2: pick the best-scoring unplaced join.
+		bestIdx := -1
+		bestScore := -1.0
+		for i := range n {
+			if placed[i] || body[i].kind != bodyItemJoin {
+				continue
+			}
+			score := joinSelectivityScore(body[i].ca, boundVars)
+			if score > bestScore {
+				bestScore = score
+				bestIdx = i
+			}
+		}
+		if bestIdx >= 0 {
+			placed[bestIdx] = true
+			item := body[bestIdx]
+			result = append(result, item)
+			for _, t := range item.ca.Terms {
+				if t.VarIdx >= 0 {
+					boundVars |= 1 << uint(t.VarIdx)
+				}
+			}
+		} else {
+			// Place any remaining items (shouldn't happen for safe rules).
+			for i := range n {
+				if !placed[i] {
+					placed[i] = true
+					result = append(result, body[i])
+				}
+			}
+		}
+	}
+
+	return result
+}
+
+// joinSelectivityScore estimates how selective a join is given currently bound variables.
+// Higher score = more selective = should be evaluated earlier.
+func joinSelectivityScore(ca interned.CompiledAtom, boundVars uint16) float64 {
+	if ca.Arity == 0 {
+		return 1.0
+	}
+	boundCount := 0
+	for i := range ca.Arity {
+		t := ca.Terms[i]
+		if t.VarIdx < 0 {
+			boundCount++ // constant
+		} else if boundVars>>uint(t.VarIdx)&1 != 0 {
+			boundCount++ // already-bound variable
+		}
+	}
+	return float64(boundCount) / float64(ca.Arity)
+}
+
+// bodyItemVarsBound checks if all variable terms in the item's compiled atom are bound.
+func bodyItemVarsBound(item bodyItem, boundVars uint16) bool {
+	for i := range item.ca.Arity {
+		t := item.ca.Terms[i]
+		if t.VarIdx >= 0 && boundVars>>uint(t.VarIdx)&1 == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// bodyItemInputVarsBound checks if all input variables (all except the last/output) are bound.
+func bodyItemInputVarsBound(item bodyItem, boundVars uint16) bool {
+	if item.ca.Arity <= 1 {
+		return true
+	}
+	for i := range item.ca.Arity - 1 {
+		t := item.ca.Terms[i]
+		if t.VarIdx >= 0 && boundVars>>uint(t.VarIdx)&1 == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// exprVarsBound checks if all variables in a compiled expression are bound.
+func exprVarsBound(expr compiledExpr, boundVars uint16) bool {
+	if expr == nil {
+		return true
+	}
+	switch e := expr.(type) {
+	case compiledTermExpr:
+		if e.term.VarIdx >= 0 {
+			return boundVars>>uint(e.term.VarIdx)&1 != 0
+		}
+		return true
+	case compiledBinExpr:
+		return exprVarsBound(e.left, boundVars) && exprVarsBound(e.right, boundVars)
+	}
+	return true
+}
+
+// queryInternedFacts evaluates a query body using VarSub-based evaluation,
+// returning results as InternedSub for compatibility with aggregate grouping.
+func (ev *evaluator) queryInternedFacts(body []syntax.Atom, memFacts interned.InternedFactSet) []interned.InternedSub {
+	varMap := make(map[string]int8)
 	items := make([]bodyItem, 0, len(body))
+
 	for _, a := range body {
 		switch {
 		case a.Negated:
-			items = append(items, bodyItem{kind: bodyItemJoin, ca: interned.CompileAtom(a.Pred, a.Terms, dict), negated: true})
+			items = append(items, bodyItem{kind: bodyItemJoin, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap), negated: true})
 		case a.Pred == "is":
-			items = append(items, bodyItem{kind: bodyItemIs, atom: a})
+			registerExprVars(a.Expr, varMap)
+			outVarIdx := int8(-1)
+			if v, ok := a.Terms[0].(datalog.Variable); ok {
+				name := string(v)
+				if idx, exists := varMap[name]; exists {
+					outVarIdx = idx
+				} else {
+					outVarIdx = int8(len(varMap))
+					varMap[name] = outVarIdx
+				}
+			}
+			ce := compileExpr(a.Expr, ev.dict, varMap)
+			items = append(items, bodyItem{kind: bodyItemIs, atom: a, cExpr: ce, outVarIdx: outVarIdx})
 		case isConstraint(a):
-			items = append(items, bodyItem{kind: bodyItemCompare, atom: a})
+			items = append(items, bodyItem{kind: bodyItemCompare, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap)})
 		case isBindBuiltin(a):
-			items = append(items, bodyItem{kind: bodyItemBind, atom: a})
+			registerAtomVars(a, varMap)
+			outVarIdx := int8(-1)
+			if v, ok := a.Terms[len(a.Terms)-1].(datalog.Variable); ok {
+				name := string(v)
+				if idx, exists := varMap[name]; exists {
+					outVarIdx = idx
+				} else {
+					outVarIdx = int8(len(varMap))
+					varMap[name] = outVarIdx
+				}
+			}
+			items = append(items, bodyItem{kind: bodyItemBind, atom: a, outVarIdx: outVarIdx})
 		default:
-			items = append(items, bodyItem{kind: bodyItemJoin, ca: interned.CompileAtom(a.Pred, a.Terms, dict)})
+			items = append(items, bodyItem{kind: bodyItemJoin, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap)})
 		}
 	}
-	return items
-}
 
-// queryInternedFacts evaluates a query body and returns interned substitutions.
-// Used by aggregates to avoid de-intern/re-intern round-trips.
-func (ev *evaluator) queryInternedFacts(body []syntax.Atom, memFacts interned.InternedFactSet) []interned.InternedSub {
-	items := compileQueryBody(body, ev.dict)
+	varNames := make([]string, len(varMap))
+	for name, idx := range varMap {
+		varNames[idx] = name
+	}
+
 	var results []interned.InternedSub
-	ev.queryRecursive(items, memFacts, make(interned.InternedSub, 0, 8), 0, func(sub interned.InternedSub) {
-		results = append(results, sub.Clone())
+	var sub interned.VarSub
+	ev.queryRecursiveV(items, memFacts, &sub, varNames, 0, func(vs *interned.VarSub) {
+		results = append(results, varSubToInternedSub(vs, varNames))
 	})
 	return results
 }
 
-func (ev *evaluator) queryRecursive(
+// queryRecursiveV evaluates a query body using VarSub (zero-alloc hot path).
+func (ev *evaluator) queryRecursiveV(
 	body []bodyItem,
 	memFacts interned.InternedFactSet,
-	sub interned.InternedSub,
-	idx int,
-	emit func(interned.InternedSub),
+	sub *interned.VarSub,
+	varNames []string,
+	bodyIdx int,
+	emit func(*interned.VarSub),
 ) {
-	if idx == len(body) {
+	if bodyIdx == len(body) {
 		emit(sub)
 		return
 	}
 
-	item := body[idx]
+	item := body[bodyIdx]
 
 	if item.negated {
-		if !ev.matchesAnyCompiled(item.ca, sub, memFacts, interned.InternedFactSet{}) {
-			ev.queryRecursive(body, memFacts, sub, idx+1, emit)
+		if !ev.matchesAnyV(item.ca, sub, memFacts, interned.InternedFactSet{}) {
+			ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
 		}
 		return
 	}
 
 	switch item.kind {
 	case bodyItemCompare:
-		if checkConstraint(item.atom, sub, ev.dict) {
-			ev.queryRecursive(body, memFacts, sub, idx+1, emit)
+		if checkConstraintV(item.atom.Pred, item.ca.Terms, sub, ev.dict) {
+			ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
 		}
 
 	case bodyItemIs:
-		valID, ok := evalExpr(item.atom.Expr, sub, ev.dict)
+		var valID uint64
+		var ok bool
+		if item.cExpr != nil {
+			valID, ok = evalExprIDV(item.cExpr, sub, ev.dict)
+		} else {
+			isub := varSubToInternedSub(sub, varNames)
+			valID, ok = evalExpr(item.atom.Expr, isub, ev.dict)
+		}
 		if !ok {
 			return
 		}
-		lhsVar, isVar := item.atom.Terms[0].(datalog.Variable)
-		if !isVar {
+		outIdx := item.outVarIdx
+		if outIdx < 0 {
 			return
 		}
-		name := string(lhsVar)
-		if boundID, isBound := sub.Get(name); isBound {
-			if boundID == valID {
-				ev.queryRecursive(body, memFacts, sub, idx+1, emit)
+		if sub.Mask>>uint(outIdx)&1 != 0 {
+			if sub.Vals[outIdx] == valID {
+				ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
 			}
 		} else {
-			extSub := append(sub, interned.InternedSubEntry{Name: name, Value: valID})
-			ev.queryRecursive(body, memFacts, extSub, idx+1, emit)
+			sub.Set(int(outIdx), valID)
+			ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
+			sub.Clear(int(outIdx))
 		}
 
 	case bodyItemBind:
-		valID, ok := evalBindBuiltin(item.atom, sub, ev.dict)
+		isub := varSubToInternedSub(sub, varNames)
+		valID, ok := evalBindBuiltin(item.atom, isub, ev.dict)
 		if !ok {
 			return
 		}
-		outTerm := item.atom.Terms[len(item.atom.Terms)-1]
-		outVar, isVar := outTerm.(datalog.Variable)
-		if !isVar {
+		outIdx := item.outVarIdx
+		if outIdx < 0 {
 			return
 		}
-		name := string(outVar)
-		if boundID, isBound := sub.Get(name); isBound {
-			if boundID == valID {
-				ev.queryRecursive(body, memFacts, sub, idx+1, emit)
+		if sub.Mask>>uint(outIdx)&1 != 0 {
+			if sub.Vals[outIdx] == valID {
+				ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
 			}
 		} else {
-			extSub := append(sub, interned.InternedSubEntry{Name: name, Value: valID})
-			ev.queryRecursive(body, memFacts, extSub, idx+1, emit)
+			sub.Set(int(outIdx), valID)
+			ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
+			sub.Clear(int(outIdx))
 		}
 
 	case bodyItemJoin:
 		ca := item.ca
-		if interned.AllTermsBound(ca, sub) {
-			fact, ok := interned.GroundCompiled(ca, sub)
+		if interned.AllTermsBoundV(ca, sub) {
+			fact, ok := interned.GroundV(ca, sub)
 			if ok {
 				fk := interned.InternedFactHash(fact)
 				if _, exists := memFacts.Index[fk]; exists {
-					ev.queryRecursive(body, memFacts, sub, idx+1, emit)
+					ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
 				}
 			}
 			return
 		}
-		bs := interned.BoundArgsCompiled(ca, sub)
-		for _, fact := range memFacts.Scan(ca.Pred, ca.Arity, &bs) {
-			if extSub, ok := interned.UnifyCompiled(ca, fact, sub); ok {
-				ev.queryRecursive(body, memFacts, extSub, idx+1, emit)
+		bs := interned.BoundArgsV(ca, sub)
+		savedMask := sub.Mask
+		scan := memFacts.Scan(ca.Pred, ca.Arity, &bs)
+		for i := range scan.Len() {
+			fact := scan.Fact(i)
+			if !interned.MatchesBound(&bs, fact) {
+				continue
+			}
+			if interned.UnifyV(ca, fact, sub) {
+				ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
+				sub.Mask = savedMask
 			}
 		}
 	}
