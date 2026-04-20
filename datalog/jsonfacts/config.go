@@ -18,6 +18,10 @@ type Config struct {
 	Sources      []Source              `json:"sources,omitempty"`
 	Matchers     []Matcher             `json:"matchers,omitempty"`
 	Declarations []datalog.Declaration `json:"declarations,omitempty"`
+
+	// OnTypeError is called when a loaded fact's terms don't match the declared types.
+	// When nil, no type checking is performed during loading.
+	OnTypeError func(error) `json:"-"`
 }
 
 // Source describes a single JSONL file and how to map its lines to facts.

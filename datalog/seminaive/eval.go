@@ -34,6 +34,15 @@ func isBindBuiltin(a syntax.Atom, builtins map[string]BuiltinFunc) bool {
 	return ok
 }
 
+// isExternalPred reports whether an atom references a registered external predicate.
+func isExternalPred(a syntax.Atom, externals map[string]externalPredicate) bool {
+	if externals == nil {
+		return false
+	}
+	_, ok := externals[a.Pred]
+	return ok
+}
+
 func cachedRegexp(pattern string) (*regexp.Regexp, error) {
 	if v, ok := regexCache.Load(pattern); ok {
 		return v.(*regexp.Regexp), nil
@@ -745,6 +754,7 @@ func (ev *evaluator) evalBodyRecursiveV(
 				}
 			}
 		}
+
 	}
 }
 
@@ -1098,5 +1108,6 @@ func (ev *evaluator) queryRecursiveV(
 				sub.Mask = savedMask
 			}
 		}
+
 	}
 }

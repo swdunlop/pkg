@@ -42,6 +42,21 @@ func (cfg *Config) LoadFS(fsys fs.FS) (*memory.Database, error) {
 		facts = append(facts, derived...)
 	}
 
+	if cfg.OnTypeError != nil && len(cfg.Declarations) > 0 {
+		ds := datalog.NewDeclarationSet(func(yield func(datalog.Declaration) bool) {
+			for _, d := range cfg.Declarations {
+				if !yield(d) {
+					return
+				}
+			}
+		})
+		for _, f := range facts {
+			if err := ds.CheckFact(f); err != nil {
+				cfg.OnTypeError(err)
+			}
+		}
+	}
+
 	builder := memory.NewBuilder()
 	for _, d := range cfg.Declarations {
 		builder.AddDeclaration(d)

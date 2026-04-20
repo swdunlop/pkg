@@ -15,12 +15,13 @@ import (
 
 // transformer implements datalog.Transformer using semi-naive evaluation.
 type transformer struct {
-	rules    []syntax.Rule
-	aggRules []syntax.AggregateRule
-	facts    []datalog.Fact
-	maxIter  int
-	builtins map[string]BuiltinFunc
-	profile  func([]StratumStats)
+	rules     []syntax.Rule
+	aggRules  []syntax.AggregateRule
+	facts     []datalog.Fact
+	maxIter   int
+	builtins  map[string]BuiltinFunc
+	externals map[string]externalPredicate
+	profile   func([]StratumStats)
 }
 
 var _ datalog.Transformer = (*transformer)(nil)
@@ -70,6 +71,12 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 		strata, err := stratify(t.rules, t.aggRules, t.builtins)
 		if err != nil {
 			return nil, fmt.Errorf("stratification: %w", err)
+		}
+
+		if len(t.externals) > 0 {
+			if err := t.fetchExternals(ctx, dict, existing); err != nil {
+				return nil, fmt.Errorf("external predicates: %w", err)
+			}
 		}
 
 		ev := &evaluator{dict: dict, maxIter: t.maxIter, builtins: t.builtins}
@@ -230,7 +237,7 @@ func (t *transformer) loadFromGeneric(input datalog.Database) (*interned.Dict, i
 
 	// Load facts for predicates referenced in rules but not declared.
 	loadUndeclaredPred := func(a syntax.Atom) {
-		if isConstraint(a) || isBindBuiltin(a, t.builtins) || a.Pred == "is" {
+		if isConstraint(a) || isBindBuiltin(a, t.builtins) || a.Pred == "is" || isExternalPred(a, t.externals) {
 			return
 		}
 		arity := len(a.Terms)
@@ -269,6 +276,111 @@ func (t *transformer) loadFromGeneric(input datalog.Database) (*interned.Dict, i
 	}
 
 	return dict, existing, decls
+}
+
+// fetchExternals performs semi-join reduction to materialize external predicate facts
+// into existing before rule evaluation begins. For each external predicate referenced
+// in rules, it collects all possible pushdown values from input facts and constants,
+// calls the external function once with the complete set, and adds results to existing.
+func (t *transformer) fetchExternals(ctx context.Context, dict *interned.Dict, existing interned.InternedFactSet) error {
+	// For each external predicate, collect pushdown values per position.
+	type pushdownInfo struct {
+		ep        externalPredicate
+		positions map[int]map[uint64]bool // position → set of interned value IDs
+	}
+	pushdowns := map[string]*pushdownInfo{}
+
+	collectFromBody := func(body []syntax.Atom) {
+		for _, a := range body {
+			ep, ok := t.externals[a.Pred]
+			if !ok {
+				continue
+			}
+
+			pd, exists := pushdowns[a.Pred]
+			if !exists {
+				pd = &pushdownInfo{ep: ep, positions: map[int]map[uint64]bool{}}
+				pushdowns[a.Pred] = pd
+			}
+
+			// Collect constants in this external atom.
+			for i, term := range a.Terms {
+				if c, ok := term.(datalog.Constant); ok {
+					if pd.positions[i] == nil {
+						pd.positions[i] = map[uint64]bool{}
+					}
+					pd.positions[i][dict.InternConstant(c)] = true
+				}
+			}
+
+			// Collect values from anchor atoms via shared variables.
+			for i, term := range a.Terms {
+				v, ok := term.(datalog.Variable)
+				if !ok {
+					continue
+				}
+				varName := string(v)
+				for _, other := range body {
+					if isConstraint(other) || other.Pred == "is" || other.Negated {
+						continue
+					}
+					if isBindBuiltin(other, t.builtins) {
+						continue
+					}
+					if _, isExt := t.externals[other.Pred]; isExt {
+						continue
+					}
+					for j, ot := range other.Terms {
+						if ov, ok := ot.(datalog.Variable); ok && string(ov) == varName {
+							predID := dict.Intern(other.Pred)
+							facts := existing.Get(predID, len(other.Terms))
+							if pd.positions[i] == nil {
+								pd.positions[i] = map[uint64]bool{}
+							}
+							for k := range facts {
+								pd.positions[i][facts[k].Values[j]] = true
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	for _, r := range t.rules {
+		collectFromBody(r.Body)
+	}
+	for _, ar := range t.aggRules {
+		collectFromBody(ar.Body)
+	}
+
+	// Call each external function and materialize results.
+	for predName, pd := range pushdowns {
+		b := Bindings{Arity: pd.ep.arity}
+		for pos, ids := range pd.positions {
+			bt := BoundTerm{Position: pos}
+			for id := range ids {
+				bt.Values = append(bt.Values, dict.Resolve(id))
+			}
+			b.Bound = append(b.Bound, bt)
+		}
+
+		predID := dict.Intern(predName)
+		for tuple := range pd.ep.fn(ctx, b) {
+			var fact interned.InternedFact
+			fact.Pred = predID
+			fact.Arity = pd.ep.arity
+			for j, v := range tuple {
+				if j >= interned.MaxFactArity {
+					break
+				}
+				fact.Values[j] = dict.Intern(v)
+			}
+			existing.Add(fact)
+		}
+	}
+
+	return nil
 }
 
 // internRuleConstants ensures all constants appearing in rules are interned

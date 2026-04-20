@@ -2,6 +2,7 @@ package seminaive_test
 
 import (
 	"context"
+	"iter"
 	"slices"
 	"testing"
 
@@ -688,5 +689,425 @@ func TestWithProfile(t *testing.T) {
 	}
 	if totalFacts == 0 {
 		t.Error("expected some derived facts across strata")
+	}
+}
+
+// --- Type Declaration Tests ---
+
+func TestTypeCheckCompileArityMismatch(t *testing.T) {
+	decls := []datalog.Declaration{
+		{Name: "edge", Terms: []datalog.TermDeclaration{
+			{Name: "from", Type: "string"},
+			{Name: "to", Type: "string"},
+		}},
+	}
+	rs, err := syntax.ParseAll(`bad(X) :- edge(X, Y, Z).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithDeclarations(decls))
+	_, err = eng.Compile(rs)
+	if err == nil {
+		t.Error("expected arity mismatch error, got nil")
+	}
+}
+
+func TestTypeCheckCompileTypeMismatch(t *testing.T) {
+	decls := []datalog.Declaration{
+		{Name: "score", Terms: []datalog.TermDeclaration{
+			{Name: "name", Type: "string"},
+			{Name: "value", Type: "integer"},
+		}},
+	}
+	// Using a string constant where an integer is declared.
+	rs, err := syntax.ParseAll(`bad(X) :- score(X, "not_a_number").`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithDeclarations(decls))
+	_, err = eng.Compile(rs)
+	if err == nil {
+		t.Error("expected type mismatch error, got nil")
+	}
+}
+
+func TestTypeCheckCompilePassesWithCorrectTypes(t *testing.T) {
+	decls := []datalog.Declaration{
+		{Name: "score", Terms: []datalog.TermDeclaration{
+			{Name: "name", Type: "string"},
+			{Name: "value", Type: "integer"},
+		}},
+	}
+	rs, err := syntax.ParseAll(`high(X) :- score(X, V), V > 100.`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithDeclarations(decls))
+	_, err = eng.Compile(rs)
+	if err != nil {
+		t.Errorf("expected no error, got: %v", err)
+	}
+}
+
+func TestTypeCheckCompileNoDeclarations(t *testing.T) {
+	// Without declarations, any types should pass.
+	rs, err := syntax.ParseAll(`result(X) :- data(X, 42, "hello").`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = seminaive.New().Compile(rs)
+	if err != nil {
+		t.Errorf("expected no error without declarations, got: %v", err)
+	}
+}
+
+func TestTypeCheckCompileVariablesPass(t *testing.T) {
+	decls := []datalog.Declaration{
+		{Name: "score", Terms: []datalog.TermDeclaration{
+			{Name: "name", Type: "string"},
+			{Name: "value", Type: "integer"},
+		}},
+	}
+	// Variables should not be type-checked.
+	rs, err := syntax.ParseAll(`result(X, V) :- score(X, V).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithDeclarations(decls))
+	_, err = eng.Compile(rs)
+	if err != nil {
+		t.Errorf("expected no error for variables, got: %v", err)
+	}
+}
+
+func TestDeclarationSetCheckFact(t *testing.T) {
+	ds := datalog.NewDeclarationSet(func(yield func(datalog.Declaration) bool) {
+		yield(datalog.Declaration{
+			Name: "event",
+			Terms: []datalog.TermDeclaration{
+				{Name: "id", Type: "string"},
+				{Name: "severity", Type: "integer"},
+			},
+		})
+	})
+
+	// Good fact.
+	err := ds.CheckFact(datalog.Fact{
+		Name:  "event",
+		Terms: []datalog.Constant{datalog.String("evt1"), datalog.Integer(5)},
+	})
+	if err != nil {
+		t.Errorf("expected no error for valid fact, got: %v", err)
+	}
+
+	// Type mismatch.
+	err = ds.CheckFact(datalog.Fact{
+		Name:  "event",
+		Terms: []datalog.Constant{datalog.String("evt1"), datalog.String("high")},
+	})
+	if err == nil {
+		t.Error("expected type mismatch error for string in integer position")
+	}
+
+	// Arity mismatch.
+	err = ds.CheckFact(datalog.Fact{
+		Name:  "event",
+		Terms: []datalog.Constant{datalog.String("evt1")},
+	})
+	if err == nil {
+		t.Error("expected arity mismatch error")
+	}
+
+	// Undeclared predicate passes.
+	err = ds.CheckFact(datalog.Fact{
+		Name:  "unknown",
+		Terms: []datalog.Constant{datalog.String("anything")},
+	})
+	if err != nil {
+		t.Errorf("expected no error for undeclared predicate, got: %v", err)
+	}
+}
+
+// --- External Predicate Tests ---
+
+func TestExternalPredicate(t *testing.T) {
+	// Mock threat intel lookup: given IPs, return categories.
+	threatIntel := func(ctx context.Context, b seminaive.Bindings) iter.Seq[[]any] {
+		data := map[string][]string{
+			"1.2.3.4":    {"malware", "c2"},
+			"10.0.0.1":   {"scanner"},
+			"192.168.1.1": {},
+		}
+		return func(yield func([]any) bool) {
+			// If position 0 has pushed-down values, look up only those IPs.
+			for _, bt := range b.Bound {
+				if bt.Position == 0 {
+					for _, v := range bt.Values {
+						ip, ok := v.(string)
+						if !ok {
+							continue
+						}
+						for _, cat := range data[ip] {
+							if !yield([]any{ip, cat}) {
+								return
+							}
+						}
+					}
+					return
+				}
+			}
+			// No pushdown: return all.
+			for ip, cats := range data {
+				for _, cat := range cats {
+					if !yield([]any{ip, cat}) {
+						return
+					}
+				}
+			}
+		}
+	}
+
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "connection", Terms: []datalog.Constant{
+		datalog.String("host1"), datalog.String("1.2.3.4"),
+	}})
+	b.AddFact(datalog.Fact{Name: "connection", Terms: []datalog.Constant{
+		datalog.String("host2"), datalog.String("10.0.0.1"),
+	}})
+	b.AddFact(datalog.Fact{Name: "connection", Terms: []datalog.Constant{
+		datalog.String("host3"), datalog.String("192.168.1.1"),
+	}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`
+		threat(Host, IP, Category) :- connection(Host, IP), threat_intel(IP, Category).
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithExternal("threat_intel", 2, threatIntel))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var results []string
+	for row := range output.Facts("threat", 3) {
+		host := string(row[0].(datalog.String))
+		cat := string(row[2].(datalog.String))
+		results = append(results, host+":"+cat)
+	}
+	slices.Sort(results)
+	expected := []string{"host1:c2", "host1:malware", "host2:scanner"}
+	if !slices.Equal(results, expected) {
+		t.Errorf("expected %v, got %v", expected, results)
+	}
+}
+
+func TestExternalPredicateSemiJoinReduction(t *testing.T) {
+	// Verify that all values are batched in a single call with semi-join reduction.
+	var capturedBindings []seminaive.Bindings
+
+	lookup := func(ctx context.Context, b seminaive.Bindings) iter.Seq[[]any] {
+		capturedBindings = append(capturedBindings, b)
+		return func(yield func([]any) bool) {
+			// Return a result for each pushed-down IP.
+			for _, bt := range b.Bound {
+				if bt.Position == 0 {
+					for _, v := range bt.Values {
+						if !yield([]any{v, "found"}) {
+							return
+						}
+					}
+				}
+			}
+		}
+	}
+
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "ip", Terms: []datalog.Constant{datalog.String("1.2.3.4")}})
+	b.AddFact(datalog.Fact{Name: "ip", Terms: []datalog.Constant{datalog.String("5.6.7.8")}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`result(IP, Status) :- ip(IP), ext_lookup(IP, Status).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithExternal("ext_lookup", 2, lookup))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Semi-join reduction: single call with all IPs batched.
+	if len(capturedBindings) != 1 {
+		t.Fatalf("expected 1 external call (semi-join), got %d", len(capturedBindings))
+	}
+	cb := capturedBindings[0]
+	if len(cb.Bound) == 0 {
+		t.Fatal("expected pushdown binding, got none")
+	}
+	if cb.Bound[0].Position != 0 {
+		t.Errorf("expected bound position 0, got %d", cb.Bound[0].Position)
+	}
+	if len(cb.Bound[0].Values) != 2 {
+		t.Errorf("expected 2 pushed-down values, got %d", len(cb.Bound[0].Values))
+	}
+}
+
+func TestExternalPredicateCalledOnce(t *testing.T) {
+	callCount := 0
+	lookup := func(ctx context.Context, b seminaive.Bindings) iter.Seq[[]any] {
+		callCount++
+		return func(yield func([]any) bool) {
+			yield([]any{"result"})
+		}
+	}
+
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "a", Terms: []datalog.Constant{datalog.String("x")}})
+	b.AddFact(datalog.Fact{Name: "b", Terms: []datalog.Constant{datalog.String("y")}})
+	input := b.Build()
+
+	// Two rules reference the same external — should be called once (materialized).
+	rs, err := syntax.ParseAll(`
+		r1(X, V) :- a(X), ext(V).
+		r2(X, V) :- b(X), ext(V).
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithExternal("ext", 1, lookup))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if callCount != 1 {
+		t.Errorf("expected 1 external call (materialized once), got %d", callCount)
+	}
+}
+
+func TestExternalPredicateNegation(t *testing.T) {
+	// External predicate used in negation — materialized facts enable correct negation check.
+	blocklist := func(ctx context.Context, b seminaive.Bindings) iter.Seq[[]any] {
+		blocked := map[string]bool{"bad.com": true, "evil.org": true}
+		return func(yield func([]any) bool) {
+			// Check pushed-down values.
+			for _, bt := range b.Bound {
+				if bt.Position == 0 {
+					for _, v := range bt.Values {
+						if domain, ok := v.(string); ok && blocked[domain] {
+							if !yield([]any{domain}) {
+								return
+							}
+						}
+					}
+					return
+				}
+			}
+			for domain := range blocked {
+				if !yield([]any{domain}) {
+					return
+				}
+			}
+		}
+	}
+
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "request", Terms: []datalog.Constant{datalog.String("good.com")}})
+	b.AddFact(datalog.Fact{Name: "request", Terms: []datalog.Constant{datalog.String("bad.com")}})
+	b.AddFact(datalog.Fact{Name: "request", Terms: []datalog.Constant{datalog.String("ok.net")}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`allowed(D) :- request(D), not blocked(D).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithExternal("blocked", 1, blocklist))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var results []string
+	for row := range output.Facts("allowed", 1) {
+		results = append(results, string(row[0].(datalog.String)))
+	}
+	slices.Sort(results)
+	expected := []string{"good.com", "ok.net"}
+	if !slices.Equal(results, expected) {
+		t.Errorf("expected %v, got %v", expected, results)
+	}
+}
+
+func TestExternalPredicateArityCheck(t *testing.T) {
+	lookup := func(ctx context.Context, b seminaive.Bindings) iter.Seq[[]any] {
+		return func(yield func([]any) bool) {}
+	}
+	rs, err := syntax.ParseAll(`bad(X, Y, Z) :- ext(X, Y, Z).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithExternal("ext", 2, lookup)) // registered arity 2, used as 3
+	_, err = eng.Compile(rs)
+	if err == nil {
+		t.Error("expected arity mismatch error for external predicate")
+	}
+}
+
+func TestExternalPredicateOnlyBody(t *testing.T) {
+	// Rule body has only an external predicate (no regular joins).
+	// External is materialized before evaluation, so it becomes a regular join.
+	source := func(ctx context.Context, b seminaive.Bindings) iter.Seq[[]any] {
+		return func(yield func([]any) bool) {
+			if !yield([]any{"alpha", int64(1)}) {
+				return
+			}
+			yield([]any{"beta", int64(2)})
+		}
+	}
+
+	rs, err := syntax.ParseAll(`result(X, V) :- ext_source(X, V).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithExternal("ext_source", 2, source))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := tr.Transform(context.Background(), datalog.Empty{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	count := 0
+	for range output.Facts("result", 2) {
+		count++
+	}
+	if count != 2 {
+		t.Errorf("expected 2 result facts, got %d", count)
 	}
 }
