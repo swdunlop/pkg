@@ -1,0 +1,69 @@
+% Lateral movement detection over Mordor "Covenant SMB Copy" dataset.
+%
+% Reconstructs the attack kill chain:
+%   1. Remote logon from source to target host
+%   2. Admin share access from the source IP
+%   3. Executable dropped via SMB share
+%   4. SMB network connection between the hosts
+%
+% Based on OTRF/Security-Datasets: covenant_copy_smb_CreateRequest
+%   ATT&CK: T1021.002 (Remote Services: SMB/Windows Admin Shares)
+
+% -- Network topology --------------------------------------------------
+% Identify which hosts initiated SMB connections and where.
+smb_conn(Host, SrcIp, DstIp) :-
+    net_conn(Host, ?, SrcIp, ?, DstIp, DstPort, ?, ?),
+    contains(DstPort, "445").
+
+% -- Remote logon detection --------------------------------------------
+% A network logon (type 3) from a remote IP.
+remote_logon(TargetHost, User, SrcIp, Auth) :-
+    logon(TargetHost, User, ?, "3", SrcIp, ?, Auth).
+
+% -- Admin share usage -------------------------------------------------
+% Access to an administrative share (C$, ADMIN$, IPC$) from a remote IP.
+admin_share(Host, User, Share, Ip) :-
+    share_access(Host, User, Share, Ip),
+    contains(Share, "C$").
+
+admin_share(Host, User, Share, Ip) :-
+    share_access(Host, User, Share, Ip),
+    contains(Share, "ADMIN$").
+
+% -- Executable drop via share -----------------------------------------
+% An executable written through a file share.
+exe_drop(Host, User, Share, Path, Ip) :-
+    share_file(Host, User, Share, Path, Ip, ?),
+    ci_ends_with(Path, ".exe").
+
+% -- Privilege escalation indicator ------------------------------------
+% User granted special privileges on logon (SeDebugPrivilege etc.)
+elevated_logon(Host, User) :-
+    special_priv(Host, User, ?, ?).
+
+% -- Kill chain: lateral movement via SMB ------------------------------
+% Ties together: SMB connection + remote logon + admin share + exe drop.
+lateral_movement(User, SrcIp, TargetHost, Path) :-
+    smb_conn(?, SrcIp, DstIp),
+    remote_logon(TargetHost, User, SrcIp, ?),
+    admin_share(TargetHost, User, ?, SrcIp),
+    exe_drop(TargetHost, User, ?, Path, SrcIp).
+
+% -- Enrichment: elevated lateral movement -----------------------------
+% The lateral movement also involved special privileges on the target.
+elevated_lateral_movement(User, SrcIp, TargetHost, Path) :-
+    lateral_movement(User, SrcIp, TargetHost, Path),
+    elevated_logon(TargetHost, User).
+
+% -- File creation on disk (Sysmon-observed) ---------------------------
+% Executable file created on target host, observed by Sysmon.
+exe_on_disk(Host, Image, Path) :-
+    file_create(Host, Image, Path),
+    ci_ends_with(Path, ".exe").
+
+% -- Corroboration: share drop matches file on disk --------------------
+% The executable dropped via SMB also appeared as a Sysmon file-create.
+confirmed_drop(User, TargetHost, SharePath, DiskPath) :-
+    exe_drop(TargetHost, User, ?, SharePath, ?),
+    exe_on_disk(TargetHost, ?, DiskPath),
+    @ends_with(DiskPath, SharePath).

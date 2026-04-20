@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"context"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"github.com/reeflective/readline"
 	"golang.org/x/term"
 	"swdunlop.dev/pkg/datalog"
+	"swdunlop.dev/pkg/datalog/jsonfacts"
 	"swdunlop.dev/pkg/datalog/memory"
 	"swdunlop.dev/pkg/datalog/seminaive"
 	"swdunlop.dev/pkg/datalog/syntax"
@@ -73,9 +75,9 @@ func (r *repl) run() error {
 		return r.runPipe()
 	}
 
-	fmt.Fprintln(r.out, "datalog — Datalog REPL")
-	fmt.Fprintln(r.out, "Type .help for commands, .quit to exit.")
-	fmt.Fprintln(r.out)
+	fmt.Fprintln(os.Stderr, "datalog — Datalog REPL")
+	fmt.Fprintln(os.Stderr, "Type .help for commands, .quit to exit.")
+	fmt.Fprintln(os.Stderr)
 
 	for {
 		line, err := r.shell.Readline()
@@ -284,13 +286,28 @@ func (r *repl) loadData() error {
 		return fmt.Errorf("config %s: %w", r.configPath, err)
 	}
 
-	db, err := cfg.LoadDir(r.dataDir)
+	var db *memory.Database
+	if strings.HasSuffix(r.dataDir, ".zip") {
+		db, err = loadFromZip(cfg, r.dataDir)
+	} else {
+		db, err = cfg.LoadDir(r.dataDir)
+	}
 	if err != nil {
 		return fmt.Errorf("loading data from %s: %w", r.dataDir, err)
 	}
 
 	r.dataDB = db
 	return nil
+}
+
+// loadFromZip opens a zip file and loads JSONL data using it as an fs.FS.
+func loadFromZip(cfg jsonfacts.Config, path string) (*memory.Database, error) {
+	r, err := zip.OpenReader(path)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return cfg.LoadFS(&r.Reader)
 }
 
 func (r *repl) buildDB() *memory.Database {

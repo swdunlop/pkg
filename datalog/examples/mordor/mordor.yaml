@@ -1,0 +1,248 @@
+# jsonfacts config for Mordor "Covenant SMB Copy" lateral movement dataset.
+#
+# Dataset: OTRF/Security-Datasets covenant_copy_smb_CreateRequest
+# Attack: Covenant C2 copies GruntHTTP.exe from WORKSTATION5 to WORKSTATION6 via SMB admin share.
+#
+# Usage:
+#   datalog -c mordor.yaml rules.dl
+
+sources:
+  - file: covenant_copy_smb_CreateRequest_2020-09-22145302.json
+    mappings:
+      # -- Sysmon events (Channel contains "Sysmon") --
+
+      # EventID 3: Network Connection
+      - predicate: net_conn
+        args:
+          - "value.Hostname"
+          - "value.Image"
+          - "value.SourceIp"
+          - "value.SourcePort"
+          - "value.DestinationIp"
+          - "value.DestinationPort"
+          - "value.Protocol"
+          - "value.User"
+        filter: "value.EventID == 3"
+
+      # EventID 5: Process Terminated
+      - predicate: proc_terminate
+        args:
+          - "value.Hostname"
+          - "value.Image"
+          - "value.ProcessGuid"
+        filter: "value.EventID == 5"
+
+      # EventID 7: Image Loaded
+      - predicate: image_load
+        args:
+          - "value.Hostname"
+          - "value.Image"
+          - "value.ImageLoaded"
+          - "value.Signed"
+          - "value.Signature"
+        filter: "value.EventID == 7"
+
+      # EventID 10: Process Access
+      - predicate: proc_access
+        args:
+          - "value.Hostname"
+          - "value.SourceImage"
+          - "value.TargetImage"
+          - "value.GrantedAccess"
+        filter: "value.EventID == 10"
+
+      # EventID 11: File Create
+      - predicate: file_create
+        args:
+          - "value.Hostname"
+          - "value.Image"
+          - "value.TargetFilename"
+        filter: "value.EventID == 11"
+
+      # EventID 12: Registry Key Create/Delete
+      - predicate: reg_key
+        args:
+          - "value.Hostname"
+          - "value.Image"
+          - "value.TargetObject"
+        filter: "value.EventID == 12"
+
+      # EventID 13: Registry Value Set
+      - predicate: reg_value
+        args:
+          - "value.Hostname"
+          - "value.Image"
+          - "value.TargetObject"
+          - "value.Details"
+        filter: "value.EventID == 13"
+
+      # -- Windows Security events --
+
+      # EventID 4624: Logon
+      - predicate: logon
+        args:
+          - "value.Hostname"
+          - "value.TargetUserName"
+          - "value.TargetDomainName"
+          - "value.LogonType"
+          - "value.IpAddress"
+          - "value.IpPort"
+          - "value.AuthenticationPackageName"
+        filter: "value.EventID == 4624"
+
+      # EventID 4672: Special Privileges Assigned
+      - predicate: special_priv
+        args:
+          - "value.Hostname"
+          - "value.SubjectUserName"
+          - "value.SubjectDomainName"
+          - "value.PrivilegeList"
+        filter: "value.EventID == 4672"
+
+      # EventID 5140: Network Share Access
+      - predicate: share_access
+        args:
+          - "value.Hostname"
+          - "value.SubjectUserName"
+          - "value.ShareName"
+          - "value.IpAddress"
+        filter: "value.EventID == 5140"
+
+      # EventID 5145: Detailed Share Access (file-level)
+      - predicate: share_file
+        args:
+          - "value.Hostname"
+          - "value.SubjectUserName"
+          - "value.ShareName"
+          - "value.RelativeTargetName"
+          - "value.IpAddress"
+          - "value.AccessMask"
+        filter: "value.EventID == 5145"
+
+matchers:
+  # Flag connections to known SMB port
+  - predicate: net_conn
+    term: 5
+    contains:
+      - "445"
+
+  # Flag connections to interesting IPs by subnet
+  - predicate: net_conn
+    term: 4
+    cidr:
+      - "172.18.39.0/24"
+      - "172.18.38.0/24"
+
+  # Flag admin shares
+  - predicate: share_access
+    term: 2
+    contains:
+      - "C$"
+      - "ADMIN$"
+      - "IPC$"
+
+  # Flag executable file paths written via shares
+  - predicate: share_file
+    term: 3
+    case_insensitive: true
+    ends_with:
+      - ".exe"
+      - ".dll"
+      - ".ps1"
+      - ".bat"
+      - ".cmd"
+      - ".vbs"
+      - ".js"
+
+  # Flag executable file creates
+  - predicate: file_create
+    term: 2
+    case_insensitive: true
+    ends_with:
+      - ".exe"
+      - ".dll"
+
+declarations:
+  - name: net_conn
+    terms:
+      - {name: host}
+      - {name: image}
+      - {name: src_ip}
+      - {name: src_port}
+      - {name: dst_ip}
+      - {name: dst_port}
+      - {name: protocol}
+      - {name: user}
+
+  - name: proc_terminate
+    terms:
+      - {name: host}
+      - {name: image}
+      - {name: guid}
+
+  - name: image_load
+    terms:
+      - {name: host}
+      - {name: image}
+      - {name: loaded}
+      - {name: signed}
+      - {name: signature}
+
+  - name: proc_access
+    terms:
+      - {name: host}
+      - {name: source}
+      - {name: target}
+      - {name: access}
+
+  - name: file_create
+    terms:
+      - {name: host}
+      - {name: image}
+      - {name: path}
+
+  - name: reg_key
+    terms:
+      - {name: host}
+      - {name: image}
+      - {name: key}
+
+  - name: reg_value
+    terms:
+      - {name: host}
+      - {name: image}
+      - {name: key}
+      - {name: value}
+
+  - name: logon
+    terms:
+      - {name: host}
+      - {name: user}
+      - {name: domain}
+      - {name: type}
+      - {name: ip}
+      - {name: port}
+      - {name: auth}
+
+  - name: special_priv
+    terms:
+      - {name: host}
+      - {name: user}
+      - {name: domain}
+      - {name: privileges}
+
+  - name: share_access
+    terms:
+      - {name: host}
+      - {name: user}
+      - {name: share}
+      - {name: ip}
+
+  - name: share_file
+    terms:
+      - {name: host}
+      - {name: user}
+      - {name: share}
+      - {name: path}
+      - {name: ip}
+      - {name: access_mask}

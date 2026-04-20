@@ -1,4 +1,4 @@
-# datalog
+# Datalog
 
 A Datalog query engine for Go, designed for rule-based analysis of structured data -- particularly security telemetry in JSONL format.
 
@@ -69,6 +69,13 @@ func main() {
 | [`datalog/seminaive`](./seminaive) | Semi-naive evaluation engine with stratified negation |
 | [`datalog/jsonfacts`](./jsonfacts) | JSONL schema loading, pattern matching, and encoding |
 | [`datalog/cmd/datalog`](./cmd/datalog) | Interactive REPL and batch processor |
+
+### Examples
+
+| Example | Description |
+|---------|-------------|
+| [`examples/mordor`](./examples/mordor) | Lateral movement detection over real Windows security telemetry from the [OTRF Security Datasets](https://github.com/OTRF/Security-Datasets) |
+| [`examples/finbench`](./examples/finbench) | Cyclic ownership detection over the [LDBC FinBench](https://ldbcouncil.org/benchmarks/finbench/) dataset |
 
 ## Loading JSONL Data
 

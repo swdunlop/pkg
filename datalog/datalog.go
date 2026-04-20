@@ -9,6 +9,11 @@ import (
 // Empty is a Database with no declarations, no facts, nothing to query.
 type Empty struct{}
 
+// Predicates implements [Database] by yielding nothing.
+func (Empty) Predicates() iter.Seq2[string, int] {
+	return func(yield func(string, int) bool) {}
+}
+
 // Declarations implements [Database] by declaring nothing.
 func (Empty) Declarations() iter.Seq[Declaration] {
 	return func(yield func(Declaration) bool) {}
@@ -28,6 +33,9 @@ var _ Database = Empty{}
 
 // A Database contains facts organized by predicates that may be queried by presenting terms.
 type Database interface {
+	// Predicates iterates through all predicate name/arity pairs that have at least one fact.
+	Predicates() iter.Seq2[string, int]
+
 	// Declarations iterates through ordered distinct declarations of predicates.
 	Declarations() iter.Seq[Declaration]
 
