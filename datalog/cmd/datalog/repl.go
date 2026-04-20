@@ -75,9 +75,9 @@ func (r *repl) run() error {
 		return r.runPipe()
 	}
 
-	fmt.Fprintln(os.Stderr, "datalog — Datalog REPL")
-	fmt.Fprintln(os.Stderr, "Type .help for commands, .quit to exit.")
-	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(r.out, "datalog — Datalog REPL")
+	fmt.Fprintln(r.out, "Type .help for commands, .quit to exit.")
+	fmt.Fprintln(r.out)
 
 	for {
 		line, err := r.shell.Readline()
