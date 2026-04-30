@@ -12,7 +12,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/reeflective/readline"
+	"github.com/lmorg/readline/v4"
 	"golang.org/x/term"
 	"swdunlop.dev/pkg/datalog"
 	"swdunlop.dev/pkg/datalog/jsonfacts"
@@ -22,7 +22,7 @@ import (
 )
 
 type repl struct {
-	shell    *readline.Shell
+	rl       *readline.Instance
 	out      io.Writer
 	facts    []datalog.Fact
 	rules    []syntax.Rule
@@ -36,36 +36,35 @@ type repl struct {
 }
 
 func newREPL(eng *seminaive.Engine) *repl {
-	shell := readline.NewShell()
-	shell.Prompt.Primary(func() string { return "?> " })
-	shell.Prompt.Secondary(func() string { return ".. " })
+	rl := readline.NewInstance()
 
 	r := &repl{
-		shell:  shell,
+		rl:     rl,
 		out:    os.Stdout,
 		engine: eng,
 	}
 
-	// Datalog statements terminate with '.' or '?'; dot-commands are always single-line.
-	shell.AcceptMultiline = func(line []rune) bool {
-		text := strings.TrimSpace(string(line))
-		if text == "" || strings.HasPrefix(text, ".") {
-			return true
-		}
-		return strings.HasSuffix(text, ".") || strings.HasSuffix(text, "?")
-	}
-
-	shell.Completer = r.complete
+	rl.TabCompleter = r.tabComplete
 
 	// Persist history to disk when possible.
 	if dir, err := os.UserCacheDir(); err == nil {
 		histDir := filepath.Join(dir, "datalog")
 		if err := os.MkdirAll(histDir, 0700); err == nil {
-			shell.History.AddFromFile("history", filepath.Join(histDir, "history"))
+			rl.History = loadFileHistory(filepath.Join(histDir, "history"))
 		}
 	}
 
 	return r
+}
+
+// isStatementComplete reports whether the accumulated input is a complete
+// Datalog statement or dot-command — i.e. ready for evaluation.
+func isStatementComplete(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" || strings.HasPrefix(text, ".") {
+		return true
+	}
+	return strings.HasSuffix(text, ".") || strings.HasSuffix(text, "?")
 }
 
 // run starts the REPL loop. Returns nil on clean exit.
@@ -79,26 +78,48 @@ func (r *repl) run() error {
 	fmt.Fprintln(r.out, "Type .help for commands, .quit to exit.")
 	fmt.Fprintln(r.out)
 
+	var buf strings.Builder
+	r.rl.SetPrompt("?> ")
 	for {
-		line, err := r.shell.Readline()
+		line, err := r.rl.Readline()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				if buf.Len() > 0 {
+					buf.Reset()
+					r.rl.SetPrompt("?> ")
+					continue
+				}
 				fmt.Fprintln(r.out)
 				return nil
 			}
-			if errors.Is(err, readline.ErrInterrupt) {
-				continue // Ctrl-C clears the current line; keep going.
+			if errors.Is(err, readline.ErrCtrlC) {
+				buf.Reset()
+				r.rl.SetPrompt("?> ")
+				continue
 			}
 			return err
 		}
 
-		text := strings.TrimSpace(line)
-		if text == "" {
+		if buf.Len() > 0 {
+			buf.WriteByte(' ')
+		}
+		buf.WriteString(line)
+
+		full := strings.TrimSpace(buf.String())
+		if full == "" {
+			buf.Reset()
+			r.rl.SetPrompt("?> ")
 			continue
 		}
+		if !isStatementComplete(full) {
+			r.rl.SetPrompt(".. ")
+			continue
+		}
+		buf.Reset()
+		r.rl.SetPrompt("?> ")
 
-		if strings.HasPrefix(text, ".") {
-			if err := r.dispatchCommand(text); err != nil {
+		if strings.HasPrefix(full, ".") {
+			if err := r.dispatchCommand(full); err != nil {
 				if err == io.EOF {
 					return nil
 				}
@@ -107,7 +128,7 @@ func (r *repl) run() error {
 			continue
 		}
 
-		if err := r.execStatement(text); err != nil {
+		if err := r.execStatement(full); err != nil {
 			fmt.Fprintf(r.out, "error: %v\n", err)
 		}
 	}
@@ -329,8 +350,12 @@ func (r *repl) buildDB() (*memory.Database, error) {
 	return b.Build(), nil
 }
 
-// complete provides tab completions for the readline shell.
-func (r *repl) complete(line []rune, cursor int) readline.Completions {
+// tabComplete provides tab completions for the readline instance.
+// Suggestions are returned as the suffix to insert at the cursor position
+// (lmorg's tab completer appends suggestions verbatim, so we crop the
+// already-typed portion of the current word).
+func (r *repl) tabComplete(line []rune, cursor int, _ readline.DelayedTabContext) *readline.TabCompleterReturnT {
+	ret := &readline.TabCompleterReturnT{}
 	before := string(line[:cursor])
 	word := wordAtCursor(before)
 	trimmed := strings.TrimSpace(before)
@@ -342,31 +367,33 @@ func (r *repl) complete(line []rune, cursor int) readline.Completions {
 			return completeFilePath(strings.TrimSpace(trimmed[len(".load"):]))
 		}
 
-		var vals []readline.Completion
+		ret.Descriptions = map[string]string{}
 		for _, cmd := range allCommands() {
-			vals = append(vals, readline.Completion{
-				Value:       cmd.name,
-				Description: cmd.help,
-				Tag:         "commands",
-			})
+			if !strings.HasPrefix(cmd.name, word) {
+				continue
+			}
+			suffix := cmd.name[len(word):]
+			ret.Suggestions = append(ret.Suggestions, suffix)
+			ret.Descriptions[suffix] = cmd.help
 		}
-		comps := readline.CompleteRaw(vals)
-		comps.PREFIX = word
-		return comps
+		ret.Prefix = word
+		return ret
 	}
 
 	// Predicate name completions for Datalog statements.
-	names := r.allPredicateNames()
-	if len(names) == 0 {
-		return readline.Completions{}
+	for _, name := range r.allPredicateNames() {
+		if !strings.HasPrefix(name, word) {
+			continue
+		}
+		ret.Suggestions = append(ret.Suggestions, name[len(word):])
 	}
-	comps := readline.CompleteValues(names...).Tag("predicates")
-	comps.PREFIX = word
-	return comps
+	ret.Prefix = word
+	return ret
 }
 
 // completeFilePath returns completions for a partial file path.
-func completeFilePath(partial string) readline.Completions {
+func completeFilePath(partial string) *readline.TabCompleterReturnT {
+	ret := &readline.TabCompleterReturnT{}
 	dir := filepath.Dir(partial)
 	if dir == "" {
 		dir = "."
@@ -382,10 +409,9 @@ func completeFilePath(partial string) readline.Completions {
 
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return readline.Completions{}
+		return ret
 	}
 
-	var vals []readline.Completion
 	for _, e := range entries {
 		name := e.Name()
 		if strings.HasPrefix(name, ".") && !strings.HasPrefix(base, ".") {
@@ -401,13 +427,10 @@ func completeFilePath(partial string) readline.Completions {
 		if e.IsDir() {
 			path += string(filepath.Separator)
 		}
-		vals = append(vals, readline.Completion{Value: path, Tag: "files"})
+		ret.Suggestions = append(ret.Suggestions, path[len(partial):])
 	}
-	comps := readline.CompleteRaw(vals)
-	if len(vals) == 1 && strings.HasSuffix(vals[0].Value, string(filepath.Separator)) {
-		comps = comps.NoSpace('/')
-	}
-	return comps
+	ret.Prefix = partial
+	return ret
 }
 
 func (r *repl) allPredicateNames() []string {
@@ -506,3 +529,50 @@ func (r *repl) dispatchCommand(line string) error {
 	}
 	return fmt.Errorf("unknown command: %s (type .help for commands)", name)
 }
+
+// fileHistory persists REPL line history to a file, appending each new entry.
+type fileHistory struct {
+	items []string
+	path  string
+}
+
+func loadFileHistory(path string) *fileHistory {
+	h := &fileHistory{path: path}
+	if data, err := os.ReadFile(path); err == nil {
+		for line := range strings.SplitSeq(string(data), "\n") {
+			if line != "" {
+				h.items = append(h.items, line)
+			}
+		}
+	}
+	return h
+}
+
+func (h *fileHistory) Write(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return len(h.items), nil
+	}
+	if n := len(h.items); n > 0 && h.items[n-1] == s {
+		return n, nil
+	}
+	h.items = append(h.items, s)
+	if h.path != "" {
+		if f, err := os.OpenFile(h.path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600); err == nil {
+			fmt.Fprintln(f, s)
+			f.Close()
+		}
+	}
+	return len(h.items), nil
+}
+
+func (h *fileHistory) GetLine(i int) (string, error) {
+	if i < 0 || i >= len(h.items) {
+		return "", fmt.Errorf("history index %d out of range", i)
+	}
+	return h.items[i], nil
+}
+
+func (h *fileHistory) Len() int { return len(h.items) }
+
+func (h *fileHistory) Dump() any { return h.items }
