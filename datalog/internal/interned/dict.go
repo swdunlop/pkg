@@ -2,6 +2,7 @@ package interned
 
 import (
 	"cmp"
+	"fmt"
 	"slices"
 
 	"swdunlop.dev/pkg/datalog"
@@ -189,14 +190,17 @@ func typeOrder(v any) int {
 }
 
 // InternFact converts a datalog.Fact to an InternedFact.
-func (d *Dict) InternFact(fact datalog.Fact) InternedFact {
+func (d *Dict) InternFact(fact datalog.Fact) (InternedFact, error) {
 	var f InternedFact
+	if len(fact.Terms) > MaxFactArity {
+		return f, fmt.Errorf("fact %s has arity %d, exceeds maximum %d", fact.Name, len(fact.Terms), MaxFactArity)
+	}
 	f.Pred = d.Intern(fact.Name)
 	f.Arity = len(fact.Terms)
 	for i, c := range fact.Terms {
 		f.Values[i] = d.InternConstant(c)
 	}
-	return f
+	return f, nil
 }
 
 // DeInternFact converts an InternedFact back to a datalog.Fact.

@@ -148,15 +148,19 @@ func (db *Database) Predicates() iter.Seq2[string, int] {
 
 // Extend returns a new database containing all facts from db plus the extra facts.
 // The original database is not modified.
-func (db *Database) Extend(extra ...datalog.Fact) *Database {
+func (db *Database) Extend(extra ...datalog.Fact) (*Database, error) {
 	dict := db.dict.Clone()
 	facts := db.facts.Clone()
 	for _, f := range extra {
-		facts.Add(dict.InternFact(f))
+		interned, err := dict.InternFact(f)
+		if err != nil {
+			return nil, err
+		}
+		facts.Add(interned)
 	}
 	decls := make([]datalog.Declaration, len(db.decls))
 	copy(decls, db.decls)
-	return &Database{dict: dict, facts: facts, decls: decls}
+	return &Database{dict: dict, facts: facts, decls: decls}, nil
 }
 
 // Builder constructs a Database programmatically.
@@ -180,8 +184,13 @@ func (b *Builder) AddDeclaration(d datalog.Declaration) {
 }
 
 // AddFact adds a fact to the database.
-func (b *Builder) AddFact(f datalog.Fact) {
-	b.facts.Add(b.dict.InternFact(f))
+func (b *Builder) AddFact(f datalog.Fact) error {
+	interned, err := b.dict.InternFact(f)
+	if err != nil {
+		return err
+	}
+	b.facts.Add(interned)
+	return nil
 }
 
 // Build finalizes the database and returns it.

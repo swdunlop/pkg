@@ -730,9 +730,12 @@ func TestDatabaseExtend(t *testing.T) {
 	b.AddFact(datalog.Fact{Name: "parent", Terms: []datalog.Constant{datalog.String("tom"), datalog.String("bob")}})
 	original := b.Build()
 
-	extended := original.Extend(
+	extended, err := original.Extend(
 		datalog.Fact{Name: "parent", Terms: []datalog.Constant{datalog.String("bob"), datalog.String("ann")}},
 	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Original should still have 1 fact.
 	origCount := 0

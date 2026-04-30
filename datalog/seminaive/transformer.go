@@ -64,7 +64,10 @@ func (t *transformer) Declarations(ctx context.Context, input datalog.Database) 
 // Transform reads facts from the input database, applies rules via semi-naive
 // evaluation, and returns a new database containing all input and derived facts.
 func (t *transformer) Transform(ctx context.Context, input datalog.Database) (datalog.Database, error) {
-	dict, existing, decls := t.loadInput(input)
+	dict, existing, decls, err := t.loadInput(input)
+	if err != nil {
+		return nil, err
+	}
 
 	// Run evaluation if we have rules.
 	if len(t.rules) > 0 || len(t.aggRules) > 0 {
@@ -166,7 +169,7 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 // loadInput reads facts from the input database into a dict and interned fact set.
 // When the input is already a memory.Database, it reuses the dict and clones the
 // facts directly via the interned.Memory hook, avoiding re-interning overhead.
-func (t *transformer) loadInput(input datalog.Database) (*interned.Dict, interned.InternedFactSet, []datalog.Declaration) {
+func (t *transformer) loadInput(input datalog.Database) (*interned.Dict, interned.InternedFactSet, []datalog.Declaration, error) {
 	// Fast path: reuse internals from a memory database.
 	if srcDict, srcFacts, _, ok := interned.Memory.Unwrap(input); ok {
 		return t.loadFromInterned(srcDict, srcFacts, input)
@@ -176,7 +179,7 @@ func (t *transformer) loadInput(input datalog.Database) (*interned.Dict, interne
 
 // loadFromInterned clones the dict and facts from an interned database, then adds
 // ruleset facts and constants. Avoids re-interning existing facts entirely.
-func (t *transformer) loadFromInterned(srcDict *interned.Dict, srcFacts interned.InternedFactSet, input datalog.Database) (*interned.Dict, interned.InternedFactSet, []datalog.Declaration) {
+func (t *transformer) loadFromInterned(srcDict *interned.Dict, srcFacts interned.InternedFactSet, input datalog.Database) (*interned.Dict, interned.InternedFactSet, []datalog.Declaration, error) {
 	dict := srcDict.Clone()
 	existing := srcFacts.Clone()
 
@@ -188,7 +191,11 @@ func (t *transformer) loadFromInterned(srcDict *interned.Dict, srcFacts interned
 
 	// Intern ground facts from the ruleset.
 	for _, f := range t.facts {
-		existing.Add(dict.InternFact(f))
+		ifact, err := dict.InternFact(f)
+		if err != nil {
+			return nil, interned.InternedFactSet{}, nil, fmt.Errorf("intern fact: %w", err)
+		}
+		existing.Add(ifact)
 	}
 
 	// Intern constants from rules so they're in the dict before evaluation.
@@ -196,11 +203,11 @@ func (t *transformer) loadFromInterned(srcDict *interned.Dict, srcFacts interned
 	// append new values (from ruleset facts/constants) at the end.
 	t.internRuleConstants(dict)
 
-	return dict, existing, decls
+	return dict, existing, decls, nil
 }
 
 // loadFromGeneric reads facts from an arbitrary Database implementation via iterators.
-func (t *transformer) loadFromGeneric(input datalog.Database) (*interned.Dict, interned.InternedFactSet, []datalog.Declaration) {
+func (t *transformer) loadFromGeneric(input datalog.Database) (*interned.Dict, interned.InternedFactSet, []datalog.Declaration, error) {
 	dict := interned.NewDict()
 	existing := interned.NewInternedFactSet()
 
@@ -225,48 +232,67 @@ func (t *transformer) loadFromGeneric(input datalog.Database) (*interned.Dict, i
 		}
 	}
 
+	// internFact is a helper to intern and add a fact, returning any error.
+	internFact := func(fact datalog.Fact) error {
+		ifact, err := dict.InternFact(fact)
+		if err != nil {
+			return err
+		}
+		existing.Add(ifact)
+		return nil
+	}
+
 	// Load facts for declared predicates.
 	for pred, arities := range predArities {
 		for arity := range arities {
 			for row := range input.Facts(pred, arity) {
-				fact := datalog.Fact{Name: pred, Terms: row}
-				existing.Add(dict.InternFact(fact))
+				if err := internFact(datalog.Fact{Name: pred, Terms: row}); err != nil {
+					return nil, interned.InternedFactSet{}, nil, err
+				}
 			}
 		}
 	}
 
 	// Load facts for predicates referenced in rules but not declared.
-	loadUndeclaredPred := func(a syntax.Atom) {
+	loadUndeclaredPred := func(a syntax.Atom) error {
 		if isConstraint(a) || isBindBuiltin(a, t.builtins) || a.Pred == "is" || isExternalPred(a, t.externals) {
-			return
+			return nil
 		}
 		arity := len(a.Terms)
 		if predArities[a.Pred] != nil && predArities[a.Pred][arity] {
-			return
+			return nil
 		}
 		for row := range input.Facts(a.Pred, arity) {
-			fact := datalog.Fact{Name: a.Pred, Terms: row}
-			existing.Add(dict.InternFact(fact))
+			if err := internFact(datalog.Fact{Name: a.Pred, Terms: row}); err != nil {
+				return err
+			}
 		}
 		if predArities[a.Pred] == nil {
 			predArities[a.Pred] = map[int]bool{}
 		}
 		predArities[a.Pred][arity] = true
+		return nil
 	}
 	for _, r := range t.rules {
 		for _, a := range r.Body {
-			loadUndeclaredPred(a)
+			if err := loadUndeclaredPred(a); err != nil {
+				return nil, interned.InternedFactSet{}, nil, err
+			}
 		}
 	}
 	for _, ar := range t.aggRules {
 		for _, a := range ar.Body {
-			loadUndeclaredPred(a)
+			if err := loadUndeclaredPred(a); err != nil {
+				return nil, interned.InternedFactSet{}, nil, err
+			}
 		}
 	}
 
 	// Intern ground facts from the ruleset.
 	for _, f := range t.facts {
-		existing.Add(dict.InternFact(f))
+		if err := internFact(f); err != nil {
+			return nil, interned.InternedFactSet{}, nil, err
+		}
 	}
 
 	// Freeze dict for deterministic ordering, remap facts.
@@ -275,7 +301,7 @@ func (t *transformer) loadFromGeneric(input datalog.Database) (*interned.Dict, i
 		existing = existing.Remap(remap)
 	}
 
-	return dict, existing, decls
+	return dict, existing, decls, nil
 }
 
 // fetchExternals performs semi-join reduction to materialize external predicate facts

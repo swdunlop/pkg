@@ -77,7 +77,10 @@ func cmdList(r *repl, _ string) error {
 		arity int
 	}
 	counts := map[predArity]int{}
-	db := r.buildDB()
+	db, err := r.buildDB()
+	if err != nil {
+		return err
+	}
 	for pred, arity := range db.Predicates() {
 		key := predArity{pred, arity}
 		for range db.Facts(pred, arity) {
@@ -129,7 +132,10 @@ func cmdFacts(r *repl, args string) error {
 	if _, err := fmt.Sscanf(args[slash+1:], "%d", &arity); err != nil {
 		return fmt.Errorf("usage: .facts <pred>/<arity>  (e.g., .facts parent/2)")
 	}
-	db := r.buildDB()
+	db, err := r.buildDB()
+	if err != nil {
+		return err
+	}
 	count := 0
 	for row := range db.Facts(pred, arity) {
 		fmt.Fprintf(r.out, "  %s(%s)\n", pred, formatTerms(row))

@@ -225,7 +225,10 @@ func (r *repl) execQuery(q *syntax.Query) error {
 		return err
 	}
 
-	db := r.buildDB()
+	db, err := r.buildDB()
+	if err != nil {
+		return err
+	}
 	output, err := t.Transform(context.Background(), db)
 	if err != nil {
 		return err
@@ -310,18 +313,20 @@ func loadFromZip(cfg jsonfacts.Config, path string) (*memory.Database, error) {
 	return cfg.LoadFS(&r.Reader)
 }
 
-func (r *repl) buildDB() *memory.Database {
+func (r *repl) buildDB() (*memory.Database, error) {
 	if r.dataDB != nil {
 		if len(r.facts) == 0 {
-			return r.dataDB
+			return r.dataDB, nil
 		}
 		return r.dataDB.Extend(r.facts...)
 	}
 	b := memory.NewBuilder()
 	for _, f := range r.facts {
-		b.AddFact(f)
+		if err := b.AddFact(f); err != nil {
+			return nil, err
+		}
 	}
-	return b.Build()
+	return b.Build(), nil
 }
 
 // complete provides tab completions for the readline shell.

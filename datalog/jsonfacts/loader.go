@@ -62,7 +62,9 @@ func (cfg *Config) LoadFS(fsys fs.FS) (*memory.Database, error) {
 		builder.AddDeclaration(d)
 	}
 	for _, f := range facts {
-		builder.AddFact(f)
+		if err := builder.AddFact(f); err != nil {
+			return nil, err
+		}
 	}
 	return builder.Build(), nil
 }
