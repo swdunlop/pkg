@@ -23,8 +23,19 @@
 //   - Pointers: Supported (scans into the value or sets to nil if NULL)
 //   - Nested structs: Supported via the "db" tag or inferred names.
 //   - JSON Columns: Use `db:"colname,json"` to scan a JSON text column into a struct,
-//     map, or slice. This is useful for storing complex data types like []string or
-//     configuration maps.
+//     map, or slice field. This is useful for storing complex data types like
+//     []string or configuration maps.
+//
+// # Implicit JSON for Top-Level Scan Targets
+//
+// When the scan target itself is a slice (other than []byte) or a map, the
+// column's text is decoded as JSON without requiring a struct or tag:
+//
+//	tags, err := db.Select[[]string]("posts", "tags").Where("id=?").Exec1(ctx, 1)
+//	meta, err := db.Select[map[string]int]("info", "data").Exec1(ctx)
+//
+// []byte remains the BLOB escape hatch and is never JSON-decoded. For JSON
+// fields nested inside a struct, use the `db:"col,json"` tag.
 //
 // # SQL Safety
 //

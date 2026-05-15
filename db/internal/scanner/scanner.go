@@ -23,9 +23,18 @@ func List[T any](stmt *sqlite.Stmt) ([]T, error) {
 	return items, err
 }
 
-// Iter steps through a statement, yielding results.
+// Iter steps through a statement, yielding results. The statement is reset on
+// exit (natural exhaustion, early break via yield returning false, or error) so
+// the cached prepared statement does not remain in a running state. Without
+// this an enclosing SAVEPOINT release would fail with "SQL statements in
+// progress" whenever the consumer stops before SQLITE_DONE.
 func Iter[T any](rerr *error, stmt *sqlite.Stmt) iter.Seq[T] {
 	return func(yield func(T) bool) {
+		defer func() {
+			if resetErr := stmt.Reset(); resetErr != nil && *rerr == nil {
+				*rerr = resetErr
+			}
+		}()
 		var it T
 		scan, err := For(&it)
 		if err != nil {
@@ -53,7 +62,15 @@ func Iter[T any](rerr *error, stmt *sqlite.Stmt) iter.Seq[T] {
 }
 
 // Get steps through a statement then scans a value, returns io.EOF if there were no more results.
+// The statement is reset before returning so the cached prepared statement is
+// no longer running; otherwise an enclosing SAVEPOINT release would fail with
+// "SQL statements in progress".
 func Get[T any](stmt *sqlite.Stmt) (ret T, err error) {
+	defer func() {
+		if resetErr := stmt.Reset(); resetErr != nil && err == nil {
+			err = resetErr
+		}
+	}()
 	scan, err := For(&ret)
 	if err != nil {
 		return
@@ -181,22 +198,25 @@ func forType(rt reflect.Type) (
 				rv.SetFloat(stmt.ColumnFloat(colIndex))
 			case reflect.Slice:
 				if rt.Elem().Kind() == reflect.Uint8 {
-					// Handle []byte
+					// []byte is the BLOB escape hatch; everything else falls
+					// through to the JSON path below.
 					n := stmt.ColumnLen(colIndex)
 					buf := make([]byte, n)
 					stmt.ColumnBytes(colIndex, buf)
 					rv.SetBytes(buf)
-				} else if rt.Elem().Kind() == reflect.String {
-					// Handle []string as JSON
-					var val []string
-					txt := stmt.ColumnText(colIndex)
-					if err := json.Unmarshal([]byte(txt), &val); err != nil {
-						return fmt.Errorf("cannot unmarshal %q into %v: %w", txt, rt, err)
-					}
-					rv.Set(reflect.ValueOf(val))
-				} else {
-					return fmt.Errorf("unsupported slice type %v", rt)
+					return nil
 				}
+				fallthrough
+			case reflect.Map:
+				// Top-level slices (other than []byte) and maps are decoded
+				// from the column's text as JSON. Use db:"col,json" on a
+				// struct field for nested cases.
+				txt := stmt.ColumnText(colIndex)
+				ptr := reflect.New(rt)
+				if err := json.Unmarshal([]byte(txt), ptr.Interface()); err != nil {
+					return fmt.Errorf("cannot unmarshal %q into %v: %w", txt, rt, err)
+				}
+				rv.Set(ptr.Elem())
 			default:
 				return fmt.Errorf("unsupported type %v", rt)
 			}

@@ -2,6 +2,7 @@ package db_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -627,6 +628,106 @@ func TestInserter_Exec_ReturningGuard(t *testing.T) {
 	_, err := db.Insert[int]("items", "val").Returning("id").Exec(ctx, "test")
 	if err == nil {
 		t.Error("expected error when using Exec with RETURNING clause on inserter")
+	}
+}
+
+// TestTx_Exec1Inside ensures that running Selector.Exec1 inside a Tx does not
+// leave the cached prepared statement in a running state. Before the scanner
+// reset fix, the trailing RELEASE SAVEPOINT failed with "cannot release
+// savepoint - SQL statements in progress".
+func TestTx_Exec1Inside(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE items (id INTEGER PRIMARY KEY, val TEXT)")
+	exec(t, ctx, "INSERT INTO items VALUES (1, 'a')")
+
+	err := db.Tx(ctx, func(ctx context.Context) error {
+		v, err := db.Select[string]("items", "val").Where("id = ?").Exec1(ctx, 1)
+		if err != nil {
+			return err
+		}
+		if v != "a" {
+			t.Errorf("expected 'a', got %q", v)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("tx: %v", err)
+	}
+}
+
+// TestTx_InsertReturning_Inside is the INSERT...RETURNING analog: the same
+// scanner.Get path is taken, so the same bug would surface.
+func TestTx_InsertReturning_Inside(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE items (id INTEGER PRIMARY KEY, val TEXT)")
+
+	err := db.Tx(ctx, func(ctx context.Context) error {
+		id, err := db.Insert[int]("items", "val").Returning("id").Exec1(ctx, "x")
+		if err != nil {
+			return err
+		}
+		if id != 1 {
+			t.Errorf("expected id 1, got %d", id)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("tx: %v", err)
+	}
+}
+
+// TestSelect_TopLevelMap exercises the implicit-JSON path for a map-typed
+// scan target. Before the scanner change, this would fail with
+// "unsupported type map[string]int".
+func TestSelect_TopLevelMap(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE info (data TEXT)")
+	exec(t, ctx, `INSERT INTO info VALUES ('{"a":1,"b":2}')`)
+
+	m, err := db.Select[map[string]int]("info", "data").Exec1(ctx)
+	if err != nil {
+		t.Fatalf("Exec1: %v", err)
+	}
+	if m["a"] != 1 || m["b"] != 2 {
+		t.Errorf("expected {a:1 b:2}, got %v", m)
+	}
+}
+
+// TestSelect_TopLevelSliceInt covers the generalized slice-as-JSON path: any
+// slice other than []byte should decode from JSON text.
+func TestSelect_TopLevelSliceInt(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE info (data TEXT)")
+	exec(t, ctx, `INSERT INTO info VALUES ('[1,2,3]')`)
+
+	xs, err := db.Select[[]int]("info", "data").Exec1(ctx)
+	if err != nil {
+		t.Fatalf("Exec1: %v", err)
+	}
+	if len(xs) != 3 || xs[0] != 1 || xs[1] != 2 || xs[2] != 3 {
+		t.Errorf("expected [1 2 3], got %v", xs)
+	}
+}
+
+// TestSelect_TopLevelRawMessageSlice guards the named-byte-slice edge case:
+// json.RawMessage is `type RawMessage []byte`, so a refactor of the []byte
+// detection could accidentally route []json.RawMessage to the BLOB arm and
+// silently produce garbage. The element Kind is reflect.Slice (not Uint8),
+// so it must fall through to the JSON path.
+func TestSelect_TopLevelRawMessageSlice(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE info (data TEXT)")
+	exec(t, ctx, `INSERT INTO info VALUES ('[{"a":1},"x",2]')`)
+
+	xs, err := db.Select[[]json.RawMessage]("info", "data").Exec1(ctx)
+	if err != nil {
+		t.Fatalf("Exec1: %v", err)
+	}
+	if len(xs) != 3 {
+		t.Fatalf("expected 3 elements, got %d (%v)", len(xs), xs)
+	}
+	if string(xs[0]) != `{"a":1}` || string(xs[1]) != `"x"` || string(xs[2]) != `2` {
+		t.Errorf("unexpected raw messages: %q %q %q", xs[0], xs[1], xs[2])
 	}
 }
 
