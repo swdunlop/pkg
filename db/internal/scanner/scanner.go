@@ -107,7 +107,7 @@ func forType(rt reflect.Type) (
 	err error,
 ) {
 	// Handle pointers by dereferencing. Allocates when non-NULL, sets nil when NULL.
-	if rt.Kind() == reflect.Ptr {
+	if rt.Kind() == reflect.Pointer {
 		elemType := rt.Elem()
 		elemScanner, err := forType(elemType)
 		if err != nil {
@@ -316,14 +316,7 @@ func (schema *fieldSchema) build(ft reflect.StructField) error {
 		return nil // ignore anonymous fields.
 	}
 
-	// Check for "json" option
-	isJSON := false
-	for _, t := range tag[1:] {
-		if t == "json" {
-			isJSON = true
-			break
-		}
-	}
+	isJSON := slices.Contains(tag[1:], "json")
 
 	err := validateName(schema.Name) // check for SQL validity of the name.
 	if err != nil {
