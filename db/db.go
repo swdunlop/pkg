@@ -63,11 +63,11 @@
 //	}
 package db
 
-// TODO: support scanning []any and map[string]any columns by assuming a JSON representation.
 // TODO: add an interface with ScanColumns() map[string]func(stmt *sqlite.Stmt, col int) to override using reflection to scan a value.
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"iter"
 	"math"
@@ -120,6 +120,28 @@ func Tx(ctx context.Context, fn func(context.Context) error) (rerr error) {
 	return rerr
 }
 
+// TxV is the value-returning form of [Tx]. The function runs inside a
+// SAVEPOINT; on error or panic the savepoint is rolled back and the zero
+// value of T is returned alongside the error. Use this instead of closing
+// over a local variable from outside the transaction:
+//
+//	story, err := db.TxV(ctx, func(ctx context.Context) (*Story, error) {
+//	    return medea.CreateStory(ctx, userID, spec)
+//	})
+func TxV[T any](ctx context.Context, fn func(context.Context) (T, error)) (T, error) {
+	var ret T
+	err := Tx(ctx, func(ctx context.Context) error {
+		var err error
+		ret, err = fn(ctx)
+		return err
+	})
+	if err != nil {
+		var zero T
+		return zero, err
+	}
+	return ret, nil
+}
+
 var savepointN atomic.Uint64
 
 // execConn executes a SQL statement on a connection without caching. Used for
@@ -163,10 +185,13 @@ func (c *cons) collect() []string {
 	return out
 }
 
-// setEntry is a cons-list node for UPDATE SET clauses.
+// setEntry is a cons-list node for UPDATE SET clauses. expr is the SQL
+// right-hand side ("?" for [Updater.Set], a caller-supplied expression for
+// [Updater.SetExpr]); values are the bind args consumed by expr's placeholders.
 type setEntry struct {
 	column string
-	value  any
+	expr   string
+	values []any
 	next   *setEntry
 }
 
@@ -186,7 +211,9 @@ func (e *setEntry) collectColumns() []string {
 	return out
 }
 
-func (e *setEntry) collectValues() []any {
+// collectExprs returns the per-entry SQL right-hand side in insertion order,
+// parallel to collectColumns.
+func (e *setEntry) collectExprs() []string {
 	if e == nil {
 		return nil
 	}
@@ -194,10 +221,30 @@ func (e *setEntry) collectValues() []any {
 	for p := e; p != nil; p = p.next {
 		n++
 	}
-	out := make([]any, n)
+	out := make([]string, n)
 	for p := e; p != nil; p = p.next {
 		n--
-		out[n] = p.value
+		out[n] = p.expr
+	}
+	return out
+}
+
+// collectValues returns the flattened bind args from every entry, in insertion
+// order. A Set("c", v) entry contributes one value; a SetExpr("c", "expr", a,
+// b) entry contributes len(args) values.
+func (e *setEntry) collectValues() []any {
+	if e == nil {
+		return nil
+	}
+	// Walk forward, stash in reverse order, then unwind so insertion order
+	// is preserved when flattening variadic args.
+	var entries []*setEntry
+	for p := e; p != nil; p = p.next {
+		entries = append(entries, p)
+	}
+	var out []any
+	for i := len(entries) - 1; i >= 0; i-- {
+		out = append(out, entries[i].values...)
 	}
 	return out
 }
@@ -506,9 +553,25 @@ type Updater[T any] struct {
 	returning *cons
 }
 
-// Set adds a SET clause to the update statement.
+// Set adds a SET clause to the update statement that binds value as a
+// parameter (column = ?). Use SetExpr when the right-hand side needs to
+// reference other columns or call SQL functions.
 func (cfg Updater[T]) Set(column string, value any) Updater[T] {
-	cfg.sets = &setEntry{column: column, value: value, next: cfg.sets}
+	cfg.sets = &setEntry{column: column, expr: `?`, values: []any{value}, next: cfg.sets}
+	return cfg
+}
+
+// SetExpr adds a SET clause using a raw SQL expression for the right-hand
+// side. Use this when the value depends on the row's current state or another
+// column, e.g. SET value = value + 1. Any ? placeholders in expr consume args
+// in order, before any WHERE-clause args:
+//
+//	db.Update[struct{}]("clock").
+//	    SetExpr("value", "value + ?", 1).
+//	    Where("id = ?").
+//	    Exec(ctx, 1)
+func (cfg Updater[T]) SetExpr(column string, expr string, args ...any) Updater[T] {
+	cfg.sets = &setEntry{column: column, expr: expr, values: args, next: cfg.sets}
 	return cfg
 }
 
@@ -591,12 +654,14 @@ func (cfg Updater[T]) SQL() string {
 	buf.WriteString(cfg.table)
 	buf.WriteString(` SET `)
 	cols := cfg.sets.collectColumns()
+	exprs := cfg.sets.collectExprs()
 	for i, col := range cols {
 		if i > 0 {
 			buf.WriteString(`, `)
 		}
 		buf.WriteString(col)
-		buf.WriteString(` = ?`)
+		buf.WriteString(` = `)
+		buf.WriteString(exprs[i])
 	}
 	buildWhere(&buf, cfg.where.collect()...)
 	buildReturning(&buf, cfg.returning.collect()...)
@@ -849,6 +914,20 @@ func start(ctx context.Context, sql string, args ...any) (stmt *sqlite.Stmt, err
 	return stmt, nil
 }
 
+// JSON wraps a value so bindStatement encodes it as JSON text. This is the
+// bind-side companion to the `db:"col,json"` scan tag, and lets callers pass
+// structs, maps, or slices to Exec / Exec1 / ExecN without pre-marshaling:
+//
+//	db.Exec(ctx, `INSERT INTO t(info) VALUES (?)`, db.JSON(myStruct))
+//
+// json.RawMessage values are bound as TEXT directly without re-marshaling.
+func JSON(v any) JSONArg { return JSONArg{value: v} }
+
+// JSONArg is the opaque wrapper returned by [JSON]. The field is unexported so
+// callers route everything through JSON; bindStatement detects the type and
+// marshals.
+type JSONArg struct{ value any }
+
 // bindStatement binds the values to the prepared statement parameters.
 func bindStatement(stmt *sqlite.Stmt, values ...any) error {
 	for i, v := range values {
@@ -889,6 +968,18 @@ func bindStatement(stmt *sqlite.Stmt, values ...any) error {
 			stmt.BindBool(idx, v)
 		case []byte:
 			stmt.BindBytes(idx, v)
+		case json.RawMessage:
+			// Already-encoded JSON; bind as TEXT (not BLOB) since SQLite's
+			// JSON path operators expect text. Must precede []byte if a
+			// case for []byte ever moves above this — type-switch matches
+			// the named type exactly.
+			stmt.BindText(idx, string(v))
+		case JSONArg:
+			raw, err := json.Marshal(v.value)
+			if err != nil {
+				return fmt.Errorf("marshal json arg %d: %w", idx, err)
+			}
+			stmt.BindText(idx, string(raw))
 		default:
 			return fmt.Errorf("unsupported bind type %T", v)
 		}

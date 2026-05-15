@@ -741,3 +741,173 @@ func TestBind_Uint64Overflow(t *testing.T) {
 		t.Error("expected error for uint64 overflow")
 	}
 }
+
+// TestBind_JSON exercises db.JSON: an arbitrary struct/map/slice argument is
+// JSON-marshaled and bound as SQLite TEXT, round-tripping through the scan
+// tag.
+func TestBind_JSON(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE docs (id INTEGER PRIMARY KEY, info TEXT)")
+
+	info := map[string]int{"a": 1, "b": 2}
+	if _, err := db.Exec(ctx, "INSERT INTO docs(info) VALUES (?)", db.JSON(info)); err != nil {
+		t.Fatalf("insert with db.JSON: %v", err)
+	}
+
+	type Doc struct {
+		ID   int            `db:"id"`
+		Info map[string]int `db:"info,json"`
+	}
+	got, err := db.Select[Doc]("docs", "id", "info").Where("id = ?").Exec1(ctx, 1)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if got.Info["a"] != 1 || got.Info["b"] != 2 {
+		t.Errorf("round-trip mismatch: %+v", got.Info)
+	}
+
+	// SQLite's json_extract should see the value as JSON, proving it was bound
+	// as TEXT rather than as the Go-rendered map syntax.
+	v, err := db.Select[int]("docs", "json_extract(info, '$.a')").Where("id = ?").Exec1(ctx, 1)
+	if err != nil {
+		t.Fatalf("json_extract: %v", err)
+	}
+	if v != 1 {
+		t.Errorf("json_extract: got %d want 1", v)
+	}
+}
+
+// TestBind_RawMessage confirms json.RawMessage takes the TEXT path, not the
+// []byte BLOB path. SQLite TEXT vs BLOB affects whether JSON operators apply.
+func TestBind_RawMessage(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE docs (info TEXT)")
+
+	if _, err := db.Exec(ctx, "INSERT INTO docs VALUES (?)", json.RawMessage(`{"x":7}`)); err != nil {
+		t.Fatalf("insert raw message: %v", err)
+	}
+	v, err := db.Select[int]("docs", "json_extract(info, '$.x')").Exec1(ctx)
+	if err != nil {
+		t.Fatalf("json_extract: %v", err)
+	}
+	if v != 7 {
+		t.Errorf("got %d want 7", v)
+	}
+}
+
+// TestBind_JSON_MarshalError surfaces marshaling failures rather than binding
+// garbage.
+func TestBind_JSON_MarshalError(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE docs (info TEXT)")
+
+	// channels are not JSON-marshalable.
+	_, err := db.Exec(ctx, "INSERT INTO docs VALUES (?)", db.JSON(make(chan int)))
+	if err == nil {
+		t.Fatal("expected marshal error")
+	}
+}
+
+// TestUpdater_SetExpr covers the SQL-expression variant of Set. Without it the
+// builder can't say SET value = value + 1 because Set binds its value as a
+// parameter.
+func TestUpdater_SetExpr(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE counters (id INTEGER PRIMARY KEY, val INTEGER NOT NULL DEFAULT 0)")
+	exec(t, ctx, "INSERT INTO counters(id, val) VALUES (1, 10)")
+
+	// SET value = value + ? with a placeholder consuming a SetExpr arg.
+	if _, err := db.Declare[struct{}]("counters").Update().
+		SetExpr("val", "val + ?", 5).
+		Where("id = ?").
+		Exec(ctx, 1); err != nil {
+		t.Fatalf("SetExpr: %v", err)
+	}
+	v, err := db.Select[int]("counters", "val").Where("id = ?").Exec1(ctx, 1)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if v != 15 {
+		t.Errorf("got %d want 15", v)
+	}
+
+	// Mixing Set (bound value) and SetExpr in one update; arg order in the
+	// final statement is: SetExpr args, then Set args, then Where args, all
+	// in column-prepend insertion order.
+	if _, err := db.Declare[struct{}]("counters").Update().
+		SetExpr("val", "val * ?", 2).
+		Set("id", 1).
+		Where("id = ?").
+		Exec(ctx, 1); err != nil {
+		t.Fatalf("mixed Set/SetExpr: %v", err)
+	}
+	v2, err := db.Select[int]("counters", "val").Where("id = ?").Exec1(ctx, 1)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if v2 != 30 {
+		t.Errorf("got %d want 30", v2)
+	}
+}
+
+// TestUpdater_SetExpr_SQL pins the generated SQL so future refactors don't
+// silently rearrange the SET-list.
+func TestUpdater_SetExpr_SQL(t *testing.T) {
+	sql := db.Declare[struct{}]("counters").Update().
+		SetExpr("val", "val + ?", 1).
+		Set("name", "x").
+		Where("id = ?").
+		SQL()
+	expected := "UPDATE counters SET val = val + ?, name = ? WHERE (id = ?)"
+	if sql != expected {
+		t.Errorf("SQL mismatch:\ngot:  %s\nwant: %s", sql, expected)
+	}
+}
+
+// TestTxV_Commit confirms the value-returning Tx propagates the return value
+// when fn succeeds.
+func TestTxV_Commit(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE items (id INTEGER PRIMARY KEY, val TEXT)")
+
+	val, err := db.TxV(ctx, func(ctx context.Context) (string, error) {
+		if _, err := db.Exec(ctx, "INSERT INTO items(id, val) VALUES (1, 'a')"); err != nil {
+			return "", err
+		}
+		return db.Select[string]("items", "val").Where("id = ?").Exec1(ctx, 1)
+	})
+	if err != nil {
+		t.Fatalf("TxV: %v", err)
+	}
+	if val != "a" {
+		t.Errorf("got %q want 'a'", val)
+	}
+}
+
+// TestTxV_Rollback confirms the value-returning Tx rolls back on error and
+// returns the zero value of T.
+func TestTxV_Rollback(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE items (id INTEGER PRIMARY KEY, val TEXT)")
+	exec(t, ctx, "INSERT INTO items VALUES (1, 'original')")
+
+	val, err := db.TxV(ctx, func(ctx context.Context) (string, error) {
+		if _, err := db.Exec(ctx, "UPDATE items SET val = 'changed' WHERE id = 1"); err != nil {
+			return "", err
+		}
+		return "would-be-result", fmt.Errorf("intentional rollback")
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if val != "" {
+		t.Errorf("expected zero string on rollback, got %q", val)
+	}
+	got, err := db.Select[string]("items", "val").Where("id = ?").Exec1(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "original" {
+		t.Errorf("expected 'original' after rollback, got %q", got)
+	}
+}
