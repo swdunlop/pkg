@@ -267,6 +267,124 @@ func TestScanner_JSON(t *testing.T) {
 	}
 }
 
+func TestColumnsOf_ExplicitTags(t *testing.T) {
+	type Block struct {
+		ID    uint64 `db:"id"`
+		Story uint64 `db:"story"`
+		Skip  string `db:"-"`
+		Text  string `db:"text"`
+	}
+	got, err := ColumnsOf[Block]()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"id", "story", "text"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
+func TestColumnsOf_InferredSnakeCase(t *testing.T) {
+	type User struct {
+		ID       int
+		UserName string
+		PDFData  []byte
+	}
+	got, err := ColumnsOf[User]()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"id", "user_name", "pdf_data"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
+func TestColumnsOf_JSONField(t *testing.T) {
+	type Doc struct {
+		ID   int                    `db:"id"`
+		Info map[string]int         `db:"info,json"`
+		Meta struct{ A int }        `db:"meta,json"`
+		Tags []string               `db:"tags,json"`
+		Raw  map[string]any         `db:"raw,ro,json"` // composed modifiers (ro currently no-op)
+	}
+	got, err := ColumnsOf[Doc]()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"id", "info", "meta", "tags", "raw"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
+func TestColumnsOf_NestedStructFlattening(t *testing.T) {
+	type Inner struct {
+		A string `db:"a"`
+		B string `db:"b"`
+	}
+	type Outer struct {
+		ID  int   `db:"id"`
+		Foo Inner `db:"foo"`
+		Bar Inner // inferred name "bar"
+	}
+	got, err := ColumnsOf[Outer]()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"id", "foo_a", "foo_b", "bar_a", "bar_b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
+func TestColumnsOf_PointerToStruct(t *testing.T) {
+	type Inner struct {
+		A string `db:"a"`
+	}
+	type Outer struct {
+		ID  int    `db:"id"`
+		Foo *Inner `db:"foo"`
+	}
+	got, err := ColumnsOf[Outer]()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"id", "foo_a"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
+func TestColumnsOf_NonStructErrors(t *testing.T) {
+	if _, err := ColumnsOf[int](); err == nil {
+		t.Error("expected error for int")
+	}
+	if _, err := ColumnsOf[[]string](); err == nil {
+		t.Error("expected error for []string")
+	}
+	if _, err := ColumnsOf[map[string]int](); err == nil {
+		t.Error("expected error for map[string]int")
+	}
+}
+
+func TestColumnsOf_PointerToStructDeref(t *testing.T) {
+	// One level of pointer-deref is acceptable: *Struct → ColumnsOf returns the
+	// struct's columns.
+	type S struct {
+		A int `db:"a"`
+		B int `db:"b"`
+	}
+	got, err := ColumnsOf[*S]()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"a", "b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v want %v", got, want)
+	}
+}
+
 func sqlExec(conn *sqlite.Conn, sql string) error {
 	stmt, err := conn.Prepare(sql)
 	if err != nil {

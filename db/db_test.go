@@ -850,6 +850,196 @@ func TestUpdater_SetExpr(t *testing.T) {
 	}
 }
 
+// TestSelect_InferredColumns verifies that Select[T] with no columns infers
+// the column list from T's struct tags rather than emitting SELECT *.
+func TestSelect_InferredColumns(t *testing.T) {
+	type Block struct {
+		ID    int    `db:"id"`
+		Story int    `db:"story"`
+		Text  string `db:"text"`
+	}
+	sql := db.Select[Block]("block").SQL()
+	expected := "SELECT id, story, text FROM block"
+	if sql != expected {
+		t.Errorf("SQL mismatch:\ngot:  %s\nwant: %s", sql, expected)
+	}
+}
+
+// TestSelect_InferredColumns_Roundtrip exercises the inferred-column path end
+// to end against a real SQLite connection.
+func TestSelect_InferredColumns_Roundtrip(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE block (id INTEGER, story INTEGER, text TEXT)")
+	exec(t, ctx, "INSERT INTO block VALUES (1, 100, 'hello')")
+
+	type Block struct {
+		ID    int    `db:"id"`
+		Story int    `db:"story"`
+		Text  string `db:"text"`
+	}
+	b, err := db.Select[Block]("block").Where("id = ?").Exec1(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.ID != 1 || b.Story != 100 || b.Text != "hello" {
+		t.Errorf("roundtrip mismatch: %+v", b)
+	}
+}
+
+// TestSelect_NonStructInferenceError pins that asking for inference on a
+// non-struct type (no columns and T is e.g. int) errors at Exec rather than
+// silently falling back to SELECT *.
+func TestSelect_NonStructInferenceError(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE nums (val INTEGER)")
+	exec(t, ctx, "INSERT INTO nums VALUES (1)")
+
+	_, err := db.Select[int]("nums").Exec1(ctx)
+	if err == nil {
+		t.Error("expected error when inferring columns for non-struct T")
+	}
+}
+
+// TestUpdater_Returning_Inferred: Returning() with no args infers from T.
+func TestUpdater_Returning_Inferred(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE counters (id INTEGER PRIMARY KEY, val INTEGER)")
+	exec(t, ctx, "INSERT INTO counters VALUES (1, 10)")
+
+	type Counter struct {
+		ID  int `db:"id"`
+		Val int `db:"val"`
+	}
+	c, err := db.Declare[Counter]("counters").Update().Set("val", 11).Where("id = ?").Returning().Exec1(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ID != 1 || c.Val != 11 {
+		t.Errorf("got %+v want {1 11}", c)
+	}
+}
+
+// TestDeclaration_Returning_UsesDeclCols pins that Returning() with no args
+// on a Declaration-derived Updater/Deleter reuses the Declaration's column
+// list rather than re-inferring from T. The difference matters when the
+// caller deliberately pinned a narrower-or-wider column list at the Declare
+// site (e.g. to lock insert-order independent of struct layout, with a
+// RETURNING list that mirrors the same explicit set).
+func TestDeclaration_Returning_UsesDeclCols(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE items (id INTEGER PRIMARY KEY, val TEXT, extra TEXT)")
+	exec(t, ctx, "INSERT INTO items(val, extra) VALUES ('hello', 'ignored')")
+
+	// Item has three fields but the Declaration pins only two columns. A
+	// bare Returning() must honor that — not silently re-infer the third.
+	type Item struct {
+		ID    int    `db:"id"`
+		Val   string `db:"val"`
+		Extra string `db:"extra"`
+	}
+	updSQL := db.Declare[Item]("items", "id", "val").Update().
+		Set("val", "world").Where("id = ?").Returning().SQL()
+	expectedUpd := "UPDATE items SET val = ? WHERE (id = ?) RETURNING id, val"
+	if updSQL != expectedUpd {
+		t.Errorf("update SQL mismatch:\ngot:  %s\nwant: %s", updSQL, expectedUpd)
+	}
+
+	delSQL := db.Declare[Item]("items", "id", "val").Delete().
+		Where("id = ?").Returning().SQL()
+	expectedDel := "DELETE FROM items WHERE (id = ?) RETURNING id, val"
+	if delSQL != expectedDel {
+		t.Errorf("delete SQL mismatch:\ngot:  %s\nwant: %s", delSQL, expectedDel)
+	}
+}
+
+// TestDeleter_Returning_Inferred: Returning() with no args infers from T.
+func TestDeleter_Returning_Inferred(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE items (id INTEGER PRIMARY KEY, val TEXT)")
+	exec(t, ctx, "INSERT INTO items VALUES (1, 'a')")
+
+	type Item struct {
+		ID  int    `db:"id"`
+		Val string `db:"val"`
+	}
+	got, err := db.Delete[Item]("items").Where("id = ?").Returning().Exec1(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != 1 || got.Val != "a" {
+		t.Errorf("got %+v want {1 a}", got)
+	}
+}
+
+// TestDeclare_NoColumns_Select: Declare[T](table) with no columns + Select()
+// emits the inferred list.
+func TestDeclare_NoColumns_Select(t *testing.T) {
+	type Item struct {
+		ID  int    `db:"id"`
+		Val string `db:"val"`
+	}
+	sql := db.Declare[Item]("items").Select().SQL()
+	expected := "SELECT id, val FROM items"
+	if sql != expected {
+		t.Errorf("SQL mismatch:\ngot:  %s\nwant: %s", sql, expected)
+	}
+}
+
+// TestDeclare_NoColumns_Insert_NoInsertions errors clearly when both the
+// Declaration and the Insert have nothing to write.
+func TestDeclare_NoColumns_Insert_NoInsertions(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE items (id INTEGER PRIMARY KEY, val TEXT)")
+
+	type Item struct {
+		ID  int    `db:"id"`
+		Val string `db:"val"`
+	}
+	_, err := db.Declare[Item]("items").Insert().Exec(ctx)
+	if err == nil {
+		t.Error("expected error for Declare(...).Insert() with no insertions")
+	}
+}
+
+// TestDeclare_NoColumns_Insert_ExplicitInsertions: even with inferred columns
+// on the Declaration (used for RETURNING), an explicit Insert("a","b") works.
+func TestDeclare_NoColumns_Insert_ExplicitInsertions(t *testing.T) {
+	ctx := setup(t)
+	exec(t, ctx, "CREATE TABLE items (id INTEGER PRIMARY KEY, val TEXT)")
+
+	type Item struct {
+		ID  int    `db:"id"`
+		Val string `db:"val"`
+	}
+	// Declaration has inferred columns {id, val}; they become the RETURNING list.
+	got, err := db.Declare[Item]("items").Insert("val").Exec1(ctx, "hello")
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if got.ID != 1 || got.Val != "hello" {
+		t.Errorf("got %+v want {1 hello}", got)
+	}
+}
+
+// TestSelect_ExplicitColumnsOverrideInference pins that an explicit column
+// list still takes precedence (and `"*"` is the literal SELECT * escape).
+func TestSelect_ExplicitColumnsOverrideInference(t *testing.T) {
+	type Item struct {
+		ID  int    `db:"id"`
+		Val string `db:"val"`
+	}
+	// Explicit columns override the inferred list.
+	sql := db.Select[Item]("items", "id").SQL()
+	if sql != "SELECT id FROM items" {
+		t.Errorf("expected explicit columns; got %s", sql)
+	}
+	// "*" is the literal escape hatch.
+	starSQL := db.Select[Item]("items", "*").SQL()
+	if starSQL != "SELECT * FROM items" {
+		t.Errorf("expected SELECT *; got %s", starSQL)
+	}
+}
+
 // TestUpdater_SetExpr_SQL pins the generated SQL so future refactors don't
 // silently rearrange the SET-list.
 func TestUpdater_SetExpr_SQL(t *testing.T) {

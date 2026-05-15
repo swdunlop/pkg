@@ -15,6 +15,49 @@
 // If the "db" tag is missing, the field name is converted to snake_case to infer
 // the column name (e.g., "UserName" -> "user_name"). Use `db:"-"` to ignore a field.
 //
+// Nested struct fields (and pointer-to-struct fields) are flattened with a
+// "parent_child" prefix to form the column name — a field named "Foo" of type
+// Inner expands to columns "foo_a", "foo_b" matching Inner's own column list.
+// Use `db:"-"` to exclude a field from this expansion.
+//
+// # Column inference: the SELECT/INSERT asymmetry
+//
+// This package distinguishes SELECT-side and INSERT-side column lists because
+// they have very different reorder safety:
+//
+//   - SELECT, RETURNING, UPDATE-RETURNING, DELETE-RETURNING columns are matched
+//     by NAME against the SQLite statement's output. Reordering the Go
+//     struct's fields cannot misroute a value to the wrong destination.
+//   - INSERT column lists are POSITIONAL. The caller writes the `?` value
+//     tuple as `Exec(ctx, args...)`. If the package inferred the column list
+//     from struct-field declaration order, *reordering a struct field* would
+//     silently rebind every value to the wrong column — same types, still
+//     compiles, may not be caught by schema constraints.
+//
+// The package therefore infers columns *only* for SELECT-side operations:
+//
+//   - [Select][T](table) with no columns → inferred from T.
+//   - [Selector.Returning] / [Updater.Returning] / [Deleter.Returning] called
+//     with no arguments → inferred from T.
+//   - [Declare][T](table) with no columns → inferred from T, available to
+//     downstream [Declaration.Select], [Declaration.Update], [Declaration.Delete].
+//
+// INSERT keeps explicit columns. Use [Declare][T](table, "a", "b") to pin the
+// insert-column order at package scope, independent of struct layout, then
+// call .Insert(...) at every insert site. A side benefit: tag renames in T
+// now produce a loud SQLite "no such column" error against the inferred
+// SELECT list rather than a silent zero-scan.
+//
+// To force a literal `SELECT *`, pass "*" as the only column:
+// `db.Select[T](table, "*")`.
+//
+// [ColumnsOf][T] is exported for callers who want the inferred list without
+// going through a builder.
+//
+// Column inference requires T to be a struct (a single pointer level is
+// dereferenced). Non-struct T — basic types, slices, maps — must use explicit
+// columns; inference returns an error rather than silently emitting SELECT *.
+//
 // # Supported Types
 //
 // The scanner supports the following Go types for column mapping:
@@ -265,19 +308,40 @@ type valuesEntry struct {
 
 // --- Declaration ---
 
-// Declare declares that there is a table with the specified columns in the database and associates it with a type,
-// making it easier to select and insert.
+// ColumnsOf returns the column names a value of T expands into when scanned,
+// inferred from struct tags (or snake_case'd field names when untagged). See
+// [scanner.ColumnsOf] for the full rules; this is a re-export so callers can
+// stay inside this package.
+func ColumnsOf[T any]() ([]string, error) {
+	return scanner.ColumnsOf[T]()
+}
+
+// Declare declares that there is a table with the specified columns in the
+// database and associates it with a type, making it easier to select and
+// insert.
+//
+// When no columns are passed, the column list is inferred from T's struct
+// tags via [ColumnsOf]. Inference failures (e.g. T is not a struct) are
+// stored on the Declaration and surfaced from any derived builder's Exec
+// call.
 func Declare[T any](table string, columns ...string) Declaration[T] {
-	return Declaration[T]{
-		table:   table,
-		columns: columns,
+	d := Declaration[T]{table: table, columns: columns}
+	if len(columns) == 0 {
+		inferred, err := ColumnsOf[T]()
+		if err != nil {
+			d.buildErr = err
+		} else {
+			d.columns = inferred
+		}
 	}
+	return d
 }
 
 // A Declaration describes how a Go type is related to a table and a set of columns.
 type Declaration[T any] struct {
-	table   string
-	columns []string
+	table    string
+	columns  []string
+	buildErr error
 }
 
 // Select returns a selector with the table and columns determined by the declaration.
@@ -287,20 +351,36 @@ func (cfg Declaration[T]) Select() Selector[T] {
 		cols = cols.prepend(c)
 	}
 	return Selector[T]{
-		from:    cfg.table,
-		columns: cols,
+		from:     cfg.table,
+		columns:  cols,
+		buildErr: cfg.buildErr,
 	}
 }
 
 // Update returns an Updater with the table determined by the declaration.
+// The declaration's columns are carried as the default RETURNING list, used
+// when [Updater.Returning] is called with no arguments.
 func (cfg Declaration[T]) Update() Updater[T] {
 	return Updater[T]{
-		table: cfg.table,
+		table:    cfg.table,
+		declCols: cfg.columns,
+		buildErr: cfg.buildErr,
 	}
 }
 
-// Insert returns an Inserter with the table and returned columns determined by the declaration.
+// Insert returns an Inserter with the table and returned columns determined
+// by the declaration.
+//
+// Calling Insert with no insertions on a Declaration that also has no columns
+// (typically `Declare[T](table).Insert()` where T's column list was deferred
+// to inference) is an error: there's nothing to insert and nothing to
+// RETURNING. The error is surfaced at Exec time.
 func (cfg Declaration[T]) Insert(insertions ...string) Inserter[T] {
+	ins := Inserter[T]{table: cfg.table, buildErr: cfg.buildErr}
+	if ins.buildErr == nil && len(insertions) == 0 {
+		ins.buildErr = fmt.Errorf(`Declare(%q).Insert(): no insertions provided — pass insertion columns to Insert, e.g. Declare[T](%q, "a", "b").Insert("a", "b")`, cfg.table, cfg.table)
+		return ins
+	}
 	var retCols *cons
 	for _, c := range cfg.columns {
 		retCols = retCols.prepend(c)
@@ -311,49 +391,66 @@ func (cfg Declaration[T]) Insert(insertions ...string) Inserter[T] {
 		insCols = insCols.prepend(c)
 		ph = ph.prepend("?")
 	}
-	return Inserter[T]{
-		table:      cfg.table,
-		returning:  retCols,
-		insertions: insCols,
-		values:     &valuesEntry{placeholders: ph},
-	}
+	ins.returning = retCols
+	ins.insertions = insCols
+	ins.values = &valuesEntry{placeholders: ph}
+	return ins
 }
 
 // Delete returns a Deleter with the table determined by the declaration.
+// The declaration's columns are carried as the default RETURNING list, used
+// when [Deleter.Returning] is called with no arguments.
 func (cfg Declaration[T]) Delete() Deleter[T] {
 	return Deleter[T]{
-		table: cfg.table,
+		table:    cfg.table,
+		declCols: cfg.columns,
+		buildErr: cfg.buildErr,
 	}
 }
 
 // --- Select ---
 
-// Select returns a Selector associated with a Go type, a SQL table and a list of column expressions.
-// When no columns are specified, SELECT * is emitted. Column ordering depends on the schema;
-// prefer explicit columns for struct scanning.
+// Select returns a Selector associated with a Go type, a SQL table and a list
+// of column expressions.
+//
+// When no columns are specified, the column list is inferred from T's struct
+// tags via [ColumnsOf]. Inference failure (e.g. T is not a struct) is stored
+// on the Selector and surfaced at Exec time. To force a literal SELECT *, pass
+// "*" as the only column.
 func Select[T any](table string, columns ...string) Selector[T] {
 	var cols *cons
+	var buildErr error
+	if len(columns) == 0 {
+		inferred, err := ColumnsOf[T]()
+		if err != nil {
+			buildErr = err
+		} else {
+			columns = inferred
+		}
+	}
 	for _, c := range columns {
 		cols = cols.prepend(c)
 	}
 	return Selector[T]{
-		from:    table,
-		columns: cols,
+		from:     table,
+		columns:  cols,
+		buildErr: buildErr,
 	}
 }
 
 // A Selector associates a Go type with a specification for how to select information from
 // the database.
 type Selector[T any] struct {
-	from    string
-	joins   *joinEntry
-	columns *cons
-	where   *cons
-	groupBy *cons
-	having  *cons
-	orderBy *cons
-	limit   int
-	offset  int
+	from     string
+	joins    *joinEntry
+	columns  *cons
+	where    *cons
+	groupBy  *cons
+	having   *cons
+	orderBy  *cons
+	limit    int
+	offset   int
+	buildErr error
 }
 
 // Join adds a JOIN to the selection using the named table.
@@ -424,6 +521,9 @@ func (cfg Selector[T]) Offset(offset int) Selector[T] {
 
 // Exec1 executes the query and returns a single result, or an error if there were no results.
 func (cfg Selector[T]) Exec1(ctx context.Context, args ...any) (ret T, err error) {
+	if cfg.buildErr != nil {
+		return ret, cfg.buildErr
+	}
 	stmt, err := start(ctx, cfg.SQL(), args...)
 	if err != nil {
 		return
@@ -433,6 +533,9 @@ func (cfg Selector[T]) Exec1(ctx context.Context, args ...any) (ret T, err error
 
 // ExecN executes the query and returns a slice of results.
 func (cfg Selector[T]) ExecN(ctx context.Context, args ...any) (ret []T, err error) {
+	if cfg.buildErr != nil {
+		return nil, cfg.buildErr
+	}
 	stmt, err := start(ctx, cfg.SQL(), args...)
 	if err != nil {
 		return
@@ -442,6 +545,10 @@ func (cfg Selector[T]) ExecN(ctx context.Context, args ...any) (ret []T, err err
 
 // Iter returns a Go iterator. If an error is encountered, *rerr will be updated and the iterator will stop.
 func (cfg Selector[T]) Iter(ctx context.Context, rerr *error, args ...any) iter.Seq[T] {
+	if cfg.buildErr != nil {
+		*rerr = cfg.buildErr
+		return func(yield func(T) bool) {}
+	}
 	stmt, err := start(ctx, cfg.SQL(), args...)
 	if err != nil {
 		*rerr = err
@@ -551,6 +658,11 @@ type Updater[T any] struct {
 	sets      *setEntry
 	where     *cons
 	returning *cons
+	// declCols is the column list carried over from [Declaration.Update],
+	// used as the default RETURNING list when [Updater.Returning] is called
+	// with no arguments. Empty for updaters not created from a declaration.
+	declCols []string
+	buildErr error
 }
 
 // Set adds a SET clause to the update statement that binds value as a
@@ -585,7 +697,26 @@ func (cfg Updater[T]) Where(clauses ...string) Updater[T] {
 }
 
 // Returning specifies the returned values from the update.
+//
+// When no columns are passed, the list defaults to the Declaration's columns
+// (if this Updater was created via [Declaration.Update]); otherwise it is
+// inferred from T's struct tags via [ColumnsOf]. Inference failure (e.g. T is
+// not a struct) is stored on the Updater and surfaced at Exec time.
 func (cfg Updater[T]) Returning(columns ...string) Updater[T] {
+	if len(columns) == 0 {
+		if len(cfg.declCols) > 0 {
+			columns = cfg.declCols
+		} else {
+			inferred, err := ColumnsOf[T]()
+			if err != nil {
+				if cfg.buildErr == nil {
+					cfg.buildErr = err
+				}
+				return cfg
+			}
+			columns = inferred
+		}
+	}
 	for _, c := range columns {
 		cfg.returning = cfg.returning.prepend(c)
 	}
@@ -595,6 +726,9 @@ func (cfg Updater[T]) Returning(columns ...string) Updater[T] {
 // Exec executes the update statement and returns the number of rows affected.
 // If Returning() was called, use Exec1, ExecN, or Iter instead to capture results.
 func (cfg Updater[T]) Exec(ctx context.Context, args ...any) (count int, err error) {
+	if cfg.buildErr != nil {
+		return 0, cfg.buildErr
+	}
 	if cfg.sets == nil {
 		return 0, fmt.Errorf("updater has no SET clauses")
 	}
@@ -607,6 +741,9 @@ func (cfg Updater[T]) Exec(ctx context.Context, args ...any) (count int, err err
 
 // Exec1 executes the update statement and returns a single result.
 func (cfg Updater[T]) Exec1(ctx context.Context, args ...any) (ret T, err error) {
+	if cfg.buildErr != nil {
+		return ret, cfg.buildErr
+	}
 	if cfg.sets == nil {
 		return ret, fmt.Errorf("updater has no SET clauses")
 	}
@@ -620,6 +757,9 @@ func (cfg Updater[T]) Exec1(ctx context.Context, args ...any) (ret T, err error)
 
 // ExecN executes the update statement and returns a slice of results.
 func (cfg Updater[T]) ExecN(ctx context.Context, args ...any) (ret []T, err error) {
+	if cfg.buildErr != nil {
+		return nil, cfg.buildErr
+	}
 	if cfg.sets == nil {
 		return nil, fmt.Errorf("updater has no SET clauses")
 	}
@@ -633,6 +773,10 @@ func (cfg Updater[T]) ExecN(ctx context.Context, args ...any) (ret []T, err erro
 
 // Iter returns a Go iterator for the results of the update.
 func (cfg Updater[T]) Iter(ctx context.Context, rerr *error, args ...any) iter.Seq[T] {
+	if cfg.buildErr != nil {
+		*rerr = cfg.buildErr
+		return func(yield func(T) bool) {}
+	}
 	if cfg.sets == nil {
 		err := fmt.Errorf("updater has no SET clauses")
 		*rerr = err
@@ -698,6 +842,7 @@ type Inserter[T any] struct {
 	returning  *cons
 	values     *valuesEntry
 	onConflict string
+	buildErr   error
 }
 
 // OnConflict adds an ON CONFLICT clause to the insert statement.
@@ -729,6 +874,9 @@ func (cfg Inserter[T]) Values(placeholders ...string) Inserter[T] {
 // Exec executes the insert statement and returns the number of rows inserted.
 // If Returning() was called, use Exec1, ExecN, or Iter instead to capture results.
 func (cfg Inserter[T]) Exec(ctx context.Context, args ...any) (int, error) {
+	if cfg.buildErr != nil {
+		return 0, cfg.buildErr
+	}
 	if cfg.returning != nil {
 		return 0, fmt.Errorf("inserter has RETURNING clause; use Exec1, ExecN, or Iter instead of Exec")
 	}
@@ -738,6 +886,9 @@ func (cfg Inserter[T]) Exec(ctx context.Context, args ...any) (int, error) {
 // Exec1 executes the insert statement and returns a single result.
 // Returns io.EOF if there was no result.
 func (cfg Inserter[T]) Exec1(ctx context.Context, args ...any) (result T, err error) {
+	if cfg.buildErr != nil {
+		return result, cfg.buildErr
+	}
 	stmt, err := start(ctx, cfg.SQL(), args...)
 	if err != nil {
 		return
@@ -747,6 +898,9 @@ func (cfg Inserter[T]) Exec1(ctx context.Context, args ...any) (result T, err er
 
 // ExecN executes the insert statement and returns a slice of results.
 func (cfg Inserter[T]) ExecN(ctx context.Context, args ...any) (ret []T, err error) {
+	if cfg.buildErr != nil {
+		return nil, cfg.buildErr
+	}
 	stmt, err := start(ctx, cfg.SQL(), args...)
 	if err != nil {
 		return
@@ -756,6 +910,10 @@ func (cfg Inserter[T]) ExecN(ctx context.Context, args ...any) (ret []T, err err
 
 // Iter returns a Go iterator for the results of the insert.
 func (cfg Inserter[T]) Iter(ctx context.Context, rerr *error, args ...any) iter.Seq[T] {
+	if cfg.buildErr != nil {
+		*rerr = cfg.buildErr
+		return func(yield func(T) bool) {}
+	}
 	stmt, err := start(ctx, cfg.SQL(), args...)
 	if err != nil {
 		*rerr = err
@@ -829,6 +987,11 @@ type Deleter[T any] struct {
 	table     string
 	where     *cons
 	returning *cons
+	// declCols is the column list carried over from [Declaration.Delete],
+	// used as the default RETURNING list when [Deleter.Returning] is called
+	// with no arguments. Empty for deleters not created from a declaration.
+	declCols []string
+	buildErr error
 }
 
 // Where adds constraining clauses to the deleter.
@@ -841,7 +1004,26 @@ func (cfg Deleter[T]) Where(clauses ...string) Deleter[T] {
 }
 
 // Returning specifies the returned values from the delete.
+//
+// When no columns are passed, the list defaults to the Declaration's columns
+// (if this Deleter was created via [Declaration.Delete]); otherwise it is
+// inferred from T's struct tags via [ColumnsOf]. Inference failure (e.g. T is
+// not a struct) is stored on the Deleter and surfaced at Exec time.
 func (cfg Deleter[T]) Returning(columns ...string) Deleter[T] {
+	if len(columns) == 0 {
+		if len(cfg.declCols) > 0 {
+			columns = cfg.declCols
+		} else {
+			inferred, err := ColumnsOf[T]()
+			if err != nil {
+				if cfg.buildErr == nil {
+					cfg.buildErr = err
+				}
+				return cfg
+			}
+			columns = inferred
+		}
+	}
 	for _, c := range columns {
 		cfg.returning = cfg.returning.prepend(c)
 	}
@@ -850,6 +1032,9 @@ func (cfg Deleter[T]) Returning(columns ...string) Deleter[T] {
 
 // Exec executes the delete statement and returns the number of rows affected.
 func (cfg Deleter[T]) Exec(ctx context.Context, args ...any) (count int, err error) {
+	if cfg.buildErr != nil {
+		return 0, cfg.buildErr
+	}
 	if cfg.returning != nil {
 		return 0, fmt.Errorf("deleter has RETURNING clause; use Exec1, ExecN, or Iter instead of Exec")
 	}
@@ -858,6 +1043,9 @@ func (cfg Deleter[T]) Exec(ctx context.Context, args ...any) (count int, err err
 
 // Exec1 executes the delete statement and returns a single result.
 func (cfg Deleter[T]) Exec1(ctx context.Context, args ...any) (ret T, err error) {
+	if cfg.buildErr != nil {
+		return ret, cfg.buildErr
+	}
 	stmt, err := start(ctx, cfg.SQL(), args...)
 	if err != nil {
 		return
@@ -867,6 +1055,9 @@ func (cfg Deleter[T]) Exec1(ctx context.Context, args ...any) (ret T, err error)
 
 // ExecN executes the delete statement and returns a slice of results.
 func (cfg Deleter[T]) ExecN(ctx context.Context, args ...any) (ret []T, err error) {
+	if cfg.buildErr != nil {
+		return nil, cfg.buildErr
+	}
 	stmt, err := start(ctx, cfg.SQL(), args...)
 	if err != nil {
 		return
@@ -876,6 +1067,10 @@ func (cfg Deleter[T]) ExecN(ctx context.Context, args ...any) (ret []T, err erro
 
 // Iter returns a Go iterator for the results of the delete.
 func (cfg Deleter[T]) Iter(ctx context.Context, rerr *error, args ...any) iter.Seq[T] {
+	if cfg.buildErr != nil {
+		*rerr = cfg.buildErr
+		return func(yield func(T) bool) {}
+	}
 	stmt, err := start(ctx, cfg.SQL(), args...)
 	if err != nil {
 		*rerr = err

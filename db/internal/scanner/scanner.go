@@ -89,6 +89,34 @@ func Get[T any](stmt *sqlite.Stmt) (ret T, err error) {
 // For returns a scanner function that populates the fields of ref using values scanned from a Sqlite statement.
 func For[T any](ref *T) (scan Fn, err error) { return forValue(reflect.ValueOf(ref), ``) }
 
+// ColumnsOf returns the column names a value of T expands into when scanned,
+// in struct-declaration order. Nested struct fields are flattened with
+// "parent_child" to match the prefix rule applied at scan time.
+//
+// T must be a struct (a single pointer level is dereferenced). Non-struct
+// types — including basic types, slices, and maps — return an error: there
+// are no struct tags to read, so the caller has to pass explicit columns.
+//
+// Fields with `db:"-"`, unexported fields, and anonymous-after-resolve fields
+// are excluded. JSON-tagged fields contribute a single column name.
+func ColumnsOf[T any]() ([]string, error) {
+	rt := reflect.TypeFor[T]()
+	if rt.Kind() == reflect.Pointer {
+		rt = rt.Elem()
+	}
+	if rt.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("column inference requires a struct type; got %v — pass explicit columns", rt)
+	}
+	schema := findStructSchema(rt)
+	schema.once.Do(func() { schema.build(rt) })
+	if schema.err != nil {
+		return nil, schema.err
+	}
+	out := make([]string, len(schema.Names))
+	copy(out, schema.Names)
+	return out, nil
+}
+
 // forValue uses reflection to build a scanner with an optional prefix.
 func forValue(rv reflect.Value, prefix string) (scan Fn, err error) {
 	rt := rv.Type()
@@ -246,6 +274,11 @@ var (
 
 type structSchema struct {
 	Fields []fieldSchema
+	// Names is the column-name list this struct expands into, in declaration
+	// order. Nested struct fields are flattened with "parent_child" to match
+	// the prefix rule applied by makeScanner. Populated once during build and
+	// then read-only; ColumnsOf returns a defensive copy.
+	Names []string
 
 	once sync.Once
 	err  error
@@ -268,6 +301,14 @@ func (schema *structSchema) build(rt reflect.Type) {
 			continue // ignore fields that will not scan.
 		}
 		schema.Fields = append(schema.Fields, field)
+		if field.nested != nil {
+			// Recurse: nested struct contributes prefix_child names.
+			for _, n := range field.nested.Names {
+				schema.Names = append(schema.Names, field.Name+"_"+n)
+			}
+		} else {
+			schema.Names = append(schema.Names, field.Name)
+		}
 	}
 }
 
@@ -298,6 +339,11 @@ func (schema *structSchema) makeScanner(rv reflect.Value, prefix string) (scan F
 type fieldSchema struct {
 	Index int
 	Name  string
+	// nested is the resolved schema when this field is a struct or
+	// pointer-to-struct (and not JSON-tagged). Set during build so the parent
+	// can flatten the nested struct's Names into "parent_child" entries — the
+	// same prefix rule applied at scan time by structSchema.makeScanner.
+	nested *structSchema
 
 	makeScanner func(rv reflect.Value, prefix string) (Fn, error)
 }
@@ -326,6 +372,21 @@ func (schema *fieldSchema) build(ft reflect.StructField) error {
 	if isJSON {
 		schema.makeScanner = makeJSONScanner(ft.Type)
 		return nil
+	}
+
+	// Identify nested struct (or pointer-to-struct) fields so the parent can
+	// emit flattened column names. Behavior for non-struct types is unchanged.
+	nestedType := ft.Type
+	if nestedType.Kind() == reflect.Pointer {
+		nestedType = nestedType.Elem()
+	}
+	if nestedType.Kind() == reflect.Struct {
+		nested := findStructSchema(nestedType)
+		nested.once.Do(func() { nested.build(nestedType) })
+		if nested.err != nil {
+			return nested.err
+		}
+		schema.nested = nested
 	}
 
 	schema.makeScanner, err = forType(ft.Type)
