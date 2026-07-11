@@ -12,7 +12,6 @@ import (
 	flag "github.com/spf13/pflag"
 	"gopkg.in/yaml.v3"
 	"swdunlop.dev/pkg/datalog/jsonfacts"
-	"swdunlop.dev/pkg/datalog/seminaive"
 )
 
 var (
@@ -37,7 +36,7 @@ func main() {
 		defer pprof.StopCPUProfile()
 	}
 
-	r := newREPL(seminaive.New())
+	r := newREPL()
 
 	if *configPath != "" {
 		dir := *dataDir

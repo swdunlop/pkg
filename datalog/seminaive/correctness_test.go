@@ -121,6 +121,48 @@ func TestExternalTupleArityMismatch(t *testing.T) {
 	}
 }
 
+// TestUnstratifiableFailsAtCompile verifies that a negation cycle is rejected
+// by Compile, not deferred to the first Transform.
+func TestUnstratifiableFailsAtCompile(t *testing.T) {
+	rs, err := syntax.ParseAll(`
+		p(X) :- q(X), not r(X).
+		r(X) :- q(X), not p(X).
+	`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	_, err = seminaive.New().Compile(rs)
+	if err == nil {
+		t.Fatal("expected a stratification error at compile time, got nil")
+	}
+	if !strings.Contains(err.Error(), "unstratifiable") {
+		t.Fatalf("expected an unstratifiable error, got: %v", err)
+	}
+}
+
+// TestIterationLimitErrorNamesStratum verifies that the iteration-limit error
+// identifies the stratum that failed to converge.
+func TestIterationLimitErrorNamesStratum(t *testing.T) {
+	b := memory.NewBuilder()
+	for i := range 10 {
+		b.AddFact(datalog.Fact{Name: "edge", Terms: []datalog.Constant{
+			datalog.Integer(i), datalog.Integer(i + 1),
+		}})
+	}
+
+	tr, err := syntax.Parse(seminaive.New(seminaive.WithMaxIterations(3)), `
+		path(X, Y) :- edge(X, Y).
+		path(X, Z) :- edge(X, Y), path(Y, Z).
+	`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	_, err = tr.Transform(context.Background(), b.Build())
+	if err == nil || !strings.Contains(err.Error(), "stratum [") || !strings.Contains(err.Error(), "path") {
+		t.Fatalf("expected the error to name the stratum's predicates, got: %v", err)
+	}
+}
+
 // sliceDB is a minimal generic Database (not a memory.Database) used to
 // exercise the loadFromGeneric path.
 type sliceDB struct {

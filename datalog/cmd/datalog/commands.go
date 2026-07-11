@@ -23,6 +23,7 @@ func allCommands() []command {
 		{".list", "List all predicates with fact counts", cmdList},
 		{".rules", "Show defined rules", cmdRules},
 		{".facts", "Dump facts for a predicate: .facts <pred>/<arity>", cmdFacts},
+		{".profile", "Toggle per-stratum evaluation stats: .profile [on|off]", cmdProfile},
 		{".clear", "Clear rules and/or facts: .clear [rules|facts|all]", cmdClear},
 		{".quit", "Exit the REPL", cmdQuit},
 		{".exit", "Exit the REPL", cmdQuit},
@@ -164,6 +165,25 @@ func cmdClear(r *repl, args string) error {
 		fmt.Fprintln(r.out, "All facts and rules cleared.")
 	default:
 		return fmt.Errorf("usage: .clear [rules|facts|all]")
+	}
+	return nil
+}
+
+func cmdProfile(r *repl, args string) error {
+	switch strings.TrimSpace(args) {
+	case "":
+		r.profile = !r.profile
+	case "on":
+		r.profile = true
+	case "off":
+		r.profile = false
+	default:
+		return fmt.Errorf("usage: .profile [on|off]")
+	}
+	if r.profile {
+		fmt.Fprintln(r.out, "Profiling on: queries print per-stratum stats.")
+	} else {
+		fmt.Fprintln(r.out, "Profiling off.")
 	}
 	return nil
 }

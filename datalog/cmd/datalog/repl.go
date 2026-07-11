@@ -27,7 +27,9 @@ type repl struct {
 	facts    []datalog.Fact
 	rules    []syntax.Rule
 	aggRules []syntax.AggregateRule
-	engine   *seminaive.Engine
+
+	engineOpts []seminaive.Option
+	profile    bool // print per-stratum stats after each query (.profile)
 
 	// Data source loaded via -c / -d flags.
 	configPath string
@@ -35,13 +37,13 @@ type repl struct {
 	dataDB     *memory.Database // facts loaded from data source (replaced on .reload)
 }
 
-func newREPL(eng *seminaive.Engine) *repl {
+func newREPL(opts ...seminaive.Option) *repl {
 	rl := readline.NewInstance()
 
 	r := &repl{
-		rl:     rl,
-		out:    os.Stdout,
-		engine: eng,
+		rl:         rl,
+		out:        os.Stdout,
+		engineOpts: opts,
 	}
 
 	rl.TabCompleter = r.tabComplete
@@ -241,7 +243,7 @@ func (r *repl) execQuery(q *syntax.Query) error {
 	allRules[len(r.rules)] = synth
 
 	ruleset := syntax.Ruleset{Rules: allRules, AggRules: r.aggRules}
-	t, err := r.engine.Compile(ruleset)
+	t, err := r.newEngine().Compile(ruleset)
 	if err != nil {
 		return err
 	}
@@ -291,6 +293,24 @@ func (r *repl) execQuery(q *syntax.Query) error {
 	}
 	fmt.Fprintf(r.out, "  (%d results)\n", len(results))
 	return nil
+}
+
+// newEngine builds an engine from the configured options, adding a profile
+// callback when .profile is on.
+func (r *repl) newEngine() *seminaive.Engine {
+	opts := r.engineOpts
+	if r.profile {
+		opts = append(opts[:len(opts):len(opts)], seminaive.WithProfile(r.printProfile))
+	}
+	return seminaive.New(opts...)
+}
+
+// printProfile renders per-stratum evaluation statistics after a query.
+func (r *repl) printProfile(stats []seminaive.StratumStats) {
+	for i, s := range stats {
+		fmt.Fprintf(r.out, "  stratum %d [%s]: %d rules, %d aggregates, %d facts, %d iterations, %s\n",
+			i, strings.Join(s.Predicates, " "), s.RuleCount, s.AggCount, s.FactCount, s.Iterations, s.Duration)
+	}
 }
 
 // setDataSource configures the REPL to load facts from a jsonfacts config.

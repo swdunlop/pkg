@@ -1,6 +1,7 @@
 package syntax_test
 
 import (
+	"strings"
 	"testing"
 
 	"swdunlop.dev/pkg/datalog"
@@ -191,5 +192,23 @@ func TestParseBuiltinPredicate(t *testing.T) {
 	r := result.(*syntax.Rule)
 	if r.Body[1].Pred != "@contains" {
 		t.Errorf("expected pred @contains, got %s", r.Body[1].Pred)
+	}
+}
+
+func TestParseErrorLineColumn(t *testing.T) {
+	// The stray ']' is on line 3, column 8.
+	_, err := syntax.ParseAll("a(1).\nb(2).\nc(3,   ].\n")
+	if err == nil {
+		t.Fatal("expected a parse error, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "line 3, column 8") {
+		t.Errorf("expected the error to report line 3, column 8, got: %v", msg)
+	}
+	if !strings.Contains(msg, "c(3,   ].") {
+		t.Errorf("expected the error to include the offending source line, got: %v", msg)
+	}
+	if !strings.Contains(msg, "\n\t       ^") {
+		t.Errorf("expected a caret under the offending column, got: %v", msg)
 	}
 }

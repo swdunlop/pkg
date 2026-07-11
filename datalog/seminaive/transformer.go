@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"iter"
 	"sort"
+	"strings"
 	"time"
 
 	"swdunlop.dev/pkg/datalog"
@@ -17,6 +18,7 @@ import (
 type transformer struct {
 	rules         []syntax.Rule
 	aggRules      []syntax.AggregateRule
+	strata        []stratum // computed at compile time from rules and aggRules
 	facts         []datalog.Fact
 	maxIter       int
 	builtins      map[string]BuiltinFunc
@@ -70,12 +72,9 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 		return nil, err
 	}
 
-	// Run evaluation if we have rules.
-	if len(t.rules) > 0 || len(t.aggRules) > 0 {
-		strata, err := stratify(t.rules, t.aggRules, t.builtins, t.multiBuiltins)
-		if err != nil {
-			return nil, fmt.Errorf("stratification: %w", err)
-		}
+	// Run evaluation if we have rules. Strata were computed at compile time.
+	if len(t.strata) > 0 {
+		strata := t.strata
 
 		if len(t.externals) > 0 {
 			if err := t.fetchExternals(ctx, dict, existing); err != nil {
@@ -115,7 +114,15 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 			if len(s.rules) > 0 {
 				factCount, iterations, err := ev.evalRules(ctx, s.rules, existing, t.maxIter)
 				if err != nil {
-					return nil, err
+					// Name the stratum so iteration-cap hits identify the
+					// offending predicates; %w keeps errors.Is working for
+					// context cancellation.
+					preds := make([]string, 0, len(s.predicates))
+					for p := range s.predicates {
+						preds = append(preds, p)
+					}
+					sort.Strings(preds)
+					return nil, fmt.Errorf("stratum [%s]: %w", strings.Join(preds, " "), err)
 				}
 				if stats != nil {
 					ss.FactCount += factCount

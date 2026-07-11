@@ -338,9 +338,42 @@ func (p *parser) advance() token {
 
 func (p *parser) expect(kind tokenKind) (token, error) {
 	if p.current.kind != kind {
-		return token{}, fmt.Errorf("at position %d: expected %v, got %q", p.current.pos, kindName(kind), p.current.val)
+		return token{}, p.errorf(p.current.pos, "expected %v, got %q", kindName(kind), p.current.val)
 	}
 	return p.advance(), nil
+}
+
+// errorf formats a parse error with the 1-based line and column of pos,
+// followed by the offending source line and a caret marking the column.
+func (p *parser) errorf(pos int, format string, args ...any) error {
+	input := p.lex.input
+	if pos > len(input) {
+		pos = len(input)
+	}
+	line := 1 + strings.Count(input[:pos], "\n")
+	start := strings.LastIndexByte(input[:pos], '\n') + 1
+	end := strings.IndexByte(input[pos:], '\n')
+	if end < 0 {
+		end = len(input)
+	} else {
+		end += pos
+	}
+	src := input[start:end]
+	col := pos - start
+
+	// Mirror tabs in the caret line so it aligns under the source line.
+	caret := make([]byte, 0, col+1)
+	for _, b := range []byte(src[:col]) {
+		if b == '\t' {
+			caret = append(caret, '\t')
+		} else {
+			caret = append(caret, ' ')
+		}
+	}
+	caret = append(caret, '^')
+
+	return fmt.Errorf("line %d, column %d: %s\n\t%s\n\t%s",
+		line, col+1, fmt.Sprintf(format, args...), src, caret)
 }
 
 func kindName(k tokenKind) string {
@@ -451,7 +484,7 @@ func (p *parser) parseStatement() (any, error) {
 	case tokDot:
 		// fact: atom.
 		if len(headGetters) > 0 {
-			return nil, fmt.Errorf("at position %d: patterns are not allowed in rule heads", headPatternPos)
+			return nil, p.errorf(headPatternPos, "patterns are not allowed in rule heads")
 		}
 		p.advance()
 		return &Rule{Head: head}, nil
@@ -479,7 +512,7 @@ func (p *parser) parseStatement() (any, error) {
 
 	// rule or aggregate: atom :- ...
 	if len(headGetters) > 0 {
-		return nil, fmt.Errorf("at position %d: patterns are not allowed in rule heads", headPatternPos)
+		return nil, p.errorf(headPatternPos, "patterns are not allowed in rule heads")
 	}
 	if _, err := p.expect(tokImplies); err != nil {
 		return nil, err
@@ -607,7 +640,7 @@ func (p *parser) parseComparisonAtom() (Atom, error) {
 		return Atom{}, err
 	}
 	if !isComparisonOp(p.current.kind) {
-		return Atom{}, fmt.Errorf("at position %d: expected comparison operator, got %q", p.current.pos, p.current.val)
+		return Atom{}, p.errorf(p.current.pos, "expected comparison operator, got %q", p.current.val)
 	}
 	op := p.advance().val
 	rhs, err := p.parseTerm()
@@ -655,7 +688,7 @@ func (p *parser) parseAtom() (Atom, error) {
 	}
 
 	if p.current.kind != tokIdent {
-		return Atom{}, fmt.Errorf("at position %d: expected predicate name, got %q", p.current.pos, p.current.val)
+		return Atom{}, p.errorf(p.current.pos, "expected predicate name, got %q", p.current.val)
 	}
 	pred := p.advance().val
 	return p.parseAtomTerms(pred, negated)
@@ -694,7 +727,7 @@ func (p *parser) parseArgTerm(negated bool) (datalog.Term, error) {
 		return p.parseTerm()
 	}
 	if negated {
-		return nil, fmt.Errorf("at position %d: patterns are not allowed under negation (yet)", p.current.pos)
+		return nil, p.errorf(p.current.pos, "patterns are not allowed under negation (yet)")
 	}
 	if len(p.getters) == 0 {
 		p.patternPos = p.current.pos
@@ -722,7 +755,7 @@ func (p *parser) parsePatternInto(obj datalog.Term) error {
 	case tokLBracket:
 		return p.parseArrayPattern(obj)
 	}
-	return fmt.Errorf("at position %d: expected pattern, got %q", p.current.pos, p.current.val)
+	return p.errorf(p.current.pos, "expected pattern, got %q", p.current.val)
 }
 
 // parseObjectPattern parses { field: value, ... } — open matching: the
@@ -737,13 +770,13 @@ func (p *parser) parseObjectPattern(obj datalog.Term) error {
 		switch p.current.kind {
 		case tokIdent:
 			if c := p.current.val[0]; c >= 'A' && c <= 'Z' {
-				return fmt.Errorf("at position %d: variable keys are not allowed in patterns; quote the key or enumerate with @json_items", p.current.pos)
+				return p.errorf(p.current.pos, "variable keys are not allowed in patterns; quote the key or enumerate with @json_items")
 			}
 			key = p.advance().val
 		case tokString:
 			key = p.advance().val
 		default:
-			return fmt.Errorf("at position %d: expected field key, got %q", p.current.pos, p.current.val)
+			return p.errorf(p.current.pos, "expected field key, got %q", p.current.val)
 		}
 		if _, err := p.expect(tokColon); err != nil {
 			return err
@@ -836,7 +869,7 @@ func (p *parser) parsePatternValue(emit func(val datalog.Term)) error {
 
 func (p *parser) parseIsAtom() (Atom, error) {
 	if p.current.kind != tokIdent {
-		return Atom{}, fmt.Errorf("at position %d: expected variable on left of 'is'", p.current.pos)
+		return Atom{}, p.errorf(p.current.pos, "expected variable on left of 'is'")
 	}
 	varTok := p.advance()
 	if _, err := p.expect(tokIs); err != nil {
@@ -937,14 +970,14 @@ func (p *parser) parseTerm() (datalog.Term, error) {
 		val := p.advance().val
 		n, err := strconv.ParseInt(val, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("invalid integer %q: %w", val, err)
+			return nil, p.errorf(p.prev.pos, "invalid integer %q: %v", val, err)
 		}
 		return datalog.Integer(n), nil
 	case tokFloat:
 		val := p.advance().val
 		f, err := strconv.ParseFloat(val, 64)
 		if err != nil {
-			return nil, fmt.Errorf("invalid float %q: %w", val, err)
+			return nil, p.errorf(p.prev.pos, "invalid float %q: %v", val, err)
 		}
 		return datalog.Float(f), nil
 	case tokMinus:
@@ -955,20 +988,20 @@ func (p *parser) parseTerm() (datalog.Term, error) {
 			val := p.advance().val
 			n, err := strconv.ParseInt(val, 10, 64)
 			if err != nil {
-				return nil, fmt.Errorf("invalid integer %q: %w", val, err)
+				return nil, p.errorf(p.prev.pos, "invalid integer %q: %v", val, err)
 			}
 			return datalog.Integer(-n), nil
 		case tokFloat:
 			val := p.advance().val
 			f, err := strconv.ParseFloat(val, 64)
 			if err != nil {
-				return nil, fmt.Errorf("invalid float %q: %w", val, err)
+				return nil, p.errorf(p.prev.pos, "invalid float %q: %v", val, err)
 			}
 			return datalog.Float(-f), nil
 		default:
-			return nil, fmt.Errorf("at position %d: expected number after '-'", p.current.pos)
+			return nil, p.errorf(p.current.pos, "expected number after '-'")
 		}
 	default:
-		return nil, fmt.Errorf("at position %d: expected term, got %q", p.current.pos, p.current.val)
+		return nil, p.errorf(p.current.pos, "expected term, got %q", p.current.val)
 	}
 }

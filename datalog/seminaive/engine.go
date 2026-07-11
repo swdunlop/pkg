@@ -197,9 +197,22 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 		}
 	}
 
+	// Strata depend only on the ruleset, so compute them once here; this
+	// also makes unstratifiable programs fail at compile time like every
+	// other rule error.
+	var strata []stratum
+	if len(rules) > 0 || len(ruleset.AggRules) > 0 {
+		s, err := stratify(rules, ruleset.AggRules, e.builtins, e.multiBuiltins)
+		if err != nil {
+			return nil, fmt.Errorf("stratification: %w", err)
+		}
+		strata = s
+	}
+
 	return &transformer{
 		rules:         rules,
 		aggRules:      ruleset.AggRules,
+		strata:        strata,
 		facts:         facts,
 		maxIter:       e.maxIter,
 		builtins:      e.builtins,
