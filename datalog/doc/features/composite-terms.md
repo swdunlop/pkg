@@ -342,6 +342,18 @@ prominently in jsonfacts/doc.go.
    tradeoff and give users guidance; interning throughput for large
    records (canonicalization cost per MB).
 
+## Benchmark results (work item 8)
+
+Measured on a 10k-record jsonfacts-shaped workload
+(seminaive/composite_bench_test.go, AMD Ryzen 9 8945HS):
+
+- Pattern destructure vs. pre-flattened detection: ~6.2ms vs. ~1.2ms per
+  Transform (~5.4x). Confirms the guidance: flatten hot fields, destructure
+  only in low-volume rules (alerts reaching back for evidence).
+- Composite interning (canonicalize + intern + store): ~43 MB/s of JSON
+  input, ~2.5µs per ~110-byte record. Canonicalization will not dominate
+  batch loading.
+
 ## Risks / open questions
 
 - **Memory: the dict holds every distinct composite forever** — both
