@@ -84,6 +84,7 @@ const (
 	TermInteger TermType = "integer" // matches Integer
 	TermFloat   TermType = "float"   // matches Float
 	TermID      TermType = "id"      // matches ID
+	TermJSON    TermType = "json"    // matches *Composite
 )
 
 // CheckConstant reports whether a constant matches the declared type.
@@ -103,6 +104,9 @@ func (typ TermType) CheckConstant(c Constant) bool {
 		return ok
 	case TermID:
 		_, ok := c.(ID)
+		return ok
+	case TermJSON:
+		_, ok := c.(*Composite)
 		return ok
 	}
 	return false
