@@ -317,12 +317,24 @@ func makeMatchRegexFn(assertFn func(string, []any)) func(params ...any) (any, er
 }
 
 // normalizeToConstant converts an expr output value to a typed datalog.Constant.
+// Objects and arrays become atomic Composite terms, so a mapping may assert
+// value (or any sub-object expression result) whole and let rules destructure
+// it lazily.
 func normalizeToConstant(v any) datalog.Constant {
 	switch val := v.(type) {
+	case nil:
+		return datalog.Null{}
 	case datalog.ID:
 		return val
 	case datalog.Constant:
 		return val
+	case map[string]any, []any:
+		c, err := datalog.NewComposite(val)
+		if err != nil {
+			// NaN or unsupported nested values: fall back to stringification.
+			return datalog.String(fmt.Sprintf("%v", val))
+		}
+		return c
 	case string:
 		return datalog.String(val)
 	case int:

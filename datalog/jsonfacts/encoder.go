@@ -74,6 +74,14 @@ func constantToJSON(c datalog.Constant) any {
 		return float64(v)
 	case datalog.ID:
 		return uint64(v)
+	case datalog.Bool:
+		return bool(v)
+	case datalog.Null:
+		return nil
+	case *datalog.Composite:
+		// Encodes as the decoded JSON value, so records asserted whole
+		// round-trip through the pipeline.
+		return v.Value()
 	default:
 		return c.String()
 	}

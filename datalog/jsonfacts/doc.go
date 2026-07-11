@@ -92,6 +92,37 @@
 // Matchers use a compiled regex "gate" to skip facts that cannot possibly match
 // any pattern, avoiding per-pattern overhead on non-matching strings.
 //
+// # Composite Terms: Flatten and Retain
+//
+// A mapping argument (or assert() argument) that evaluates to a JSON object
+// or array becomes a single atomic [datalog.Composite] term rather than an
+// error. Rules destructure composites lazily with patterns or the @json_*
+// builtins, so fields need not be identified before loading.
+//
+// The recommended idiom for security workloads is to flatten the hot fields
+// for indexed joins and assert the raw record once under the same synthetic
+// ID for provenance:
+//
+//	{
+//	    "expr": "let id = fresh_id(); assert(\"event\", [id, value]); assert(\"process\", [id, value.pid, value.name, value.cmdline])"
+//	}
+//
+// Detection rules run entirely on the flat predicates; only findings reach
+// back for evidence:
+//
+//	alert(Id, Record) :- suspicious(Id), event(Id, Record).
+//
+// The [Encoder] then emits the complete original record in the alert output
+// (a Composite encodes as its decoded JSON value), so evidence survives the
+// pipeline without reconstructing it from flattened predicates. Composites
+// are hash-consed: each distinct record is stored once no matter how many
+// flat facts share its ID. Note the trade-offs: the dictionary retains every
+// distinct composite for the lifetime of the database, and patterns do not
+// use column indexes — project hot fields into a derived predicate and join
+// on that instead of destructuring in every rule.
+//
+// Matchers skip composite terms; they only scan string values.
+//
 // # Declarations
 //
 // [datalog.Declaration] entries name the terms of each predicate so the [Encoder]
