@@ -756,6 +756,10 @@ func (ev *evaluator) evalBodyRecursiveV(
 		}
 		idx := item.outVarIdx
 		if idx < 0 {
+			// Constant output position acts as a filter.
+			if last := item.ca.Terms[item.ca.Arity-1]; last.VarIdx < 0 && last.ConstID == valID {
+				ev.evalBodyRecursiveV(body, negativeBody, varNames, deltaJoinIdx, delta, existing, emitted, sub, bodyIdx+1, emit)
+			}
 			return
 		}
 		if sub.Mask>>uint(idx)&1 != 0 {
@@ -1181,6 +1185,10 @@ func (ev *evaluator) queryRecursiveV(
 		}
 		outIdx := item.outVarIdx
 		if outIdx < 0 {
+			// Constant output position acts as a filter.
+			if last := item.ca.Terms[item.ca.Arity-1]; last.VarIdx < 0 && last.ConstID == valID {
+				ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
+			}
 			return
 		}
 		if sub.Mask>>uint(outIdx)&1 != 0 {

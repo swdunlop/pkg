@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"swdunlop.dev/pkg/datalog"
+	"swdunlop.dev/pkg/datalog/internal/interned"
 	"swdunlop.dev/pkg/datalog/syntax"
 )
 
@@ -163,6 +164,9 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 			if err := checkRuleSafety(r, e.builtins, e.multiBuiltins, e.externals); err != nil {
 				return nil, err
 			}
+			if err := checkRuleVarLimit(r.Head, r.Body); err != nil {
+				return nil, err
+			}
 			if len(e.decls) > 0 {
 				if err := checkRuleTypes(r, e.decls); err != nil {
 					return nil, err
@@ -176,6 +180,11 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 			if err := checkAggRuleTypes(ar, e.decls); err != nil {
 				return nil, err
 			}
+		}
+	}
+	for _, ar := range ruleset.AggRules {
+		if err := checkRuleVarLimit(ar.Head, ar.Body); err != nil {
+			return nil, err
 		}
 	}
 
@@ -287,6 +296,42 @@ func checkRuleSafety(r syntax.Rule, builtins map[string]BuiltinFunc, multiBuilti
 				return fmt.Errorf("unsafe rule: head variable %s not bound", string(v))
 			}
 		}
+	}
+	return nil
+}
+
+// checkRuleVarLimit errors when a rule uses more distinct variables than the
+// evaluator's fixed-size substitution supports. Destructuring patterns consume
+// fresh variables for intermediates, so pattern-heavy rules can hit this.
+func checkRuleVarLimit(head syntax.Atom, body []syntax.Atom) error {
+	vars := map[string]bool{}
+	addTerms := func(terms []datalog.Term) {
+		for _, t := range terms {
+			if v, ok := t.(datalog.Variable); ok {
+				vars[string(v)] = true
+			}
+		}
+	}
+	var addExpr func(expr syntax.Expr)
+	addExpr = func(expr syntax.Expr) {
+		switch e := expr.(type) {
+		case syntax.TermExpr:
+			addTerms([]datalog.Term{e.Term})
+		case syntax.BinExpr:
+			addExpr(e.Left)
+			addExpr(e.Right)
+		}
+	}
+	addTerms(head.Terms)
+	for _, a := range body {
+		addTerms(a.Terms)
+		if a.Expr != nil {
+			addExpr(a.Expr)
+		}
+	}
+	if len(vars) > interned.MaxRuleVars {
+		return fmt.Errorf("rule %s uses %d distinct variables (including pattern intermediates); the maximum is %d",
+			head.Pred, len(vars), interned.MaxRuleVars)
 	}
 	return nil
 }

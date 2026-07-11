@@ -97,4 +97,40 @@
 // Integer literals include negative numbers (-42). Float literals support
 // scientific notation (1.5e3). The parser normalizes floats that represent
 // exact integers to integer type.
+//
+// # Destructuring Patterns
+//
+// Object and array patterns in body-atom argument positions match inside
+// composite (JSON) constants:
+//
+//	suspicious(P) :- process(P, {name: Name, ppid: 4}), @ends_with(Name, ".tmp.exe").
+//	pair(A, B)    :- ev(Id, [A, B]).
+//	walk(H, T)    :- list(L), l(L, [H | T]).
+//
+// The grammar, allowed only in argument positions of positive body atoms:
+//
+//	pattern     := object_pat | array_pat
+//	object_pat  := "{" [ field ("," field)* ] "}"
+//	field       := (ident | string) ":" (term | pattern)
+//	array_pat   := "[" [ (term | pattern) ("," (term | pattern))* [ "|" var ] ] "]"
+//
+// Patterns are pure syntax sugar: the parser rewrites each pattern into a
+// fresh anonymous variable plus @json_get/@json_len/@json_slice getter atoms
+// appended to the body. The engine never sees a pattern. Consequently
+// [Rule.String] prints the desugared form, not the original pattern; the
+// printed form reparses to the same rule (explicit ?N variables are accepted
+// by the lexer).
+//
+// Object matching is open: {name: N} matches any object that has a "name"
+// key, regardless of other keys. A missing key is not an error; the
+// candidate simply fails to match. Constants in value positions act as
+// filters ({status: "active"}), repeated variables get equality semantics
+// ({src: X, dst: X}), and nested patterns recurse through fresh
+// intermediates. Unquoted field keys are literal key names and must start
+// with a lowercase letter; quote keys that begin with an uppercase letter.
+// Enumerating unknown keys is @json_items' job, not a pattern's.
+//
+// Patterns are rejected in rule heads (term construction could grow the
+// term universe and break termination) and under negation (negating a
+// desugared conjunction is not the conjunction of negations).
 package syntax

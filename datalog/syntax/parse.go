@@ -37,6 +37,11 @@ const (
 	tokStar                // *
 	tokSlash               // /
 	tokColon               // :
+	tokLBrace              // {
+	tokRBrace              // }
+	tokLBracket            // [
+	tokRBracket            // ]
+	tokPipe                // |
 )
 
 type token struct {
@@ -103,6 +108,21 @@ func (l *lexer) next() token {
 	case b == ')':
 		l.advance()
 		return token{kind: tokRParen, val: ")", pos: startPos}
+	case b == '{':
+		l.advance()
+		return token{kind: tokLBrace, val: "{", pos: startPos}
+	case b == '}':
+		l.advance()
+		return token{kind: tokRBrace, val: "}", pos: startPos}
+	case b == '[':
+		l.advance()
+		return token{kind: tokLBracket, val: "[", pos: startPos}
+	case b == ']':
+		l.advance()
+		return token{kind: tokRBracket, val: "]", pos: startPos}
+	case b == '|':
+		l.advance()
+		return token{kind: tokPipe, val: "|", pos: startPos}
 	case b == ',':
 		l.advance()
 		return token{kind: tokComma, val: ",", pos: startPos}
@@ -148,6 +168,18 @@ func (l *lexer) next() token {
 		return token{kind: tokColon, val: ":", pos: startPos}
 	case b == '?':
 		l.advance()
+		// An explicit ?N names a parser-generated variable (as printed by
+		// Rule.String for desugared patterns), letting rules round-trip.
+		if l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
+			start := l.pos
+			for l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
+				l.pos++
+			}
+			if n, err := strconv.Atoi(l.input[start:l.pos]); err == nil && n >= l.anonID {
+				l.anonID = n + 1 // fresh vars must not collide with explicit ?N
+			}
+			return token{kind: tokIdent, val: "?" + l.input[start:l.pos], pos: startPos}
+		}
 		return token{kind: tokAnon, val: "?", pos: startPos}
 	case b == '.':
 		// check if it's a float like .5
@@ -276,6 +308,20 @@ type parser struct {
 	lex     *lexer
 	current token
 	prev    token
+
+	// getters accumulates atoms desugared from destructuring patterns in
+	// the most recently parsed atom; patternPos records where the first
+	// pattern began, for error reporting when patterns are not allowed.
+	getters    []Atom
+	patternPos int
+}
+
+// takeGetters returns and clears the getter atoms desugared from patterns
+// in the last-parsed atom.
+func (p *parser) takeGetters() []Atom {
+	g := p.getters
+	p.getters = nil
+	return g
 }
 
 func newParser(input string) *parser {
@@ -347,6 +393,16 @@ func kindName(k tokenKind) string {
 		return "'>='"
 	case tokColon:
 		return "':'"
+	case tokLBrace:
+		return "'{'"
+	case tokRBrace:
+		return "'}'"
+	case tokLBracket:
+		return "'['"
+	case tokRBracket:
+		return "']'"
+	case tokPipe:
+		return "'|'"
 	default:
 		return "unknown"
 	}
@@ -381,24 +437,31 @@ func ParseAll(input string) (Ruleset, error) {
 }
 
 func (p *parser) parseStatement() (any, error) {
-	// Could be a rule, fact, aggregate rule, or query.
+	// Could be a rule, fact, aggregate rule, or query. Patterns are parsed
+	// permissively here because the first atom may turn out to be a query
+	// body atom; they are rejected below once it proves to be a head.
 	head, err := p.parseAtom()
 	if err != nil {
 		return nil, err
 	}
+	headGetters := p.takeGetters()
+	headPatternPos := p.patternPos
 
 	switch p.current.kind {
 	case tokDot:
 		// fact: atom.
+		if len(headGetters) > 0 {
+			return nil, fmt.Errorf("at position %d: patterns are not allowed in rule heads", headPatternPos)
+		}
 		p.advance()
 		return &Rule{Head: head}, nil
 	case tokAnon:
 		// single-atom query: atom?
 		p.advance()
-		return &Query{Body: []Atom{head}}, nil
+		return &Query{Body: append([]Atom{head}, headGetters...)}, nil
 	case tokComma:
 		// multi-atom query: atom, atom, ...?
-		atoms := []Atom{head}
+		atoms := append([]Atom{head}, headGetters...)
 		for p.current.kind == tokComma {
 			p.advance()
 			a, err := p.parseAtom()
@@ -406,6 +469,7 @@ func (p *parser) parseStatement() (any, error) {
 				return nil, err
 			}
 			atoms = append(atoms, a)
+			atoms = append(atoms, p.takeGetters()...)
 		}
 		if _, err := p.expect(tokAnon); err != nil {
 			return nil, err
@@ -414,6 +478,9 @@ func (p *parser) parseStatement() (any, error) {
 	}
 
 	// rule or aggregate: atom :- ...
+	if len(headGetters) > 0 {
+		return nil, fmt.Errorf("at position %d: patterns are not allowed in rule heads", headPatternPos)
+	}
 	if _, err := p.expect(tokImplies); err != nil {
 		return nil, err
 	}
@@ -444,6 +511,7 @@ func (p *parser) parseStatement() (any, error) {
 		p.lex.pos = savedPos
 		p.current = savedCurrent
 		p.prev = savedPrev
+		p.getters = nil // drop getters from a partially parsed aggregate body
 	}
 
 	body, err := p.parseAtomList()
@@ -512,6 +580,7 @@ func (p *parser) parseAtomList() ([]Atom, error) {
 		return nil, err
 	}
 	atoms = append(atoms, a)
+	atoms = append(atoms, p.takeGetters()...)
 	for p.current.kind == tokComma {
 		p.advance()
 		a, err := p.parseAtom()
@@ -519,6 +588,7 @@ func (p *parser) parseAtomList() ([]Atom, error) {
 			return nil, err
 		}
 		atoms = append(atoms, a)
+		atoms = append(atoms, p.takeGetters()...)
 	}
 	return atoms, nil
 }
@@ -597,14 +667,14 @@ func (p *parser) parseAtomTerms(pred string, negated bool) (Atom, error) {
 	}
 	var terms []datalog.Term
 	if p.current.kind != tokRParen {
-		t, err := p.parseTerm()
+		t, err := p.parseArgTerm(negated)
 		if err != nil {
 			return Atom{}, err
 		}
 		terms = append(terms, t)
 		for p.current.kind == tokComma {
 			p.advance()
-			t, err := p.parseTerm()
+			t, err := p.parseArgTerm(negated)
 			if err != nil {
 				return Atom{}, err
 			}
@@ -615,6 +685,153 @@ func (p *parser) parseAtomTerms(pred string, negated bool) (Atom, error) {
 		return Atom{}, err
 	}
 	return Atom{Pred: pred, Terms: terms, Negated: negated}, nil
+}
+
+// parseArgTerm parses one atom argument: a plain term, or a destructuring
+// pattern that desugars into a fresh variable plus getter atoms.
+func (p *parser) parseArgTerm(negated bool) (datalog.Term, error) {
+	if p.current.kind != tokLBrace && p.current.kind != tokLBracket {
+		return p.parseTerm()
+	}
+	if negated {
+		return nil, fmt.Errorf("at position %d: patterns are not allowed under negation (yet)", p.current.pos)
+	}
+	if len(p.getters) == 0 {
+		p.patternPos = p.current.pos
+	}
+	fresh := p.freshVar()
+	if err := p.parsePatternInto(fresh); err != nil {
+		return nil, err
+	}
+	return fresh, nil
+}
+
+// freshVar allocates a parser-generated anonymous variable (?0, ?1, ...).
+func (p *parser) freshVar() datalog.Variable {
+	name := fmt.Sprintf("?%d", p.lex.anonID)
+	p.lex.anonID++
+	return datalog.Variable(name)
+}
+
+// parsePatternInto parses an object or array pattern and appends getter
+// atoms binding the pattern's parts of obj to p.getters.
+func (p *parser) parsePatternInto(obj datalog.Term) error {
+	switch p.current.kind {
+	case tokLBrace:
+		return p.parseObjectPattern(obj)
+	case tokLBracket:
+		return p.parseArrayPattern(obj)
+	}
+	return fmt.Errorf("at position %d: expected pattern, got %q", p.current.pos, p.current.val)
+}
+
+// parseObjectPattern parses { field: value, ... } — open matching: the
+// object may have keys beyond those named. Each field desugars to
+// @json_get(obj, "key", value).
+func (p *parser) parseObjectPattern(obj datalog.Term) error {
+	if _, err := p.expect(tokLBrace); err != nil {
+		return err
+	}
+	for p.current.kind != tokRBrace {
+		var key string
+		switch p.current.kind {
+		case tokIdent:
+			if c := p.current.val[0]; c >= 'A' && c <= 'Z' {
+				return fmt.Errorf("at position %d: variable keys are not allowed in patterns; quote the key or enumerate with @json_items", p.current.pos)
+			}
+			key = p.advance().val
+		case tokString:
+			key = p.advance().val
+		default:
+			return fmt.Errorf("at position %d: expected field key, got %q", p.current.pos, p.current.val)
+		}
+		if _, err := p.expect(tokColon); err != nil {
+			return err
+		}
+		err := p.parsePatternValue(func(val datalog.Term) {
+			p.getters = append(p.getters, Atom{
+				Pred:  "@json_get",
+				Terms: []datalog.Term{obj, datalog.String(key), val},
+			})
+		})
+		if err != nil {
+			return err
+		}
+		if p.current.kind != tokComma {
+			break
+		}
+		p.advance()
+	}
+	_, err := p.expect(tokRBrace)
+	return err
+}
+
+// parseArrayPattern parses [ e0, e1, ... ] or [ e0, ... | Rest ]. Fixed
+// arrays desugar to @json_len plus indexed @json_get atoms; a | tail
+// desugars to @json_slice, which strictly shrinks and so terminates
+// under recursion.
+func (p *parser) parseArrayPattern(obj datalog.Term) error {
+	if _, err := p.expect(tokLBracket); err != nil {
+		return err
+	}
+	idx := int64(0)
+	var rest datalog.Term
+	for p.current.kind != tokRBracket && rest == nil {
+		err := p.parsePatternValue(func(val datalog.Term) {
+			p.getters = append(p.getters, Atom{
+				Pred:  "@json_get",
+				Terms: []datalog.Term{obj, datalog.Integer(idx), val},
+			})
+		})
+		if err != nil {
+			return err
+		}
+		idx++
+		switch p.current.kind {
+		case tokComma:
+			p.advance()
+		case tokPipe:
+			p.advance()
+			t, err := p.parseTerm()
+			if err != nil {
+				return err
+			}
+			rest = t
+		}
+	}
+	if _, err := p.expect(tokRBracket); err != nil {
+		return err
+	}
+	if rest != nil {
+		p.getters = append(p.getters, Atom{
+			Pred:  "@json_slice",
+			Terms: []datalog.Term{obj, datalog.Integer(idx), rest},
+		})
+	} else {
+		p.getters = append(p.getters, Atom{
+			Pred:  "@json_len",
+			Terms: []datalog.Term{obj, datalog.Integer(idx)},
+		})
+	}
+	return nil
+}
+
+// parsePatternValue parses a field or element position inside a pattern:
+// either a plain term or a nested pattern via a fresh intermediate variable.
+// emit receives the value term before any nested pattern's getters are
+// appended, so getters bind each intermediate before it is used.
+func (p *parser) parsePatternValue(emit func(val datalog.Term)) error {
+	if p.current.kind == tokLBrace || p.current.kind == tokLBracket {
+		fresh := p.freshVar()
+		emit(fresh)
+		return p.parsePatternInto(fresh)
+	}
+	t, err := p.parseTerm()
+	if err != nil {
+		return err
+	}
+	emit(t)
+	return nil
 }
 
 func (p *parser) parseIsAtom() (Atom, error) {
