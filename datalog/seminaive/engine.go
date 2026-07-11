@@ -139,9 +139,12 @@ func WithProfile(fn func([]StratumStats)) Option {
 	return func(e *Engine) { e.profile = fn }
 }
 
-// New creates a new semi-naive Engine.
+// New creates a new semi-naive Engine. The JSON destructuring builtins
+// (@json_get, @json_len, @json_type, @json_slice, @json_each, @json_items)
+// are always registered; options may override them by name.
 func New(options ...Option) *Engine {
 	e := &Engine{maxIter: defaultMaxIter}
+	registerJSONBuiltins(e)
 	for _, o := range options {
 		o(e)
 	}
