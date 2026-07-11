@@ -586,7 +586,7 @@ echo 'ancestor("tom", X)?' | datalog -c schema.yaml -d ./data rules.dl
 JSONL files ──→ jsonfacts.Config.LoadDir() ──→ memory.Database
                                                       │
 Datalog rules ──→ syntax.ParseAll() ──→ Ruleset       │
-                                          │            │
+                                          │           │
                   seminaive.New().Compile(rs) ──→ Transformer
                                                       │
                                     tr.Transform(ctx, db)
