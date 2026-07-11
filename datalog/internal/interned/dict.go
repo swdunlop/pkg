@@ -26,17 +26,34 @@ func NewDict() *Dict {
 	}
 }
 
+// compositeKey is the comparable index key for a *datalog.Composite: its
+// canonical encoding. It is a distinct type so a composite can never collide
+// with a String term whose value happens to be JSON text.
+type compositeKey string
+
+// indexKey converts a value to the comparable key it is indexed under.
+// Composites are not comparable, so they index under their canonical
+// encoding; everything else indexes as itself.
+func indexKey(v any) any {
+	if c, ok := v.(*datalog.Composite); ok {
+		return compositeKey(c.Canonical())
+	}
+	return v
+}
+
 // Intern returns the ID for a value, assigning a new one if needed.
 // Integer-valued float64 values are normalized to int64 so that
 // JSON-loaded numbers (always float64) match Datalog integer literals.
+// *datalog.Composite values are hash-consed by canonical encoding.
 func (d *Dict) Intern(v any) uint64 {
 	v = NormalizeNumeric(v)
-	if id, ok := d.index[v]; ok {
+	key := indexKey(v)
+	if id, ok := d.index[key]; ok {
 		return id
 	}
 	id := uint64(len(d.values))
 	d.values = append(d.values, v)
-	d.index[v] = id
+	d.index[key] = id
 	return id
 }
 
@@ -50,6 +67,12 @@ func (d *Dict) InternConstant(c datalog.Constant) uint64 {
 	case datalog.String:
 		return d.Intern(string(v))
 	case datalog.ID:
+		return d.Intern(v)
+	case datalog.Bool:
+		return d.Intern(v)
+	case datalog.Null:
+		return d.Intern(v)
+	case *datalog.Composite:
 		return d.Intern(v)
 	}
 	panic("unknown constant type")
@@ -73,6 +96,8 @@ func (d *Dict) Resolve(id uint64) any {
 }
 
 // ResolveConstant resolves a dict ID to a typed datalog.Constant.
+// A *datalog.Composite is returned as-is, so repeated resolution yields
+// pointer-identical results within one dict.
 func (d *Dict) ResolveConstant(id uint64) datalog.Constant {
 	switch v := d.values[id].(type) {
 	case float64:
@@ -82,6 +107,12 @@ func (d *Dict) ResolveConstant(id uint64) datalog.Constant {
 	case string:
 		return datalog.String(v)
 	case datalog.ID:
+		return v
+	case datalog.Bool:
+		return v
+	case datalog.Null:
+		return v
+	case *datalog.Composite:
 		return v
 	}
 	panic("unknown value type in dict")
@@ -94,7 +125,7 @@ func (d *Dict) Len() int {
 
 // Has reports whether a value is already interned.
 func (d *Dict) Has(v any) (uint64, bool) {
-	id, ok := d.index[NormalizeNumeric(v)]
+	id, ok := d.index[indexKey(NormalizeNumeric(v))]
 	return id, ok
 }
 
@@ -130,7 +161,7 @@ func (d *Dict) Freeze() []uint64 {
 	remap := make([]uint64, n)
 	for newID, e := range entries {
 		d.values[newID] = e.value
-		d.index[e.value] = uint64(newID)
+		d.index[indexKey(e.value)] = uint64(newID)
 		remap[e.oldID] = uint64(newID)
 	}
 
@@ -139,7 +170,8 @@ func (d *Dict) Freeze() []uint64 {
 }
 
 // dictCompare orders values for sorted dictionary construction.
-// Type order: float64 (0) < int64 (1) < string (2).
+// Type order: float64 (0) < int64 (1) < string (2) < ID (3) < composite (4)
+// < bool (5) < null (6).
 func dictCompare(a, b any) int {
 	ta, tb := typeOrder(a), typeOrder(b)
 	if ta != tb {
@@ -154,6 +186,18 @@ func dictCompare(a, b any) int {
 		return cmp.Compare(va, b.(string))
 	case datalog.ID:
 		return cmp.Compare(va, b.(datalog.ID))
+	case *datalog.Composite:
+		return cmp.Compare(va.Canonical(), b.(*datalog.Composite).Canonical())
+	case datalog.Bool:
+		vb := b.(datalog.Bool)
+		switch {
+		case va == vb:
+			return 0
+		case !bool(va):
+			return -1
+		default:
+			return 1
+		}
 	}
 	return 0
 }
@@ -184,8 +228,14 @@ func typeOrder(v any) int {
 		return 2
 	case datalog.ID:
 		return 3
-	default:
+	case *datalog.Composite:
 		return 4
+	case datalog.Bool:
+		return 5
+	case datalog.Null:
+		return 6
+	default:
+		return 7
 	}
 }
 

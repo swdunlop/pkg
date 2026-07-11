@@ -234,6 +234,14 @@ func constantToAny(c datalog.Constant) any {
 		return int64(v)
 	case datalog.String:
 		return string(v)
+	case datalog.ID:
+		return v
+	case datalog.Bool:
+		return v
+	case datalog.Null:
+		return v
+	case *datalog.Composite:
+		return v
 	}
 	panic("unknown constant type")
 }
