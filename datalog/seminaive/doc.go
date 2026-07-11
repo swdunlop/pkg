@@ -91,7 +91,9 @@
 //
 // # Options
 //
-// Use [WithMaxIterations] to limit the number of fixpoint iterations (default 10000):
+// Use [WithMaxIterations] to limit the number of fixpoint iterations (default 10000).
+// Transform returns an error if a stratum has not converged when the limit is
+// reached, rather than returning incomplete results:
 //
 //	engine := seminaive.New(seminaive.WithMaxIterations(500))
 package seminaive

@@ -113,7 +113,7 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 			}
 
 			if len(s.rules) > 0 {
-				factCount, iterations, err := ev.evalRules(s.rules, existing, t.maxIter)
+				factCount, iterations, err := ev.evalRules(ctx, s.rules, existing, t.maxIter)
 				if err != nil {
 					return nil, err
 				}
@@ -222,17 +222,6 @@ func (t *transformer) loadFromGeneric(input datalog.Database) (*interned.Dict, i
 		}
 	}
 
-	// Discover predicates from declarations.
-	predArities := map[string]map[int]bool{}
-	for d := range input.Declarations() {
-		if predArities[d.Name] == nil {
-			predArities[d.Name] = map[int]bool{}
-		}
-		if len(d.Terms) > 0 {
-			predArities[d.Name][len(d.Terms)] = true
-		}
-	}
-
 	// internFact is a helper to intern and add a fact, returning any error.
 	internFact := func(fact datalog.Fact) error {
 		ifact, err := dict.InternFact(fact)
@@ -243,7 +232,16 @@ func (t *transformer) loadFromGeneric(input datalog.Database) (*interned.Dict, i
 		return nil
 	}
 
-	// Load facts for declared predicates.
+	// Load every predicate the input reports, so the output carries all
+	// input facts regardless of whether rules reference them — matching
+	// the memory.Database fast path, which clones the whole fact set.
+	predArities := map[string]map[int]bool{}
+	for pred, arity := range input.Predicates() {
+		if predArities[pred] == nil {
+			predArities[pred] = map[int]bool{}
+		}
+		predArities[pred][arity] = true
+	}
 	for pred, arities := range predArities {
 		for arity := range arities {
 			for row := range input.Facts(pred, arity) {
@@ -254,7 +252,8 @@ func (t *transformer) loadFromGeneric(input datalog.Database) (*interned.Dict, i
 		}
 	}
 
-	// Load facts for predicates referenced in rules but not declared.
+	// Load facts for rule-referenced predicates the input did not report,
+	// in case a Database implementation under-reports Predicates.
 	loadUndeclaredPred := func(a syntax.Atom) error {
 		if isConstraint(a) || isBindBuiltin(a, t.builtins) || isMultiBindBuiltin(a, t.multiBuiltins) || a.Pred == "is" || isExternalPred(a, t.externals) {
 			return nil
@@ -394,13 +393,13 @@ func (t *transformer) fetchExternals(ctx context.Context, dict *interned.Dict, e
 
 		predID := dict.Intern(predName)
 		for tuple := range pd.ep.fn(ctx, b) {
+			if len(tuple) != pd.ep.arity {
+				return fmt.Errorf("external predicate %s: expected tuples of arity %d, got %d", predName, pd.ep.arity, len(tuple))
+			}
 			var fact interned.InternedFact
 			fact.Pred = predID
 			fact.Arity = pd.ep.arity
 			for j, v := range tuple {
-				if j >= interned.MaxFactArity {
-					break
-				}
 				fact.Values[j] = dict.Intern(v)
 			}
 			existing.Add(fact)

@@ -2,6 +2,8 @@ package seminaive
 
 import (
 	"cmp"
+	"context"
+	"fmt"
 	"regexp"
 	"strings"
 	"sync"
@@ -469,7 +471,10 @@ type evaluator struct {
 }
 
 // evalRules runs semi-naive evaluation for a set of rules to fixpoint.
-func (ev *evaluator) evalRules(rules []syntax.Rule, existing interned.InternedFactSet, maxIter int) (factCount int, iterations int, err error) {
+// It returns an error if the fixpoint is not reached within maxIter
+// iterations or the context is cancelled mid-evaluation; the partial
+// results are discarded in either case.
+func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existing interned.InternedFactSet, maxIter int) (factCount int, iterations int, err error) {
 	emitted := interned.NewLightInternedFactSet()
 	delta := interned.NewLightInternedFactSet()
 
@@ -539,6 +544,9 @@ func (ev *evaluator) evalRules(rules []syntax.Rule, existing interned.InternedFa
 	}
 
 	for iterations = range maxIter {
+		if err := ctx.Err(); err != nil {
+			return factCount, iterations, err
+		}
 		if iterations > 0 {
 			existing.Merge(emitted)
 			delta = emitted
@@ -588,6 +596,14 @@ func (ev *evaluator) evalRules(rules []syntax.Rule, existing interned.InternedFa
 		if len(emitted.Index) == 0 {
 			break
 		}
+	}
+
+	// The loop only leaves emitted non-empty when it ran out of iterations,
+	// which means the results are incomplete, not converged.
+	if len(emitted.Index) != 0 {
+		return factCount, iterations + 1, fmt.Errorf(
+			"fixpoint not reached after %d iterations; results would be incomplete (raise the limit with seminaive.WithMaxIterations)",
+			maxIter)
 	}
 
 	existing.Merge(emitted)
