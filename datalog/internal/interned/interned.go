@@ -178,10 +178,31 @@ type PredArityI struct {
 	Arity int
 }
 
+// colIndex indexes one argument position of one (pred, arity) fact slice.
+// Facts at positions >= indexedUpTo are not yet indexed; catchUp extends
+// the index to cover them. Facts are append-only, so entries never go stale.
+type colIndex struct {
+	m           map[uint64][]int32 // value -> positions in factChunks.facts
+	indexedUpTo int32
+}
+
+// catchUp extends the index to cover facts appended since the last scan.
+func (ci *colIndex) catchUp(facts []InternedFact, col int) {
+	for i := ci.indexedUpTo; i < int32(len(facts)); i++ {
+		v := facts[i].Values[col]
+		ci.m[v] = append(ci.m[v], i)
+	}
+	ci.indexedUpTo = int32(len(facts))
+}
+
+// minIndexSize is the minimum fact count before Scan builds a column index.
+// Below this, a full scan filtered by MatchesBound is cheaper than a map.
+const minIndexSize = 64
+
 // InternedFactSet is an in-memory set of interned facts.
 type InternedFactSet struct {
 	ByPred map[PredArityI]*factChunks
-	ByArg0 map[PredArityI]map[uint64][]int32 // nil for light sets; values are indices into ByPred factChunks
+	ByCol  map[PredArityI]map[int]*colIndex // nil for light sets; built lazily by Scan
 	Index  map[uint64]struct{}
 }
 
@@ -214,7 +235,7 @@ func (r ScanResult) Fact(i int) *InternedFact {
 func NewInternedFactSet() InternedFactSet {
 	return InternedFactSet{
 		ByPred: make(map[PredArityI]*factChunks),
-		ByArg0: make(map[PredArityI]map[uint64][]int32),
+		ByCol:  make(map[PredArityI]map[int]*colIndex),
 		Index:  make(map[uint64]struct{}),
 	}
 }
@@ -222,7 +243,7 @@ func NewInternedFactSet() InternedFactSet {
 func NewInternedFactSetCap(indexCap int) InternedFactSet {
 	return InternedFactSet{
 		ByPred: make(map[PredArityI]*factChunks),
-		ByArg0: make(map[PredArityI]map[uint64][]int32),
+		ByCol:  make(map[PredArityI]map[int]*colIndex),
 		Index:  make(map[uint64]struct{}, indexCap),
 	}
 }
@@ -478,15 +499,6 @@ func (fs InternedFactSet) AddWithKey(fact InternedFact, fk uint64) bool {
 		fs.ByPred[k] = fc
 	}
 	fc.append(fact)
-	if fs.ByArg0 != nil && fact.Arity > 0 {
-		idx := int32(len(fc.facts) - 1)
-		m := fs.ByArg0[k]
-		if m == nil {
-			m = make(map[uint64][]int32)
-			fs.ByArg0[k] = m
-		}
-		m[fact.Values[0]] = append(m[fact.Values[0]], idx)
-	}
 	return true
 }
 
@@ -501,15 +513,6 @@ func (fs InternedFactSet) AddUnchecked(fact InternedFact, fk uint64) {
 		fs.ByPred[k] = fc
 	}
 	fc.append(fact)
-	if fs.ByArg0 != nil && fact.Arity > 0 {
-		idx := int32(len(fc.facts) - 1)
-		m := fs.ByArg0[k]
-		if m == nil {
-			m = make(map[uint64][]int32)
-			fs.ByArg0[k] = m
-		}
-		m[fact.Values[0]] = append(m[fact.Values[0]], idx)
-	}
 }
 
 func (fs InternedFactSet) Get(pred uint64, arity int) []InternedFact {
@@ -519,94 +522,95 @@ func (fs InternedFactSet) Get(pred uint64, arity int) []InternedFact {
 	return nil
 }
 
-// Scan returns facts matching bound arguments. If arg0 is bound and the
-// ByArg0 index is available, uses it for O(1) lookup; otherwise falls back
-// to a full predicate scan.
+// Scan returns facts matching bound arguments. When a column index is
+// available (or worth building) for a bound position, uses it for O(1)
+// lookup; otherwise falls back to a full predicate scan.
+//
+// Scan builds and extends column indexes lazily, so it mutates the set.
+// It is NOT safe for concurrent use -- same contract as Add, but
+// non-obvious because scans look read-only.
 func (fs InternedFactSet) Scan(pred uint64, arity int, bound *BoundSet) ScanResult {
 	k := PredArityI{pred, arity}
-	if val, ok := bound.Get(0); ok && fs.ByArg0 != nil {
-		if m := fs.ByArg0[k]; m != nil {
-			fc := fs.ByPred[k]
-			if fc == nil {
-				return ScanResult{}
-			}
-			indices := m[val]
-			if indices == nil {
-				return ScanResult{indices: emptyIndices}
-			}
-			return ScanResult{facts: fc.facts, indices: indices}
-		}
+	fc := fs.ByPred[k]
+	if fc == nil {
+		return ScanResult{}
 	}
-	if fc := fs.ByPred[k]; fc != nil {
+	if fs.ByCol == nil || bound.Mask == 0 {
 		return ScanResult{facts: fc.facts}
 	}
-	return ScanResult{}
+	col := fs.chooseColumn(k, bound, len(fc.facts))
+	if col < 0 {
+		return ScanResult{facts: fc.facts}
+	}
+	ci := fs.colIndexFor(k, col)
+	ci.catchUp(fc.facts, col)
+	val, _ := bound.Get(col)
+	indices := ci.m[val]
+	if indices == nil {
+		return ScanResult{indices: emptyIndices}
+	}
+	return ScanResult{facts: fc.facts, indices: indices}
 }
 
-// Merge copies all facts from other into fs in bulk.
+// chooseColumn picks the bound column to scan on, or -1 for a full scan.
+// Prefers an existing index with the highest cardinality (len of its map
+// is a free selectivity estimate); otherwise builds on the lowest bound
+// position, unless the relation is too small to be worth indexing.
+func (fs InternedFactSet) chooseColumn(k PredArityI, bound *BoundSet, factCount int) int {
+	cols := fs.ByCol[k]
+	best, bestCard := -1, 0
+	first := -1
+	mask := bound.Mask
+	for mask != 0 {
+		pos := bits.TrailingZeros16(mask)
+		mask &= mask - 1
+		if first < 0 {
+			first = pos
+		}
+		if ci := cols[pos]; ci != nil && len(ci.m) > bestCard {
+			best, bestCard = pos, len(ci.m)
+		}
+	}
+	if best >= 0 {
+		return best
+	}
+	if factCount < minIndexSize {
+		return -1
+	}
+	return first
+}
+
+// colIndexFor returns the index for (k, col), creating it if absent.
+func (fs InternedFactSet) colIndexFor(k PredArityI, col int) *colIndex {
+	cols := fs.ByCol[k]
+	if cols == nil {
+		cols = make(map[int]*colIndex)
+		fs.ByCol[k] = cols
+	}
+	ci := cols[col]
+	if ci == nil {
+		ci = &colIndex{m: make(map[uint64][]int32)}
+		cols[col] = ci
+	}
+	return ci
+}
+
+// Merge copies all facts from other into fs in bulk. Existing column
+// indexes stay valid (facts are append-only) and catch up on next Scan;
+// no index maintenance is needed here.
 func (fs InternedFactSet) Merge(other InternedFactSet) {
 	maps.Copy(fs.Index, other.Index)
 	for k, ofc := range other.ByPred {
 		if dfc := fs.ByPred[k]; dfc != nil {
-			oldLen := int32(len(dfc.facts))
 			dfc.appendFrom(ofc)
-			if fs.ByArg0 != nil {
-				if other.ByArg0 != nil {
-					// Full-to-full: offset other's indices.
-					if om := other.ByArg0[k]; om != nil {
-						dm := fs.ByArg0[k]
-						if dm == nil {
-							dm = make(map[uint64][]int32, len(om))
-							fs.ByArg0[k] = dm
-						}
-						for val, indices := range om {
-							for _, idx := range indices {
-								dm[val] = append(dm[val], oldLen+idx)
-							}
-						}
-					}
-				} else {
-					// Light-to-full: build indices from facts.
-					dm := fs.ByArg0[k]
-					if dm == nil {
-						dm = make(map[uint64][]int32)
-						fs.ByArg0[k] = dm
-					}
-					for i := range ofc.facts {
-						f := &ofc.facts[i]
-						if f.Arity > 0 {
-							dm[f.Values[0]] = append(dm[f.Values[0]], oldLen+int32(i))
-						}
-					}
-				}
-			}
 		} else {
 			fs.ByPred[k] = ofc
-			if fs.ByArg0 != nil {
-				if other.ByArg0 != nil {
-					// Full-to-full: steal other's ByArg0 entry (indices valid as-is).
-					if om := other.ByArg0[k]; om != nil {
-						fs.ByArg0[k] = om
-					}
-				} else {
-					// Light-to-full: build indices from facts.
-					m := make(map[uint64][]int32)
-					for i := range ofc.facts {
-						f := &ofc.facts[i]
-						if f.Arity > 0 {
-							m[f.Values[0]] = append(m[f.Values[0]], int32(i))
-						}
-					}
-					if len(m) > 0 {
-						fs.ByArg0[k] = m
-					}
-				}
-			}
 		}
 	}
 }
 
-// Clone returns a deep copy of the fact set.
+// Clone returns a deep copy of the fact set. Column indexes are not
+// copied -- the clone starts index-cold and rebuilds them on demand.
 func (fs InternedFactSet) Clone() InternedFactSet {
 	result := InternedFactSet{
 		ByPred: make(map[PredArityI]*factChunks, len(fs.ByPred)),
@@ -620,17 +624,8 @@ func (fs InternedFactSet) Clone() InternedFactSet {
 		copy(cp, fc.facts)
 		result.ByPred[k] = &factChunks{facts: cp}
 	}
-	if fs.ByArg0 != nil {
-		result.ByArg0 = make(map[PredArityI]map[uint64][]int32, len(fs.ByArg0))
-		for k, m := range fs.ByArg0 {
-			newM := make(map[uint64][]int32, len(m))
-			for arg0, indices := range m {
-				cp := make([]int32, len(indices))
-				copy(cp, indices)
-				newM[arg0] = cp
-			}
-			result.ByArg0[k] = newM
-		}
+	if fs.ByCol != nil {
+		result.ByCol = make(map[PredArityI]map[int]*colIndex)
 	}
 	return result
 }

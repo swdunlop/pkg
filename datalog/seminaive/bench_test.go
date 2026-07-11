@@ -410,6 +410,61 @@ func BenchmarkJoin1_5000(b *testing.B) {
 	}
 }
 
+// --- JoinArg1: second-argument join benchmark (arg0-hostile) ---
+//
+// The edge atom is entered with only its SECOND argument bound, so a
+// first-argument-only index cannot help; this pins the win from lazy
+// per-column indexing.
+
+func setupJoinArg1(b *testing.B, n, starts int) (datalog.Database, datalog.Transformer) {
+	b.Helper()
+	builder := memory.NewBuilder()
+	// (i*7+1) mod n is a bijection for gcd(7, n) == 1, so each start
+	// value matches exactly one edge.
+	for i := range n {
+		builder.AddFact(datalog.Fact{
+			Name:  "edge",
+			Terms: []datalog.Constant{datalog.Integer(int64(i)), datalog.Integer(int64((i*7 + 1) % n))},
+		})
+	}
+	for i := range starts {
+		builder.AddFact(datalog.Fact{
+			Name:  "start",
+			Terms: []datalog.Constant{datalog.Integer(int64(i))},
+		})
+	}
+	input := builder.Build()
+
+	rs, err := syntax.ParseAll(`result(X, Y) :- start(X), edge(Y, X).`)
+	if err != nil {
+		b.Fatal(err)
+	}
+	tr, err := seminaive.New().Compile(rs)
+	if err != nil {
+		b.Fatal(err)
+	}
+	return input, tr
+}
+
+func BenchmarkJoinArg1_5000(b *testing.B) {
+	input, tr := setupJoinArg1(b, 5000, 500)
+
+	b.ResetTimer()
+	for b.Loop() {
+		output, err := tr.Transform(context.Background(), input)
+		if err != nil {
+			b.Fatal(err)
+		}
+		count := 0
+		for range output.Facts("result", 2) {
+			count++
+		}
+		if count != 500 {
+			b.Fatalf("expected 500 results, got %d", count)
+		}
+	}
+}
+
 // BenchmarkNegation benchmarks negation checking in a stratified program.
 func BenchmarkNegation(b *testing.B) {
 	builder := memory.NewBuilder()

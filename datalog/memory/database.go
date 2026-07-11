@@ -2,6 +2,7 @@ package memory
 
 import (
 	"iter"
+	"sync"
 
 	"swdunlop.dev/pkg/datalog"
 	"swdunlop.dev/pkg/datalog/internal/interned"
@@ -12,6 +13,12 @@ type Database struct {
 	dict  *interned.Dict
 	facts interned.InternedFactSet
 	decls []datalog.Declaration
+
+	// scanMu guards facts.Scan, which lazily builds column indexes and
+	// therefore mutates the fact set. Query is a public API and may be
+	// called concurrently; the results a Scan returns are append-only
+	// slices, so only the Scan call itself needs the lock.
+	scanMu sync.Mutex
 }
 
 var _ datalog.Database = (*Database)(nil)
@@ -84,10 +91,12 @@ func (db *Database) Query(pred string, terms ...datalog.Term) iter.Seq[[]datalog
 	}
 
 	return func(yield func([]datalog.Constant) bool) {
+		db.scanMu.Lock()
 		scan := db.facts.Scan(predID, arity, &bs)
+		db.scanMu.Unlock()
 		for i := range scan.Len() {
 			fact := scan.Fact(i)
-			if !matchFact(fact, terms, &bs) {
+			if !matchFact(fact, &bs) {
 				continue
 			}
 			row := make([]datalog.Constant, arity)
@@ -102,9 +111,9 @@ func (db *Database) Query(pred string, terms ...datalog.Term) iter.Seq[[]datalog
 }
 
 // matchFact checks whether an InternedFact matches a query pattern.
-// The boundSet already filters via the byArg0 index, but non-leading
-// constant positions still need manual checking.
-func matchFact(fact *interned.InternedFact, terms []datalog.Term, bs *interned.BoundSet) bool {
+// Scan may have filtered on one bound column via an index, but the
+// remaining constant positions still need manual checking.
+func matchFact(fact *interned.InternedFact, bs *interned.BoundSet) bool {
 	for i := range fact.Arity {
 		if val, ok := bs.Get(i); ok {
 			if fact.Values[i] != val {
