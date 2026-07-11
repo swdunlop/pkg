@@ -1,7 +1,6 @@
 package main
 
 import (
-	"archive/zip"
 	"bufio"
 	"context"
 	"errors"
@@ -15,35 +14,26 @@ import (
 	"github.com/lmorg/readline/v4"
 	"golang.org/x/term"
 	"swdunlop.dev/pkg/datalog"
-	"swdunlop.dev/pkg/datalog/jsonfacts"
-	"swdunlop.dev/pkg/datalog/memory"
 	"swdunlop.dev/pkg/datalog/seminaive"
 	"swdunlop.dev/pkg/datalog/syntax"
 )
 
+// repl wraps a session with terminal interaction: readline, tab
+// completion, history, dot-commands, and result formatting.
 type repl struct {
-	rl       *readline.Instance
-	out      io.Writer
-	facts    []datalog.Fact
-	rules    []syntax.Rule
-	aggRules []syntax.AggregateRule
-
-	engineOpts []seminaive.Option
-	profile    bool // print per-stratum stats after each query (.profile)
-
-	// Data source loaded via -c / -d flags.
-	configPath string
-	dataDir    string
-	dataDB     *memory.Database // facts loaded from data source (replaced on .reload)
+	*session
+	rl      *readline.Instance
+	out     io.Writer
+	profile bool // print per-stratum stats after each query (.profile)
 }
 
 func newREPL(opts ...seminaive.Option) *repl {
 	rl := readline.NewInstance()
 
 	r := &repl{
-		rl:         rl,
-		out:        os.Stdout,
-		engineOpts: opts,
+		session: &session{engineOpts: opts},
+		rl:      rl,
+		out:     os.Stdout,
 	}
 
 	rl.TabCompleter = r.tabComplete
@@ -171,22 +161,14 @@ func (r *repl) runPipe() error {
 	return scanner.Err()
 }
 
-// loadProgram parses a Datalog source string containing multiple statements,
-// adding facts and rules to the REPL state and executing any queries.
+// loadProgram loads a Datalog source string into the session and executes
+// any queries it contains, printing their results.
 func (r *repl) loadProgram(src string) error {
-	ruleset, err := syntax.ParseAll(src)
+	queries, err := r.session.loadProgram(src)
 	if err != nil {
 		return err
 	}
-	for _, rule := range ruleset.Rules {
-		if rule.IsFact() {
-			r.facts = append(r.facts, rule.ToFact())
-		} else {
-			r.rules = append(r.rules, rule)
-		}
-	}
-	r.aggRules = append(r.aggRules, ruleset.AggRules...)
-	for _, q := range ruleset.Queries {
+	for _, q := range queries {
 		if err := r.execQuery(&q); err != nil {
 			return err
 		}
@@ -225,41 +207,15 @@ func (r *repl) execStatement(text string) error {
 	return nil
 }
 
+// execQuery evaluates a query through the session and prints the results.
 func (r *repl) execQuery(q *syntax.Query) error {
-	vars := extractNamedVars(q.Body)
-
-	// Build synthetic rule: _q_(Var1, ..., VarN) :- body.
-	headTerms := make([]datalog.Term, len(vars))
-	for i, v := range vars {
-		headTerms[i] = datalog.Variable(v)
-	}
-	synth := syntax.Rule{
-		Head: syntax.Atom{Pred: "_q_", Terms: headTerms},
-		Body: q.Body,
-	}
-
-	allRules := make([]syntax.Rule, len(r.rules)+1)
-	copy(allRules, r.rules)
-	allRules[len(r.rules)] = synth
-
-	ruleset := syntax.Ruleset{Rules: allRules, AggRules: r.aggRules}
-	t, err := r.newEngine().Compile(ruleset)
+	results, vars, stats, err := r.runQuery(context.Background(), q)
 	if err != nil {
 		return err
 	}
 
-	db, err := r.buildDB()
-	if err != nil {
-		return err
-	}
-	output, err := t.Transform(context.Background(), db)
-	if err != nil {
-		return err
-	}
-
-	var results [][]datalog.Constant
-	for row := range output.Facts("_q_", len(vars)) {
-		results = append(results, row)
+	if r.profile {
+		r.printProfile(stats)
 	}
 
 	if len(results) == 0 {
@@ -295,79 +251,12 @@ func (r *repl) execQuery(q *syntax.Query) error {
 	return nil
 }
 
-// newEngine builds an engine from the configured options, adding a profile
-// callback when .profile is on.
-func (r *repl) newEngine() *seminaive.Engine {
-	opts := r.engineOpts
-	if r.profile {
-		opts = append(opts[:len(opts):len(opts)], seminaive.WithProfile(r.printProfile))
-	}
-	return seminaive.New(opts...)
-}
-
 // printProfile renders per-stratum evaluation statistics after a query.
 func (r *repl) printProfile(stats []seminaive.StratumStats) {
 	for i, s := range stats {
 		fmt.Fprintf(r.out, "  stratum %d [%s]: %d rules, %d aggregates, %d facts, %d iterations, %s\n",
 			i, strings.Join(s.Predicates, " "), s.RuleCount, s.AggCount, s.FactCount, s.Iterations, s.Duration)
 	}
-}
-
-// setDataSource configures the REPL to load facts from a jsonfacts config.
-func (r *repl) setDataSource(configPath, dataDir string) {
-	r.configPath = configPath
-	r.dataDir = dataDir
-}
-
-// loadData loads (or reloads) facts from the configured data source.
-func (r *repl) loadData() error {
-	if r.configPath == "" {
-		return fmt.Errorf("no data source configured (use -c flag)")
-	}
-
-	cfg, err := loadConfig(r.configPath)
-	if err != nil {
-		return fmt.Errorf("config %s: %w", r.configPath, err)
-	}
-
-	var db *memory.Database
-	if strings.HasSuffix(r.dataDir, ".zip") {
-		db, err = loadFromZip(cfg, r.dataDir)
-	} else {
-		db, err = cfg.LoadDir(r.dataDir)
-	}
-	if err != nil {
-		return fmt.Errorf("loading data from %s: %w", r.dataDir, err)
-	}
-
-	r.dataDB = db
-	return nil
-}
-
-// loadFromZip opens a zip file and loads JSONL data using it as an fs.FS.
-func loadFromZip(cfg jsonfacts.Config, path string) (*memory.Database, error) {
-	r, err := zip.OpenReader(path)
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-	return cfg.LoadFS(&r.Reader)
-}
-
-func (r *repl) buildDB() (*memory.Database, error) {
-	if r.dataDB != nil {
-		if len(r.facts) == 0 {
-			return r.dataDB, nil
-		}
-		return r.dataDB.Extend(r.facts...)
-	}
-	b := memory.NewBuilder()
-	for _, f := range r.facts {
-		if err := b.AddFact(f); err != nil {
-			return nil, err
-		}
-	}
-	return b.Build(), nil
 }
 
 // tabComplete provides tab completions for the readline instance.
@@ -451,72 +340,6 @@ func completeFilePath(partial string) *readline.TabCompleterReturnT {
 	}
 	ret.Prefix = partial
 	return ret
-}
-
-func (r *repl) allPredicateNames() []string {
-	seen := map[string]bool{}
-	if r.dataDB != nil {
-		for pred := range r.dataDB.Predicates() {
-			seen[pred] = true
-		}
-	}
-	for _, f := range r.facts {
-		seen[f.Name] = true
-	}
-	for _, rule := range r.rules {
-		seen[rule.Head.Pred] = true
-		for _, atom := range rule.Body {
-			seen[atom.Pred] = true
-		}
-	}
-	for _, ar := range r.aggRules {
-		seen[ar.Head.Pred] = true
-	}
-
-	names := make([]string, 0, len(seen))
-	for name := range seen {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-// extractNamedVars collects unique non-underscore variables from query body atoms,
-// preserving order of first occurrence.
-func extractNamedVars(body []syntax.Atom) []string {
-	var vars []string
-	seen := map[string]bool{}
-	for _, atom := range body {
-		for _, t := range atom.Terms {
-			if v, ok := t.(datalog.Variable); ok {
-				name := string(v)
-				if !seen[name] && !strings.HasPrefix(name, "_") {
-					vars = append(vars, name)
-					seen[name] = true
-				}
-			}
-		}
-		if atom.Pred == "is" && atom.Expr != nil {
-			extractExprVars(atom.Expr, &vars, seen)
-		}
-	}
-	return vars
-}
-
-func extractExprVars(expr syntax.Expr, vars *[]string, seen map[string]bool) {
-	switch e := expr.(type) {
-	case syntax.TermExpr:
-		if v, ok := e.Term.(datalog.Variable); ok {
-			name := string(v)
-			if !seen[name] && !strings.HasPrefix(name, "_") {
-				*vars = append(*vars, name)
-				seen[name] = true
-			}
-		}
-	case syntax.BinExpr:
-		extractExprVars(e.Left, vars, seen)
-		extractExprVars(e.Right, vars, seen)
-	}
 }
 
 func formatTerms(terms []datalog.Constant) string {

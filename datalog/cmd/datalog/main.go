@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -10,8 +9,6 @@ import (
 	"runtime/pprof"
 
 	flag "github.com/spf13/pflag"
-	"gopkg.in/yaml.v3"
-	"swdunlop.dev/pkg/datalog/jsonfacts"
 )
 
 var (
@@ -75,30 +72,4 @@ func main() {
 			log.Fatal(err)
 		}
 	}
-}
-
-// loadConfig reads a jsonfacts.Config from a JSON or YAML file.
-func loadConfig(path string) (jsonfacts.Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return jsonfacts.Config{}, err
-	}
-
-	ext := filepath.Ext(path)
-	if ext == ".yaml" || ext == ".yml" {
-		var raw any
-		if err := yaml.Unmarshal(data, &raw); err != nil {
-			return jsonfacts.Config{}, fmt.Errorf("parsing YAML: %w", err)
-		}
-		data, err = json.Marshal(raw)
-		if err != nil {
-			return jsonfacts.Config{}, fmt.Errorf("converting YAML to JSON: %w", err)
-		}
-	}
-
-	var cfg jsonfacts.Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return jsonfacts.Config{}, fmt.Errorf("parsing config: %w", err)
-	}
-	return cfg, nil
 }
