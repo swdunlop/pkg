@@ -15,13 +15,14 @@ import (
 
 // transformer implements datalog.Transformer using semi-naive evaluation.
 type transformer struct {
-	rules     []syntax.Rule
-	aggRules  []syntax.AggregateRule
-	facts     []datalog.Fact
-	maxIter   int
-	builtins  map[string]BuiltinFunc
-	externals map[string]externalPredicate
-	profile   func([]StratumStats)
+	rules         []syntax.Rule
+	aggRules      []syntax.AggregateRule
+	facts         []datalog.Fact
+	maxIter       int
+	builtins      map[string]BuiltinFunc
+	multiBuiltins map[string]multiBuiltin
+	externals     map[string]externalPredicate
+	profile       func([]StratumStats)
 }
 
 var _ datalog.Transformer = (*transformer)(nil)
@@ -71,7 +72,7 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 
 	// Run evaluation if we have rules.
 	if len(t.rules) > 0 || len(t.aggRules) > 0 {
-		strata, err := stratify(t.rules, t.aggRules, t.builtins)
+		strata, err := stratify(t.rules, t.aggRules, t.builtins, t.multiBuiltins)
 		if err != nil {
 			return nil, fmt.Errorf("stratification: %w", err)
 		}
@@ -82,7 +83,7 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 			}
 		}
 
-		ev := &evaluator{dict: dict, maxIter: t.maxIter, builtins: t.builtins}
+		ev := &evaluator{dict: dict, maxIter: t.maxIter, builtins: t.builtins, multiBuiltins: t.multiBuiltins}
 
 		var stats []StratumStats
 		if t.profile != nil {
@@ -255,7 +256,7 @@ func (t *transformer) loadFromGeneric(input datalog.Database) (*interned.Dict, i
 
 	// Load facts for predicates referenced in rules but not declared.
 	loadUndeclaredPred := func(a syntax.Atom) error {
-		if isConstraint(a) || isBindBuiltin(a, t.builtins) || a.Pred == "is" || isExternalPred(a, t.externals) {
+		if isConstraint(a) || isBindBuiltin(a, t.builtins) || isMultiBindBuiltin(a, t.multiBuiltins) || a.Pred == "is" || isExternalPred(a, t.externals) {
 			return nil
 		}
 		arity := len(a.Terms)
@@ -350,7 +351,7 @@ func (t *transformer) fetchExternals(ctx context.Context, dict *interned.Dict, e
 					if isConstraint(other) || other.Pred == "is" || other.Negated {
 						continue
 					}
-					if isBindBuiltin(other, t.builtins) {
+					if isBindBuiltin(other, t.builtins) || isMultiBindBuiltin(other, t.multiBuiltins) {
 						continue
 					}
 					if _, isExt := t.externals[other.Pred]; isExt {

@@ -43,6 +43,17 @@ type externalPredicate struct {
 // Returns the result value to intern, or (nil, false) if the builtin cannot produce a result.
 type BuiltinFunc func(inputs []any) (any, bool)
 
+// MultiBuiltinFunc yields zero or more output tuples for the given inputs.
+// Convention: the last N args of the atom (N declared at registration) are
+// outputs; the rest are inputs. Yield returns false to stop enumeration.
+type MultiBuiltinFunc func(inputs []any, yield func(outputs []any) bool)
+
+// multiBuiltin holds a registered multi-result builtin and its output count.
+type multiBuiltin struct {
+	outputs int
+	fn      MultiBuiltinFunc
+}
+
 // StratumStats records evaluation metrics for a single stratum.
 type StratumStats struct {
 	Predicates []string
@@ -55,11 +66,12 @@ type StratumStats struct {
 
 // Engine implements syntax.Engine using semi-naive evaluation.
 type Engine struct {
-	maxIter   int
-	builtins  map[string]BuiltinFunc
-	externals map[string]externalPredicate
-	decls     datalog.DeclarationSet
-	profile   func([]StratumStats)
+	maxIter       int
+	builtins      map[string]BuiltinFunc
+	multiBuiltins map[string]multiBuiltin
+	externals     map[string]externalPredicate
+	decls         datalog.DeclarationSet
+	profile       func([]StratumStats)
 }
 
 var _ syntax.Engine = (*Engine)(nil)
@@ -80,6 +92,18 @@ func WithBuiltin(name string, fn BuiltinFunc) Option {
 			e.builtins = make(map[string]BuiltinFunc)
 		}
 		e.builtins[name] = fn
+	}
+}
+
+// WithMultiBuiltin registers a named multi-result builtin that can be used in
+// rule bodies. The builtin predicate should start with "@" by convention.
+// The last `outputs` args of the atom are output positions; the rest are inputs.
+func WithMultiBuiltin(name string, outputs int, fn MultiBuiltinFunc) Option {
+	return func(e *Engine) {
+		if e.multiBuiltins == nil {
+			e.multiBuiltins = make(map[string]multiBuiltin)
+		}
+		e.multiBuiltins[name] = multiBuiltin{outputs: outputs, fn: fn}
 	}
 }
 
@@ -133,7 +157,7 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 		if r.IsFact() {
 			facts = append(facts, r.ToFact())
 		} else {
-			if err := checkRuleSafety(r, e.builtins, e.externals); err != nil {
+			if err := checkRuleSafety(r, e.builtins, e.multiBuiltins, e.externals); err != nil {
 				return nil, err
 			}
 			if len(e.decls) > 0 {
@@ -153,13 +177,14 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 	}
 
 	return &transformer{
-		rules:     rules,
-		aggRules:  ruleset.AggRules,
-		facts:     facts,
-		maxIter:   e.maxIter,
-		builtins:  e.builtins,
-		externals: e.externals,
-		profile:   e.profile,
+		rules:         rules,
+		aggRules:      ruleset.AggRules,
+		facts:         facts,
+		maxIter:       e.maxIter,
+		builtins:      e.builtins,
+		multiBuiltins: e.multiBuiltins,
+		externals:     e.externals,
+		profile:       e.profile,
 	}, nil
 }
 
@@ -168,7 +193,7 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 //   - The is-bound variable is then available for subsequent atoms and the head.
 //   - Variables in negated atoms and comparison constraints are bound.
 //   - All head variables are bound.
-func checkRuleSafety(r syntax.Rule, builtins map[string]BuiltinFunc, externals map[string]externalPredicate) error {
+func checkRuleSafety(r syntax.Rule, builtins map[string]BuiltinFunc, multiBuiltins map[string]multiBuiltin, externals map[string]externalPredicate) error {
 	bound := map[string]bool{}
 	for _, a := range r.Body {
 		switch {
@@ -193,6 +218,25 @@ func checkRuleSafety(r syntax.Rule, builtins map[string]BuiltinFunc, externals m
 			// Output arg (last) becomes bound.
 			if v, ok := a.Terms[len(a.Terms)-1].(datalog.Variable); ok {
 				bound[string(v)] = true
+			}
+		case isMultiBindBuiltin(a, multiBuiltins):
+			// Input args (all except the declared outputs) must be bound.
+			nOut := multiBuiltins[a.Pred].outputs
+			if len(a.Terms) < nOut {
+				return fmt.Errorf("builtin %s: expected at least %d args, got %d", a.Pred, nOut, len(a.Terms))
+			}
+			for _, t := range a.Terms[:len(a.Terms)-nOut] {
+				if v, ok := t.(datalog.Variable); ok {
+					if !bound[string(v)] {
+						return fmt.Errorf("unsafe rule: variable %s in %s not bound", string(v), a.Pred)
+					}
+				}
+			}
+			// Output args become bound.
+			for _, t := range a.Terms[len(a.Terms)-nOut:] {
+				if v, ok := t.(datalog.Variable); ok {
+					bound[string(v)] = true
+				}
 			}
 		case a.Negated, isConstraint(a):
 			// Checked in second pass below.

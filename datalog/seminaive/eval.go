@@ -34,6 +34,16 @@ func isBindBuiltin(a syntax.Atom, builtins map[string]BuiltinFunc) bool {
 	return ok
 }
 
+// isMultiBindBuiltin reports whether an atom is a multi-result binding builtin.
+// Convention: the last N args (N declared at registration) are outputs; the rest are inputs.
+func isMultiBindBuiltin(a syntax.Atom, multiBuiltins map[string]multiBuiltin) bool {
+	if multiBuiltins == nil {
+		return false
+	}
+	_, ok := multiBuiltins[a.Pred]
+	return ok
+}
+
 // isExternalPred reports whether an atom references a registered external predicate.
 func isExternalPred(a syntax.Atom, externals map[string]externalPredicate) bool {
 	if externals == nil {
@@ -340,10 +350,11 @@ func applyBinOpFloat(op string, l, r float64) (any, bool) {
 type bodyItemKind int
 
 const (
-	bodyItemJoin    bodyItemKind = iota // match atom against facts
-	bodyItemIs                         // evaluate arithmetic expression, bind variable
-	bodyItemCompare                    // check comparison/string constraint
-	bodyItemBind                       // evaluate binding builtin
+	bodyItemJoin      bodyItemKind = iota // match atom against facts
+	bodyItemIs                           // evaluate arithmetic expression, bind variable
+	bodyItemCompare                      // check comparison/string constraint
+	bodyItemBind                         // evaluate binding builtin
+	bodyItemBindMulti                    // evaluate multi-result binding builtin
 )
 
 // compiledExpr is a pre-compiled arithmetic expression using VarSub indices.
@@ -446,13 +457,15 @@ type bodyItem struct {
 	joinIdx   int                  // for bodyItemJoin: index among join items (delta tracking)
 	negated   bool                 // for negated atoms in query body
 	outVarIdx int8                 // for bodyItemIs/bodyItemBind: VarSub index of output variable (-1 if unused)
+	multiOut  int                  // for bodyItemBindMulti: number of output positions (the atom's last multiOut terms)
 }
 
 // evaluator holds per-evaluation state.
 type evaluator struct {
-	dict     *interned.Dict
-	maxIter  int
-	builtins map[string]BuiltinFunc
+	dict          *interned.Dict
+	maxIter       int
+	builtins      map[string]BuiltinFunc
+	multiBuiltins map[string]multiBuiltin
 }
 
 // evalRules runs semi-naive evaluation for a set of rules to fixpoint.
@@ -506,6 +519,9 @@ func (ev *evaluator) evalRules(rules []syntax.Rule, existing interned.InternedFa
 					}
 				}
 				cr.body = append(cr.body, bodyItem{kind: bodyItemBind, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap), outVarIdx: outVarIdx})
+			case isMultiBindBuiltin(a, ev.multiBuiltins):
+				registerAtomVars(a, varMap)
+				cr.body = append(cr.body, bodyItem{kind: bodyItemBindMulti, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap), multiOut: ev.multiBuiltins[a.Pred].outputs})
 			default:
 				cr.body = append(cr.body, bodyItem{kind: bodyItemJoin, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap), joinIdx: cr.joinCount})
 				cr.joinCount++
@@ -622,6 +638,60 @@ func varSubToInternedSub(vs *interned.VarSub, names []string) interned.InternedS
 	return s
 }
 
+// evalBindMulti evaluates a multi-result builtin item. For each yielded
+// output tuple it binds (or compare-checks) the output positions and calls
+// next; the substitution mask is restored between tuples and on return.
+func (ev *evaluator) evalBindMulti(item bodyItem, sub *interned.VarSub, next func()) {
+	mb, ok := ev.multiBuiltins[item.atom.Pred]
+	if !ok {
+		return
+	}
+	nOut := item.multiOut
+	nIn := item.ca.Arity - nOut
+	if nIn < 0 {
+		return
+	}
+	inputs := make([]any, nIn)
+	for i := range nIn {
+		v, ok := resolveCompiledTermValue(item.ca.Terms[i], sub, ev.dict)
+		if !ok {
+			return
+		}
+		inputs[i] = v
+	}
+	outTerms := item.ca.Terms[nIn:]
+	savedMask := sub.Mask
+	mb.fn(inputs, func(outputs []any) bool {
+		if len(outputs) != nOut {
+			return true
+		}
+		for j, t := range outTerms {
+			valID := ev.dict.Intern(outputs[j])
+			if t.VarIdx < 0 {
+				// Constant output position acts as a filter.
+				if t.ConstID != valID {
+					sub.Mask = savedMask
+					return true
+				}
+				continue
+			}
+			if sub.Mask>>uint(t.VarIdx)&1 != 0 {
+				// Already-bound output gets equality semantics.
+				if sub.Vals[t.VarIdx] != valID {
+					sub.Mask = savedMask
+					return true
+				}
+			} else {
+				sub.Set(int(t.VarIdx), valID)
+			}
+		}
+		next()
+		sub.Mask = savedMask
+		return true
+	})
+	sub.Mask = savedMask
+}
+
 // evalBodyRecursiveV evaluates a rule body using nested-loop join.
 func (ev *evaluator) evalBodyRecursiveV(
 	body []bodyItem,
@@ -697,6 +767,11 @@ func (ev *evaluator) evalBodyRecursiveV(
 			ev.evalBodyRecursiveV(body, negativeBody, varNames, deltaJoinIdx, delta, existing, emitted, sub, bodyIdx+1, emit)
 			sub.Clear(int(idx))
 		}
+
+	case bodyItemBindMulti:
+		ev.evalBindMulti(item, sub, func() {
+			ev.evalBodyRecursiveV(body, negativeBody, varNames, deltaJoinIdx, delta, existing, emitted, sub, bodyIdx+1, emit)
+		})
 
 	case bodyItemJoin:
 		ca := item.ca
@@ -859,6 +934,17 @@ func reorderBody(body []bodyItem) []bodyItem {
 						}
 						progress = true
 					}
+				case bodyItemBindMulti:
+					if multiInputVarsBound(item, boundVars) {
+						placed[i] = true
+						result = append(result, item)
+						for _, t := range item.ca.Terms[item.ca.Arity-item.multiOut:] {
+							if t.VarIdx >= 0 {
+								boundVars |= 1 << uint(t.VarIdx)
+							}
+						}
+						progress = true
+					}
 				}
 			}
 		}
@@ -920,6 +1006,19 @@ func joinSelectivityScore(ca interned.CompiledAtom, boundVars uint16) float64 {
 // bodyItemVarsBound checks if all variable terms in the item's compiled atom are bound.
 func bodyItemVarsBound(item bodyItem, boundVars uint16) bool {
 	for i := range item.ca.Arity {
+		t := item.ca.Terms[i]
+		if t.VarIdx >= 0 && boundVars>>uint(t.VarIdx)&1 == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// multiInputVarsBound checks if all input variables (all except the last
+// multiOut output positions) of a multi-result builtin are bound.
+func multiInputVarsBound(item bodyItem, boundVars uint16) bool {
+	nIn := item.ca.Arity - item.multiOut
+	for i := range nIn {
 		t := item.ca.Terms[i]
 		if t.VarIdx >= 0 && boundVars>>uint(t.VarIdx)&1 == 0 {
 			return false
@@ -998,6 +1097,9 @@ func (ev *evaluator) queryInternedFacts(body []syntax.Atom, memFacts interned.In
 				}
 			}
 			items = append(items, bodyItem{kind: bodyItemBind, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap), outVarIdx: outVarIdx})
+		case isMultiBindBuiltin(a, ev.multiBuiltins):
+			registerAtomVars(a, varMap)
+			items = append(items, bodyItem{kind: bodyItemBindMulti, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap), multiOut: ev.multiBuiltins[a.Pred].outputs})
 		default:
 			items = append(items, bodyItem{kind: bodyItemJoin, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap)})
 		}
@@ -1090,6 +1192,11 @@ func (ev *evaluator) queryRecursiveV(
 			ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
 			sub.Clear(int(outIdx))
 		}
+
+	case bodyItemBindMulti:
+		ev.evalBindMulti(item, sub, func() {
+			ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
+		})
 
 	case bodyItemJoin:
 		ca := item.ca
