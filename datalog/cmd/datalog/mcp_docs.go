@@ -13,6 +13,13 @@ const mcpServerInstructions = `This server exposes one Datalog evaluation sessio
 operator-chosen data directory. Nothing is written back to disk; the
 session lives only for this connection.
 
+Before anything else, call list_predicates. A session often arrives
+already populated with the operator's schema and rules - answer
+questions against it with query and sample_facts. set_schema and
+set_rules REPLACE the operator's working documents; enter the authoring
+loop below only when the session is empty or the operator has asked you
+to change the mappings or rules - never just to answer a question.
+
 Workflow loop (repeat as needed):
   1. sample_input   - look at raw JSONL records to learn field names.
   2. set_schema     - submit a jsonfacts config mapping JSON fields to

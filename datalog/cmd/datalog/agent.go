@@ -67,11 +67,14 @@ type kitDriver struct {
 // prompt only sets the conversational posture.
 const agentSystemPrompt = `You are the assistant embedded in a Datalog workbench.
 The human is authoring a jsonfacts schema (mapping JSONL records to base facts)
-and Datalog rules over those facts. Use the datalog MCP tools to inspect and
-change the live session: sample_input and list_predicates to orient, set_schema
-and set_rules to author, query and sample_facts to verify. Prefer counts and
-samples over dumps. Every change you make appears immediately in the panes the
-human is watching; keep them informed of what you changed and why.`
+and Datalog rules over those facts, and their working session is usually
+already loaded. Orient with list_predicates, then answer questions with query
+and sample_facts against what is there. set_schema and set_rules REPLACE the
+human's working documents - call them only when the human explicitly asks you
+to change the schema or rules, never to answer a question; sample_input is for
+authoring too, not for lookups. Prefer counts and samples over dumps. Every
+change you make appears immediately in the panes the human is watching; keep
+them informed of what you changed and why.`
 
 // newKitDriver constructs the embedded agent. mcpSrv is the workbench's own
 // mcp-go server value — the same one mounted at /mcp — registered through
