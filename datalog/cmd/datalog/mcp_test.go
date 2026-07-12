@@ -536,6 +536,64 @@ func TestSampleFacts_DefaultLimit(t *testing.T) {
 	}
 }
 
+// The fact-listing tools read the session's evaluated snapshot, not the
+// EDB alone: a rule-derived predicate the workbench's Fact Browser shows
+// with N facts must not report 0 through sample_facts/list_predicates
+// (the agent and the human have to agree on what exists).
+func TestSampleFacts_DerivedPredicate(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 5)
+	h, done := newTestHandlers(t, dir)
+	defer done()
+
+	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+		t.Fatalf("set_schema: %v", err)
+	}
+	if _, err := h.setRules(setRulesInput{Source: `active(Host) :- event(Host, Pid, Cmd).`}); err != nil {
+		t.Fatalf("set_rules: %v", err)
+	}
+
+	// Before evaluation the derived predicate reads as empty everywhere —
+	// consistent with the Fact Browser's fallback to the EDB snapshot.
+	out, err := h.sampleFacts(sampleFactsInput{Predicate: "active", Arity: 1})
+	if err != nil {
+		t.Fatalf("sample_facts before evaluate: %v", err)
+	}
+	if out.Total != 0 {
+		t.Fatalf("sample_facts before evaluate: total = %d, want 0", out.Total)
+	}
+
+	// A Run (session.evaluate + derivedDB cache, as serve startup and the
+	// workbench's Run action both do) makes derived facts visible to both.
+	evaluated, err := h.sess.evaluate(context.Background())
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	h.sess.derivedDB = evaluated
+
+	out, err = h.sampleFacts(sampleFactsInput{Predicate: "active", Arity: 1})
+	if err != nil {
+		t.Fatalf("sample_facts after evaluate: %v", err)
+	}
+	if out.Total == 0 {
+		t.Fatal("sample_facts after evaluate: derived facts still report 0")
+	}
+
+	preds, err := h.listPredicates(listPredicatesInput{})
+	if err != nil {
+		t.Fatalf("list_predicates: %v", err)
+	}
+	for _, p := range preds.Predicates {
+		if p.Name == "active" && p.Arity == 1 {
+			if p.Facts == 0 {
+				t.Fatal("list_predicates: derived predicate still counts 0 facts")
+			}
+			return
+		}
+	}
+	t.Fatal("list_predicates: derived predicate missing from listing")
+}
+
 // -- sample_input -----------------------------------------------------------
 
 func TestSampleInput_OffsetAndLimit(t *testing.T) {

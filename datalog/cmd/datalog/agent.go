@@ -498,24 +498,18 @@ func formatToolResult(s string) string {
 }
 
 // toolStatus marks the summary line only when there is something to say —
-// with an icon, not a word: oat's small spinner while the call is in
-// flight, a red ✕ badge (drawn by .tool-status.error's ::before) on
-// failure, and nothing at all on success — a finished call with no flag is
-// the ok state. The title attribute keeps the meaning reachable by hover
-// and assistive tech.
+// with an icon, not a word: a red ✕ badge (drawn by .tool-status.error's
+// ::before) on failure, nothing otherwise. No per-call spinner: an
+// in-flight call is the newest entry, sitting directly above the chat
+// pane's single running indicator (view.Console's agentActivity), and a
+// second ring there just multiplied the tells. The title keeps the meaning
+// reachable by hover and assistive tech.
 func toolStatus(ev agentEvent, done bool) html.Content {
-	switch {
-	case !done:
-		return tag.New("span.tool-status.running").
-			Set("aria-busy", "true").
-			Set("data-spinner", "small").
-			Set("title", "running")
-	case ev.IsError:
+	if done && ev.IsError {
 		return tag.New("span.tool-status.error").
 			Set("title", "tool call failed")
-	default:
-		return html.Group{}
 	}
+	return html.Group{}
 }
 
 // compactArgs bounds a tool call's summary line to one readable length,

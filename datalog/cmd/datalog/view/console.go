@@ -39,8 +39,9 @@ func Console(queryLog, agentLog []html.Content) html.Content {
 // toggle, the two tab buttons (which also open the drawer, so a collapsed
 // console is one click from either tab), and — pushed to the right edge —
 // the busy-status span plus the Clear button. The Agent tab button carries
-// oat's [aria-busy] spinner while a turn runs, so even a collapsed drawer
-// telegraphs agent activity.
+// oat's [aria-busy] spinner while a turn runs ONLY when the agent panel
+// itself isn't visible (drawer closed or Query tab up): one running
+// indicator at a time — when the panel is open, agentActivity is the tell.
 func consoleBar() html.Content {
 	return tag.New("div#console-bar",
 		tag.New("button#console-toggle.console-tab").
@@ -50,16 +51,19 @@ func consoleBar() html.Content {
 		consoleTabButton("query", "Query"),
 		consoleTabButton("agent", "Agent").
 			Set("data-spinner", "small").
-			Set("data-attr:aria-busy", "$busy === 'agent' ? 'true' : false"),
+			Set("data-attr:aria-busy",
+				"$busy === 'agent' && !($_consoleOpen && $_consoleTab === 'agent') ? 'true' : false"),
 		tag.New("span#console-status").Set("data-text", busyStatusExpr),
 		clearButton(),
 	)
 }
 
-// busyStatusExpr renders the busy mutex as words: which of run/apply/agent
-// holds it, or nothing. This is the one place the whole mutex is spelled
-// out, complementing the per-button Stop morphs.
-const busyStatusExpr = `$busy === 'agent' ? 'agent turn running…' : $busy === 'run' ? 'run in flight…' : $busy === 'apply' ? 'apply in flight…' : ''`
+// busyStatusExpr renders the run/apply side of the busy mutex as words,
+// complementing those buttons' Stop morphs. The agent case is deliberately
+// absent: agent activity already shows in the chat pane (agentActivity) or
+// on the Agent tab's spinner when the pane is hidden — a third copy of
+// "agent turn running…" on the bar was one indicator too many.
+const busyStatusExpr = `$busy === 'run' ? 'run in flight…' : $busy === 'apply' ? 'apply in flight…' : ''`
 
 func consoleTabButton(tab, label string) tag.Interface {
 	return tag.New("button.console-tab").
@@ -117,8 +121,9 @@ func queryInputRow() html.Content {
 
 // agentActivity is the chat pane's turn-level activity line, pinned between
 // the scrollback and the composer whenever the agent holds the $busy mutex.
-// The composer button's overlay ring proved too subtle a tell on its own;
-// this line is unmissable while a turn runs and takes no space when idle.
+// It is the ONE running indicator in an open chat pane — the tab spinner
+// yields to it (consoleBar), the bar status doesn't mention the agent, the
+// composer's ■ carries no ring, and tool entries don't spin (toolStatus).
 // aria-busy is static — data-show removes the whole line when the mutex
 // isn't 'agent', so the spinner never spins unseen.
 func agentActivity() html.Content {
@@ -136,9 +141,8 @@ func agentActivity() html.Content {
 // shared $busy mutex:
 //
 //   - idle:       ↑ posts the prompt
-//   - agent busy: ■ posts /cancel, ringed by oat's [aria-busy] spinner
-//     (data-spinner "small overlay" draws the ring over the ■ rather than
-//     beside it — overlay mode positions the spinner absolutely)
+//   - agent busy: ■ posts /cancel — no spinner ring; agentActivity beside
+//     it is the pane's one running indicator
 //   - run/apply busy: disabled, making the mutex visible from this side too
 //
 // Enter sends (guarded on !$busy so it cannot double-fire mid-turn),
@@ -151,8 +155,6 @@ func promptInputRow() html.Content {
 				Set("data-bind:console-prompt").
 				Set("data-on:keydown", "evt.key === 'Enter' && !evt.shiftKey && (evt.preventDefault(), !$busy && @post('/console/prompt'))"),
 			tag.New("button#console-send").
-				Set("data-spinner", "small overlay").
-				Set("data-attr:aria-busy", "$busy === 'agent' ? 'true' : false").
 				Set("data-attr:disabled", "$busy === 'run' || $busy === 'apply'").
 				Set("data-attr:title", "$busy === 'agent' ? 'stop the running turn' : 'send'").
 				Set("data-text", "$busy === 'agent' ? '■' : '↑'").

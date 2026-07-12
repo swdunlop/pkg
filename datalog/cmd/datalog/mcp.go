@@ -524,7 +524,11 @@ type listPredicatesOutput struct {
 }
 
 func (h *mcpHandlers) listPredicates(_ listPredicatesInput) (listPredicatesOutput, error) {
-	db, err := h.sess.buildDB()
+	// evaluatedDB, not buildDB: the agent and the human must see the same
+	// counts. The workbench's Fact Browser reads the last Run's evaluated
+	// snapshot, so a rule-derived predicate that showed N facts there must
+	// not report 0 here (the EDB alone never holds derived facts).
+	db, err := h.sess.evaluatedDB()
 	if err != nil {
 		return listPredicatesOutput{}, err
 	}
@@ -599,7 +603,9 @@ func (h *mcpHandlers) sampleFacts(in sampleFactsInput) (sampleFactsOutput, error
 		limit = defaultSampleFactsLimit
 	}
 
-	db, err := h.sess.buildDB()
+	// evaluatedDB, not buildDB — same reasoning as listPredicates: derived
+	// facts the Fact Browser shows must be sampleable, not report as 0.
+	db, err := h.sess.evaluatedDB()
 	if err != nil {
 		return sampleFactsOutput{}, err
 	}

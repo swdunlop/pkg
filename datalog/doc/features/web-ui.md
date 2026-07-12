@@ -235,9 +235,9 @@ Agent tool calls render for the operator, not the wire, and the
 drawer's vertical real estate is the constraint: each call is one
 collapsed `<details>` whose summary line carries the tool name, its
 elided arguments (a `query` call shows the query text itself, not its
-JSON envelope), and a status icon on the right edge — oat's small
-spinner while the call runs, a red ✕ badge on failure, nothing on
-success — one line per call until the operator opens it. The body
+JSON envelope), and a status icon on the right edge — a red ✕ badge
+on failure, nothing otherwise — one line per call until the operator
+opens it. The body
 holds the rest: query results as the editor's variable-named table,
 errors as the editor's error list with the message unwrapped from any
 JSON envelope the transport put around it, other results as
@@ -247,8 +247,12 @@ Error surfaces (the error lists, error transcript entries, error
 toasts) are filled `--danger` blocks with white text: danger-colored
 text on the card's dark blue-grey sits at near-equal value and
 disappears. While a turn runs, an activity line ("agent turn
-running…", spinner) sits between the scrollback and the composer —
-the composer button's overlay ring alone was too subtle a tell.
+running…", spinner) sits between the scrollback and the composer, and
+it is the *only* running indicator in an open chat pane: the Agent
+tab's spinner shows only while the pane itself is hidden (drawer
+closed or Query tab up), the bar's status text covers run/apply but
+not the agent, the composer's ■ carries no ring, and tool entries
+don't spin — one tell at a time, not a chorus.
 A drawer rather than a fourth column because the three-column rhythm
 was hard-won; the ultrawide case is an open question below.
 

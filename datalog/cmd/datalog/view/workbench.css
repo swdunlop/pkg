@@ -453,8 +453,9 @@ section#console {
   display: inline-flex;
   align-items: center;
 }
-/* Status is an icon, not a word: oat's small spinner (via aria-busy on the
- * span) while running, a red ✕ badge on error. */
+/* Status is an icon, not a word: a red ✕ badge on error, nothing
+ * otherwise (running shows no per-call spinner — the agent-activity line
+ * is the pane's one running indicator). */
 .console-entry .tool-status.error::before {
   content: '✕';
   display: inline-flex;
@@ -544,11 +545,5 @@ section#console {
   opacity: 0.5;
   cursor: default;
 }
-/* While a turn runs the button shows ■ (stop) with oat's overlay spinner
- * ring drawn around it; the ring inherits --primary for its moving edge,
- * which would vanish on the primary-filled button, so recolor the track
- * and edge for the on-primary context. */
-#console-send[aria-busy='true']::before {
-  border-color: rgb(from var(--primary-foreground) r g b / 0.35);
-  border-top-color: var(--primary-foreground);
-}
+/* While a turn runs the button shows a plain ■ (stop) — no spinner ring;
+ * the agent-activity line beside it is the pane's one running indicator. */

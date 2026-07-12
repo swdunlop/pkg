@@ -333,8 +333,10 @@ func (s *session) evaluate(ctx context.Context) (datalog.Database, error) {
 // Browser) use this instead of buildDB directly so a predicate's "derived"
 // facts reflect the last Run rather than always reading as empty
 // (buildDB alone never runs rule evaluation — see doc/features/web-ui.md
-// design constraint 2's snapshot-pointer intent). REPL and MCP fact-listing
-// paths still call buildDB directly and are unaffected by this cache.
+// design constraint 2's snapshot-pointer intent). The MCP fact-listing
+// tools (list_predicates, sample_facts) read this too, so the agent and
+// the Fact Browser always agree on counts; REPL paths still call buildDB
+// directly and are unaffected by this cache.
 func (s *session) evaluatedDB() (datalog.Database, error) {
 	if s.derivedDB != nil {
 		return s.derivedDB, nil
