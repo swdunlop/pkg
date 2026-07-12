@@ -64,13 +64,13 @@ func RulesEditor(rulesText string) html.Content {
 	// client-side JS; noted here as a deviation from the design doc.
 
 	return PaneSection.Set("id", "pane-rules-editor").Add(
-		PaneHeading.Add(html.Text("Datalog Editor")),
+		PaneHeadingWithNav("Datalog Editor", "rules"),
 		rulesTextarea,
 		// ErrorList renders between the textarea and the actions row so a
 		// growing error list pushes the buttons down instead of the
 		// textarea above it out from under the cursor.
 		ErrorList.Set("id", "rules-error"),
-		tag.New("div.actions", runButton, saveButton),
+		tag.New("div.actions", runButton, saveButton, StopButton),
 		StatusDiv.Set("id", "status"),
 		tag.New("div#rules-results"),
 	)

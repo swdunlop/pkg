@@ -46,7 +46,6 @@ type PredicateEntry struct {
 // entry's (initially empty) facts container with the first page.
 func Predicates(kind string, entries []PredicateEntry) html.Content {
 	return tag.New("div#"+predicatesID(kind),
-		tag.New("h3", html.Text("Predicates")),
 		html.Map(entries, predicateEntry),
 	)
 }

@@ -6,10 +6,12 @@ import (
 )
 
 // Page is the full-page shell for the workbench's two views — doctype,
-// head, nav chrome, and a three-column body — implementing html.Content per
-// doc/notes/datastar.md Appendix A.8's layout-as-struct idiom. Fragment
-// responses (the SSE action/subscription endpoints) never construct a
-// Page; they emit pane-scoped html.Content directly.
+// head, and a three-column body, implementing html.Content per
+// doc/notes/datastar.md Appendix A.8's layout-as-struct idiom. There is no
+// page-level header bar; the Facts/Rules nav lives instead in the editor
+// pane's heading (see PaneHeadingWithNav). Fragment responses (the SSE
+// action/subscription endpoints) never construct a Page; they emit
+// pane-scoped html.Content directly.
 //
 // The single four-pane page was split into two three-pane views (Facts,
 // Rules) because four disjoint panes on one screen was unworkable — each
@@ -67,11 +69,6 @@ func head(p Page) html.Content {
 
 func body(p Page) html.Content {
 	return tag.New("body",
-		tag.New("header#chrome",
-			tag.New("h1", html.Text("datalog workbench")),
-			navLinks(p.Active),
-			cancelButton,
-		),
 		tag.New("div#toast"),
 		// The Fact Browser subscription (doc/notes/datastar.md §8) is
 		// page-scoped, not pane-scoped: whichever of #predicates-base /
@@ -81,6 +78,18 @@ func body(p Page) html.Content {
 		// present and no-ops on the other).
 		tag.New("div").Set("data-init", "@get('/events', {openWhenHidden: true, requestCancellation: 'disabled'})"),
 		tag.New("main#workbench", p.Columns...),
+	)
+}
+
+// PaneHeading renders an editor pane's h2 title alongside the Facts/Rules
+// view switcher, since the page's old header#chrome bar (title, nav,
+// Cancel) was removed in favor of putting the nav next to whichever
+// editor's heading is currently on screen. active names the current view
+// ("facts" or "rules") so navLinks can style the matching link distinctly.
+func PaneHeadingWithNav(title, active string) html.Content {
+	return tag.New("div.pane-heading",
+		PaneHeading.Add(html.Text(title)),
+		navLinks(active),
 	)
 }
 
@@ -137,7 +146,10 @@ var (
 			Set("src", "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.1/bundles/datastar.js").
 			Set("integrity", "sha384-dWn5jta+MrFAhwrzi4llarDQkaQE0zW2lreXrV0yK15W0A7TrtfGyIyji04PLUY7")
 
-	// cancelButton is the Global Cancel emergency brake (doc/features/web-ui.md
-	// "Execution sandbox"): fires every in-flight job's CancelFunc.
-	cancelButton = tag.New("button#cancel[data-on:click=@post('/cancel')]", html.Text("Cancel"))
+	// StopButton is the Global Cancel emergency brake (doc/features/web-ui.md
+	// "Execution sandbox"): fires every in-flight job's CancelFunc. Lives in
+	// each editor's action bar, pushed to the row's right edge (workbench.css),
+	// rather than the old header#chrome — labeled "Stop" there since it now
+	// sits alongside Run/Apply/Save instead of standing alone as page chrome.
+	StopButton = tag.New("button#stop.action[data-on:click=@post('/cancel')]", html.Text("Stop"))
 )

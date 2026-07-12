@@ -51,14 +51,14 @@ func JSONFactsEditor(schemaText string, selectedRow html.Content, output html.Co
 		Add(html.Text("Save"))
 
 	return PaneSection.Set("id", "pane-jsonfacts-editor").Add(
-		PaneHeading.Add(html.Text("jsonfacts Editor")),
+		PaneHeadingWithNav("jsonfacts Editor", "facts"),
 		selectedRow,
 		schemaTextarea,
 		// ErrorList renders between the textarea and the actions row so a
 		// growing error list pushes the buttons down instead of the
 		// textarea above it out from under the cursor.
 		ErrorList.Set("id", "jsonfacts-error"),
-		tag.New("div.actions", applyButton, saveButton),
+		tag.New("div.actions", applyButton, saveButton, StopButton),
 		output,
 	)
 }

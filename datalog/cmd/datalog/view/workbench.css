@@ -32,9 +32,8 @@
   --danger: light-dark(#a3333d, #bf616a);             /* md-error */
 }
 
-/* The page itself never scrolls: header is a fixed-height flex item, main
- * fills the rest of the viewport, and each pane below scrolls on its own
- * (see main#workbench / section.pane). */
+/* The page itself never scrolls: main fills the whole viewport, and each
+ * pane below scrolls on its own (see main#workbench / section.pane). */
 html,
 body {
   height: 100%;
@@ -46,28 +45,13 @@ body {
   overflow: hidden;
 }
 
-/* Header bar: title, view nav, and Global Cancel, left to right. */
-header#chrome {
-  display: flex;
-  flex: none;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-4);
-  padding: var(--space-2) var(--space-4);
-  background: var(--card);
-  border-bottom: 1px solid var(--border);
-}
-header#chrome h1 {
-  margin: 0;
-  font-size: var(--text-4);
-}
-
-/* Facts/Rules view switcher, between the title and Cancel. */
+/* Facts/Rules view switcher, pinned to the right of whichever editor
+ * pane's heading is on screen (see .pane-heading below) — there is no
+ * page-level header bar. */
 nav#views {
   display: flex;
   gap: var(--space-2);
   margin-inline-start: auto;
-  margin-inline-end: var(--space-4);
 }
 nav#views a {
   padding: var(--space-1) var(--space-3);
@@ -119,11 +103,26 @@ section.pane {
 }
 section.pane > h2 {
   flex: none;
-  margin: 0 0 var(--space-3);
+  margin: 0;
   font-size: var(--text-5);
   color: var(--muted-foreground);
   text-transform: uppercase;
   letter-spacing: 0.05em;
+}
+
+/* Editor pane heading row: title on the left, Facts/Rules switcher pushed
+ * to the right edge via nav#views's margin-inline-start:auto above. Only
+ * the two editor panes (jsonfacts, rules) render this — the Data/Fact
+ * Browser panes use a bare section.pane > h2. */
+div.pane-heading {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-4);
+  margin: 0 0 var(--space-3);
+}
+div.pane-heading > h2 {
+  margin: 0;
 }
 
 /* Editor textareas (jsonfacts/rules panes): grow to fill whatever space the
@@ -142,11 +141,16 @@ textarea.editor {
   tab-size: 4;
 }
 
-/* Action rows (Apply/Save, Run/Save): spaced, not touching. */
+/* Action rows (Apply/Save/Stop, Run/Save/Stop): spaced, not touching.
+ * Stop is the Global Cancel emergency brake, pushed to the row's right
+ * edge (away from Apply/Run/Save) so it doesn't get fat-fingered. */
 div.actions {
   display: flex;
   gap: var(--space-2);
   margin-block: var(--space-3);
+}
+div.actions #stop {
+  margin-inline-start: auto;
 }
 
 /* In-form error lists (doc/notes/datastar.md §4). The :empty rule hiding
