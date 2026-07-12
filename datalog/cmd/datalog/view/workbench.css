@@ -470,6 +470,49 @@ section#console {
   line-height: 1;
 }
 
+/* Permission-request entries (acp-integration.md work item 9): the
+ * blocked-state line reads like the tool-call summary line it echoes, and
+ * the options row holds one button per PermissionOption, allow/reject
+ * styled distinctly with oat's existing semantic colors rather than a new
+ * design system. */
+.console-entry.permission .permission-line {
+  margin: 0 0 var(--space-1);
+}
+.permission-options {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.permission-option.allow {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+.permission-option.reject {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/* Plan checklist (acp-integration.md work item 9): one line per entry, a
+ * status glyph standing in for a native checkbox so pending/in_progress/
+ * completed reads at a glance without extra chrome. */
+.plan-checklist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.plan-line {
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+}
+.plan-line.completed {
+  color: var(--muted-foreground);
+  text-decoration: line-through;
+}
+.plan-line.in-progress .plan-mark {
+  color: var(--primary);
+}
+
 /* Console input rows: input grows; any sibling button (the Query tab's
  * Run) keeps its natural one-line height at the row's bottom edge instead
  * of stretching to match a taller input. */

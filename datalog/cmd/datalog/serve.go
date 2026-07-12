@@ -135,15 +135,16 @@ func newWorkbench(dataDir, configPath string, ruleFiles []string, tokenFlag stri
 	h.registerTools(srv)
 
 	wb := &workbench{
-		h:          h,
-		bus:        newBus(),
-		jobs:       newJobs(),
-		console:    &consoleLog{},
-		mcpSrv:     srv,
-		agentCfg:   agentCfg,
-		schemaPath: configPath,
-		rulesPath:  firstOrEmpty(ruleFiles),
-		mcpToken:   token,
+		h:           h,
+		bus:         newBus(),
+		jobs:        newJobs(),
+		console:     &consoleLog{},
+		mcpSrv:      srv,
+		agentCfg:    agentCfg,
+		schemaPath:  configPath,
+		rulesPath:   firstOrEmpty(ruleFiles),
+		mcpToken:    token,
+		pendingPerm: map[string]pendingPermission{},
 	}
 
 	// The patch-back seam (doc/features/web-ui.md Deployment section): an
@@ -305,6 +306,20 @@ type workbench struct {
 	agent    agentDriver
 	agentCfg agentConfig
 
+	// permMu guards pendingPerm, the RequestID→pendingPermission map a
+	// running turn's sink populates (agent.go's runAgentTurn) and
+	// handleConsoleAnswer (console.go) consumes. It is a separate map from
+	// agent.go's local toolIDs because Answer arrives over HTTP on its own
+	// goroutine, outside the turn's sink closure — this is the one piece of
+	// per-turn state that must be reachable from a handler, so it lives on
+	// the workbench instead of a local in runAgentTurn. Cleared entry-by-
+	// entry as each request resolves, and wholesale when the turn ends
+	// (acp-integration.md work item 9: "cancelled turn resolves pending
+	// permissions driver-side; morph any unresolved permission entries to a
+	// cancelled state").
+	permMu      sync.Mutex
+	pendingPerm map[string]pendingPermission
+
 	// schemaPath and rulesPath are the operator-given startup paths for the
 	// schema (-c) and rules (first positional .dl file) documents,
 	// respectively — the Save targets (doc/features/web-ui.md "Session state
@@ -376,6 +391,7 @@ func (wb *workbench) routes(mux *http.ServeMux) {
 	// and the Agent tab's prompt (doc/features/web-ui.md "Console drawer").
 	mux.HandleFunc("POST /console/query", wb.handleConsoleQuery)
 	mux.HandleFunc("POST /console/prompt", wb.handleConsolePrompt)
+	mux.HandleFunc("POST /console/answer", wb.handleConsoleAnswer)
 	mux.HandleFunc("POST /console/clear", wb.handleConsoleClear)
 
 	// Global Cancel — implemented fully now (doc/features/web-ui.md

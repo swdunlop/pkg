@@ -186,12 +186,23 @@ func TestConsoleClearAgentCancelsRunningTurn(t *testing.T) {
 // fakeDriver scripts one turn's event sequence, standing in for kitDriver so
 // the turn runner's entry lifecycle is testable without a provider
 // (acp-integration.md phase-1 work item 4: test the event mapping in
-// isolation).
+// isolation). answerable/answerErr let the same fake stand in for an ACP-like
+// driver that DOES issue permission requests (work item 9's tests) without a
+// separate type: Answer records the call so a handler test can assert on it,
+// returning answerErr when set so the "Answer fails" path is reachable too.
 type fakeDriver struct {
 	events     []agentEvent
 	stopReason string
 	err        error
 	closed     bool
+
+	answerable bool
+	answerErr  error
+	answered   []answerCall
+}
+
+type answerCall struct {
+	requestID, optionID string
 }
 
 func (d *fakeDriver) Prompt(ctx context.Context, text string, sink func(agentEvent)) (string, error) {
@@ -205,7 +216,11 @@ func (d *fakeDriver) Prompt(ctx context.Context, text string, sink func(agentEve
 }
 
 func (d *fakeDriver) Answer(requestID, optionID string) error {
-	return errors.New("fakeDriver does not issue permission requests")
+	if !d.answerable {
+		return errors.New("fakeDriver does not issue permission requests")
+	}
+	d.answered = append(d.answered, answerCall{requestID, optionID})
+	return d.answerErr
 }
 
 func (d *fakeDriver) Close() error { d.closed = true; return nil }
@@ -410,6 +425,208 @@ func TestRunAgentTurnCancelled(t *testing.T) {
 	log := renderLog(wb, "agent")
 	if !strings.Contains(log, "turn cancelled") {
 		t.Fatalf("expected cancellation entry: %s", log)
+	}
+}
+
+// -- permission requests -------------------------------------------------------
+
+// blockingPermissionDriver emits one permission event, then blocks Prompt
+// until Answer is called (or ctx is cancelled) — the real shape a
+// session/request_permission RPC takes in acpDriver, and the shape this
+// test needs to answer the request from an HTTP handler WHILE the turn is
+// still in flight, matching how the pane actually works (blockingDriver
+// above is the same idiom for a plain message turn).
+type blockingPermissionDriver struct {
+	answered chan answerCall
+}
+
+func newBlockingPermissionDriver() *blockingPermissionDriver {
+	return &blockingPermissionDriver{answered: make(chan answerCall, 1)}
+}
+
+func (d *blockingPermissionDriver) Prompt(ctx context.Context, text string, sink func(agentEvent)) (string, error) {
+	sink(agentEvent{
+		Kind: "permission", RequestID: "req-1", ToolName: "datalog__set_rules",
+		ToolArgs: `{"rules":"bad(X) :- copied_to(X, _)."}`,
+		Options: []agentOption{
+			{ID: "allow", Name: "Allow", Kind: "allow_once"},
+			{ID: "reject", Name: "Reject", Kind: "reject_once"},
+		},
+	})
+	select {
+	case call := <-d.answered:
+		sink(agentEvent{Kind: "message", Text: "ok, chose " + call.optionID})
+		return "stop", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (d *blockingPermissionDriver) Answer(requestID, optionID string) error {
+	d.answered <- answerCall{requestID, optionID}
+	return nil
+}
+
+func (d *blockingPermissionDriver) Close() error { return nil }
+
+func TestRunAgentTurnPermissionRendersOptions(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	driver := newBlockingPermissionDriver()
+	wb.agent = driver
+	srv := startTestServer(wb)
+	defer srv.Close()
+
+	turnDone := make(chan struct{})
+	go func() {
+		wb.runAgentTurn(context.Background(), driver, "change the rules")
+		close(turnDone)
+	}()
+
+	// Wait for the permission entry to land before asserting on it or
+	// answering — runAgentTurn is running on its own goroutine now, mirroring
+	// how the real prompt handler detaches the turn (handleConsolePrompt).
+	waitFor(t, func() bool { return strings.Contains(renderLog(wb, "agent"), "permission-option") })
+
+	log := renderLog(wb, "agent")
+	for _, want := range []string{
+		"agent is waiting for permission",
+		"set_rules",
+		">Allow<",
+		">Reject<",
+		"permission-option allow",
+		"permission-option reject",
+		"requestID=req-1",
+		"optionID=allow",
+		"optionID=reject",
+	} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("permission entry missing %q: %s", want, log)
+		}
+	}
+
+	// The pending entry must be tracked so the answer endpoint (outside the
+	// turn goroutine's sink) can find it.
+	wb.permMu.Lock()
+	_, ok := wb.pendingPerm["req-1"]
+	wb.permMu.Unlock()
+	if !ok {
+		t.Fatalf("permission request not tracked in wb.pendingPerm")
+	}
+
+	resp := postSignals(t, srv, "/console/answer?requestID=req-1&optionID=allow", map[string]any{})
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+
+	<-turnDone // the turn's own message/cleanup steps race the assertions below otherwise
+
+	log = renderLog(wb, "agent")
+	if !strings.Contains(log, "answered: Allow") {
+		t.Fatalf("resolved entry does not name the chosen option: %s", log)
+	}
+	if strings.Contains(log, "permission-option") {
+		t.Fatalf("resolved entry still carries buttons: %s", log)
+	}
+
+	wb.permMu.Lock()
+	_, stillPending := wb.pendingPerm["req-1"]
+	wb.permMu.Unlock()
+	if stillPending {
+		t.Fatalf("answered request was not cleared from wb.pendingPerm")
+	}
+}
+
+func TestConsoleAnswerUnknownRequestRendersError(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	srv := startTestServer(wb)
+	defer srv.Close()
+
+	// No turn ever ran, so "req-does-not-exist" was never tracked — this
+	// covers both a late answer (arrived after the turn already resolved or
+	// cancelled it) and a stale page replaying an old requestID. The
+	// handler must render an error entry, not panic on the missing map key
+	// or a nil driver.
+	resp := postSignals(t, srv, "/console/answer?requestID=req-does-not-exist&optionID=allow", map[string]any{})
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+
+	log := renderLog(wb, "agent")
+	if !strings.Contains(log, "no longer waiting for an answer") {
+		t.Fatalf("expected an error entry for the unknown request: %s", log)
+	}
+}
+
+// cancelAfterPermissionDriver emits one permission event, then cancels its
+// own context (simulating Global Cancel firing while the turn is blocked on
+// a permission request) and returns as a cancelled turn does.
+type cancelAfterPermissionDriver struct {
+	cancel context.CancelFunc
+}
+
+func (d *cancelAfterPermissionDriver) Prompt(ctx context.Context, text string, sink func(agentEvent)) (string, error) {
+	sink(agentEvent{Kind: "permission", RequestID: "req-2", ToolName: "datalog__query",
+		Options: []agentOption{{ID: "allow", Name: "Allow", Kind: "allow_once"}}})
+	d.cancel()
+	return "", ctx.Err()
+}
+
+func (d *cancelAfterPermissionDriver) Answer(requestID, optionID string) error {
+	return errors.New("turn already ended")
+}
+
+func (d *cancelAfterPermissionDriver) Close() error { return nil }
+
+func TestRunAgentTurnCancelledResolvesPendingPermission(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	driver := &cancelAfterPermissionDriver{cancel: cancel}
+
+	wb.runAgentTurn(ctx, driver, "hi")
+
+	log := renderLog(wb, "agent")
+	if !strings.Contains(log, "cancelled: turn ended before the agent received an answer") {
+		t.Fatalf("expected the pending permission to morph to cancelled: %s", log)
+	}
+	if strings.Contains(log, "permission-option") {
+		t.Fatalf("cancelled entry still carries live buttons: %s", log)
+	}
+
+	wb.permMu.Lock()
+	n := len(wb.pendingPerm)
+	wb.permMu.Unlock()
+	if n != 0 {
+		t.Fatalf("pendingPerm not cleared at turn end: %d entries remain", n)
+	}
+}
+
+// -- plan checklist ------------------------------------------------------------
+
+func TestRunAgentTurnPlanMorphsInPlace(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	driver := &fakeDriver{
+		events: []agentEvent{
+			{Kind: "plan", PlanEntries: []agentPlanEntry{
+				{Content: "inspect schema", Status: "in_progress"},
+				{Content: "run query", Status: "pending"},
+			}},
+			{Kind: "plan", PlanEntries: []agentPlanEntry{
+				{Content: "inspect schema", Status: "completed"},
+				{Content: "run query", Status: "in_progress"},
+			}},
+		},
+		stopReason: "stop",
+	}
+
+	wb.runAgentTurn(context.Background(), driver, "plan it out")
+
+	log := renderLog(wb, "agent")
+	if strings.Count(log, "plan-checklist") != 1 {
+		t.Fatalf("plan should morph one entry in place, not append a second: %s", log)
+	}
+	if !strings.Contains(log, "inspect schema") || !strings.Contains(log, "run query") {
+		t.Fatalf("plan entries missing: %s", log)
+	}
+	if !strings.Contains(log, "plan-line completed") {
+		t.Fatalf("completed status not reflected in the final morph: %s", log)
 	}
 }
 

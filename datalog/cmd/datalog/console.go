@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -267,6 +268,69 @@ func (wb *workbench) handleConsoleClear(w http.ResponseWriter, r *http.Request) 
 
 	wb.console.Clear(tab)
 	wb.bus.Publish(datastar.Elements(view.ConsoleLog(tab)))
+}
+
+// handleConsoleAnswer (POST /console/answer?requestID=...&optionID=...) is
+// one permission button's click target (agent.go's permissionEntry). The
+// query string, not signals, carries the pair — each button is a distinct,
+// static (requestID, optionID) baked in at render time, the same idiom
+// handleConsoleClear uses for ?tab= (view/console.go's clearButton is the
+// precedent this follows).
+//
+// The driver resolved here is the CURRENT wb.agent read directly under
+// agentMu — deliberately NOT wb.agentDriver(), which lazily constructs a
+// fresh driver on a nil agent; an Answer with no live turn has nothing to
+// construct a driver FOR (acp-integration.md work item 9's explicit
+// instruction). requestID unknown to wb.pendingPerm (already resolved,
+// already cancelled by turn-end cleanup, or simply never existed — a stale
+// browser tab replaying an old page) renders an error entry rather than
+// touching the driver at all; Answer erroring on a requestID it does
+// recognize (the driver's own bookkeeping disagrees) also renders an error,
+// never panics either way.
+func (wb *workbench) handleConsoleAnswer(w http.ResponseWriter, r *http.Request) {
+	requestID := r.URL.Query().Get("requestID")
+	optionID := r.URL.Query().Get("optionID")
+
+	if _, err := datastar.RequestStream(w, r); err != nil {
+		return
+	}
+
+	wb.permMu.Lock()
+	pending, ok := wb.pendingPerm[requestID]
+	if ok {
+		delete(wb.pendingPerm, requestID)
+	}
+	wb.permMu.Unlock()
+	if !ok {
+		wb.consoleAppend("agent", "error",
+			html.Text("this permission request is no longer waiting for an answer"))
+		return
+	}
+
+	wb.agentMu.Lock()
+	driver := wb.agent
+	wb.agentMu.Unlock()
+	if driver == nil {
+		wb.consoleUpdate(pending.entryID, "permission",
+			permissionResolvedEntry(&pending.event, "error: no agent is running to receive this answer"))
+		return
+	}
+
+	if err := driver.Answer(requestID, optionID); err != nil {
+		wb.consoleUpdate(pending.entryID, "permission",
+			permissionResolvedEntry(&pending.event, fmt.Sprintf("error: %v", err)))
+		return
+	}
+
+	chosen := optionID
+	for _, opt := range pending.event.Options {
+		if opt.ID == optionID {
+			chosen = opt.Name
+			break
+		}
+	}
+	wb.consoleUpdate(pending.entryID, "permission",
+		permissionResolvedEntry(&pending.event, "answered: "+chosen))
 }
 
 // queryEcho renders the query text an entry responds to, so the scrollback

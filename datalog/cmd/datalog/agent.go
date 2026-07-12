@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -66,6 +67,17 @@ type agentOption struct {
 type agentPlanEntry struct {
 	Content string
 	Status  string // "pending" | "in_progress" | "completed" (ACP's PlanEntryStatus)
+}
+
+// pendingPermission is one entry in the workbench's RequestID→state map
+// (serve.go's wb.pendingPerm): the console entry id to morph when the
+// request resolves, and the original event so the resolved rendering can
+// still name the tool it gated (handleConsoleAnswer and runAgentTurn's
+// post-turn cleanup both need this — the map, not a turn-local closure, is
+// what makes the event reachable from the HTTP handler).
+type pendingPermission struct {
+	entryID uint64
+	event   agentEvent
 }
 
 // agentDriver abstracts one conversational agent behind the chat pane
@@ -354,13 +366,19 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 		case "error":
 			wb.consoleAppend("agent", "error", html.Text(ev.Text))
 		case "permission":
-			// Minimal phase-2 rendering: the request and its options as
-			// plain text, one entry per request — interactive buttons that
-			// call Answer are a separate task (acp-integration.md work item
-			// 9). Until that lands, a turn parked on a permission request
-			// has no way to proceed from the pane; the driver's own kill
-			// timer / cancellation is the only recourse.
-			wb.consoleAppend("agent", "permission", html.Text(permissionText(ev)))
+			// Interactive rendering (acp-integration.md work item 9): one
+			// entry with a live button per option. The entry id is tracked
+			// under wb.permMu — NOT the local toolIDs map above — because
+			// the click that resolves this request arrives at
+			// handleConsoleAnswer on its own HTTP goroutine, outside this
+			// sink closure entirely; toolIDs would simply be unreachable
+			// from there. "A turn blocked on permission shows that state
+			// plainly": the entry's own phrasing carries that, so no
+			// second spinner is added alongside agentActivity.
+			id := wb.consoleAppend("agent", "permission", permissionEntry(ev))
+			wb.permMu.Lock()
+			wb.pendingPerm[ev.RequestID] = pendingPermission{entryID: id, event: ev}
+			wb.permMu.Unlock()
 		case "plan":
 			body := planEntry(ev.PlanEntries)
 			if planID == 0 {
@@ -394,54 +412,132 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 	case stopReason != "" && stopReason != "stop" && stopReason != "end_turn" && stopReason != "tool_calls":
 		wb.consoleAppend("agent", "note", html.Text("turn ended: "+stopReason))
 	}
+
+	// A cancelled or crashed turn can leave permission requests the driver
+	// never resolves an answer for — the ACP request itself is abandoned
+	// with the subprocess/turn, but the pane's buttons would otherwise sit
+	// there forever, dead (clicking Answer on a requestID the driver no
+	// longer recognizes). Morph every entry still in wb.pendingPerm to a
+	// cancelled state and clear the map so no stale requestID survives into
+	// the next turn (acp-integration.md work item 9: "cancelled turn
+	// resolves pending permissions driver-side; morph any unresolved
+	// permission entries to a cancelled state").
+	wb.permMu.Lock()
+	stale := wb.pendingPerm
+	wb.pendingPerm = map[string]pendingPermission{}
+	wb.permMu.Unlock()
+	for _, p := range stale {
+		ev := p.event
+		wb.consoleUpdate(p.entryID, "permission",
+			permissionResolvedEntry(&ev, "cancelled: turn ended before the agent received an answer"))
+	}
 }
 
-// permissionText renders one permission request as plain text: the tool
-// call it gates and the options the agent offered. Plain text is
-// deliberate — interactive option buttons (posting back through Answer)
-// are chat-pane work item 9, out of scope here; this is only enough to
-// keep the operator informed that the turn is waiting on a decision they
-// cannot yet make from the UI.
-func permissionText(ev agentEvent) string {
+// permissionSummary renders the tool call a permission request gates —
+// "agent is waiting for permission: <tool> <args>" — shared by the pending
+// (with buttons) and resolved (without) renderings so the phrasing that
+// makes a blocked turn "show that state plainly" (acp-integration.md "Chat
+// pane") survives the morph to resolved/cancelled.
+func permissionSummary(ev agentEvent) string {
 	var b strings.Builder
-	b.WriteString("permission requested for ")
 	b.WriteString(strings.TrimPrefix(ev.ToolName, "datalog__"))
 	if ev.ToolArgs != "" {
+		compact, _ := compactArgs(strings.TrimSpace(ev.ToolArgs))
 		b.WriteString(" ")
-		b.WriteString(strings.TrimSpace(ev.ToolArgs))
+		b.WriteString(compact)
 	}
-	b.WriteString(" — options: ")
-	names := make([]string, len(ev.Options))
-	for i, opt := range ev.Options {
-		names[i] = opt.Name
-	}
-	b.WriteString(strings.Join(names, ", "))
-	b.WriteString(" (interactive buttons coming soon; the operator cannot yet respond from this pane)")
 	return b.String()
 }
 
-// planEntry renders the agent's plan as a plain-text checklist, updated in
-// place each time the agent replaces the plan (ACP's plan/update always
-// carries the complete list — see agentPlanEntry's doc comment). A real
-// checklist widget is chat-pane work item 9.
-func planEntry(entries []agentPlanEntry) html.Content {
-	var b strings.Builder
-	for i, e := range entries {
-		if i > 0 {
-			b.WriteString("\n")
+// permissionEntry renders one pending permission request: the phrasing
+// "agent is waiting for permission: ..." makes the blocked state plain
+// (acp-integration.md "Chat pane"), and one inline button per option —
+// posting RequestID/OptionID to POST /console/answer (handleConsoleAnswer,
+// console.go) — lets the operator resolve it without a second round-trip
+// through the tool-call entry. Resolving morphs the entry to
+// permissionResolvedEntry instead, which drops the buttons.
+func permissionEntry(ev agentEvent) html.Content {
+	summary := permissionSummary(ev)
+	buttons := make(html.Group, 0, len(ev.Options))
+	for _, opt := range ev.Options {
+		class := "permission-option"
+		if strings.HasPrefix(opt.Kind, "reject") {
+			class += " reject"
+		} else {
+			class += " allow"
 		}
-		mark := "[ ]"
-		switch e.Status {
-		case "completed":
-			mark = "[x]"
-		case "in_progress":
-			mark = "[~]"
-		}
-		b.WriteString(mark)
-		b.WriteString(" ")
-		b.WriteString(e.Content)
+		buttons = append(buttons, tag.New("button."+class).
+			Set("data-on:click", "@post('/console/answer?requestID="+urlQueryEscape(ev.RequestID)+
+				"&optionID="+urlQueryEscape(opt.ID)+"')").
+			Add(html.Text(opt.Name)))
 	}
-	return tag.New("pre", html.Text(b.String()))
+	return html.Group{
+		tag.New("p.permission-line",
+			html.Text("agent is waiting for permission: "+summary)),
+		tag.New("div.permission-options", buttons),
+	}
+}
+
+// permissionResolvedEntry renders a request after it stops being pending —
+// either Answer succeeded (note names the chosen option) or the turn ended
+// with it still unanswered (runAgentTurn's cleanup, driver-side
+// cancellation per acp-integration.md work item 9). ev is nil when the
+// caller (runAgentTurn's cleanup) only has the entry id, not the original
+// event — wb.pendingPerm maps RequestID to entry id only, not the event, to
+// keep that map small; the resulting summary is generic ("a pending
+// permission request") rather than naming the tool again, which is an
+// acceptable loss for an abandoned request nobody can act on anymore.
+// handleConsoleAnswer, which does have the original event via
+// pendingPermEvent, passes it through so the resolved line still names the
+// tool.
+func permissionResolvedEntry(ev *agentEvent, note string) html.Content {
+	subject := "a pending permission request"
+	if ev != nil {
+		subject = "permission for " + permissionSummary(*ev)
+	}
+	return tag.New("p.permission-line", html.Text(subject+" — "+note))
+}
+
+// urlQueryEscape escapes a value for inclusion in a query string built by
+// string concatenation, matching the idiom view/console.go's clearButton
+// already uses for ?tab=. RequestID/OptionID are driver-generated tokens,
+// not free text, but escaping costs nothing and removes any assumption
+// about their alphabet.
+func urlQueryEscape(s string) string {
+	return url.QueryEscape(s)
+}
+
+// planMark renders one plan entry's status as a checklist glyph — a real
+// widget (acp-integration.md work item 9) in place of the phase-1 [ ]/[x]/[~]
+// text markers.
+func planMark(status string) string {
+	switch status {
+	case "completed":
+		return "☑"
+	case "in_progress":
+		return "◐"
+	default:
+		return "☐"
+	}
+}
+
+// planEntry renders the agent's plan as a checklist block: one line per
+// entry with its status glyph, replaced wholesale and morphed in place each
+// time the agent sends a new plan (ACP's plan/update always carries the
+// complete list — see agentPlanEntry's doc comment).
+func planEntry(entries []agentPlanEntry) html.Content {
+	lines := make(html.Group, 0, len(entries))
+	for _, e := range entries {
+		class := "plan-line"
+		if e.Status != "" {
+			class += " " + strings.ReplaceAll(e.Status, "_", "-")
+		}
+		lines = append(lines, tag.New("li."+class,
+			tag.New("span.plan-mark", html.Text(planMark(e.Status))),
+			html.Text(" "+e.Content),
+		))
+	}
+	return tag.New("ul.plan-checklist", lines)
 }
 
 // thoughtEntry renders accumulated reasoning as a collapsed disclosure —
