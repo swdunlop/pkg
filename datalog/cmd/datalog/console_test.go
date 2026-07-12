@@ -242,6 +242,19 @@ func TestRunAgentTurnTranscript(t *testing.T) {
 	}
 }
 
+func TestFormatToolResult(t *testing.T) {
+	got := formatToolResult(`{"total":3,"rows":[["a","b"]]}`)
+	want := "{\n  \"total\": 3,\n  \"rows\": [\n    [\n      \"a\",\n      \"b\"\n    ]\n  ]\n}"
+	if got != want {
+		t.Fatalf("JSON not indented:\n%s", got)
+	}
+	for _, plain := range []string{"3 rows", "", "{not json", "error: boom"} {
+		if formatToolResult(plain) != plain {
+			t.Fatalf("non-JSON result %q was altered: %q", plain, formatToolResult(plain))
+		}
+	}
+}
+
 func TestRunAgentTurnNoReplyNote(t *testing.T) {
 	wb := newMordorWorkbench(t)
 	// A turn that runs tools but never composes a reply — small models end

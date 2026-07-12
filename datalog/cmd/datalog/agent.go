@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -331,8 +333,23 @@ func toolEntry(ev agentEvent, done bool) html.Content {
 	}
 	return html.Group{head, tag.New("details",
 		tag.New("summary", html.Text("result")),
-		tag.New("pre", html.Text(ev.Result)),
+		tag.New("pre", html.Text(formatToolResult(ev.Result))),
 	)}
+}
+
+// formatToolResult pretty-prints a JSON tool result for the disclosure —
+// the MCP tools emit single-line JSON, unreadable in a <pre>. Anything that
+// isn't a JSON document (error strings, plain text) passes through as-is.
+func formatToolResult(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" || (trimmed[0] != '{' && trimmed[0] != '[') {
+		return s
+	}
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, []byte(trimmed), "", "  "); err != nil {
+		return s
+	}
+	return buf.String()
 }
 
 func toolStatus(ev agentEvent, done bool) html.Content {
