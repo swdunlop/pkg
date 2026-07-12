@@ -372,6 +372,9 @@ func (h *mcpHandlers) query(ctx context.Context, in queryInput) (queryOutput, er
 	if !ok {
 		return queryOutput{}, fmt.Errorf("query: expected a query statement ending in '?', got %T", parsed)
 	}
+	if err := rejectAnonQueryVars(q); err != nil {
+		return queryOutput{}, err
+	}
 
 	limit := in.Limit
 	if limit <= 0 {
@@ -422,6 +425,53 @@ func (h *mcpHandlers) query(ctx context.Context, in queryInput) (queryOutput, er
 		Truncated: n > serialize,
 		Stats:     outStats,
 	}, nil
+}
+
+// rejectAnonQueryVars refuses the anonymous variable '?' in a query tool
+// call's body atoms. '?' is legal in the language (aggregate rule bodies
+// use it idiomatically), but in a query it produces parser-generated
+// columns (?0, ?1, ...) a model didn't ask for and can't correlate — and a
+// weak model that writes pred(?, ?)? is usually pattern-matching SQL, not
+// choosing anonymity. The error text teaches the two forms it should have
+// used, since tool errors are the model's only corrective feedback
+// (doc/features/mcp-server.md's atomic-feedback posture). The parser
+// renames each '?' to ?N before we see it, so detection matches the
+// generated prefix rather than the literal.
+func rejectAnonQueryVars(q *syntax.Query) error {
+	for _, atom := range q.Body {
+		for _, term := range atom.Terms {
+			v, ok := term.(datalog.Variable)
+			if !ok || !strings.HasPrefix(string(v), "?") {
+				continue
+			}
+			return fmt.Errorf("query: anonymous variable '?' is not allowed in query arguments: "+
+				"name every column you want returned (e.g. %s), or use an underscore-prefixed "+
+				"variable (e.g. _Ignored) for positions you don't care about", exampleNamedQuery(q))
+		}
+	}
+	return nil
+}
+
+// exampleNamedQuery rewrites the offending query with A, B, C... in place
+// of its anonymous variables, so the error shows the fix applied to the
+// model's own query rather than an unrelated example.
+func exampleNamedQuery(q *syntax.Query) string {
+	names := []string{"A", "B", "C", "D", "E", "F", "G", "H"}
+	next := 0
+	fixed := syntax.Query{Body: make([]syntax.Atom, len(q.Body))}
+	for i, atom := range q.Body {
+		terms := make([]datalog.Term, len(atom.Terms))
+		for j, term := range atom.Terms {
+			if v, ok := term.(datalog.Variable); ok && strings.HasPrefix(string(v), "?") && next < len(names) {
+				terms[j] = datalog.Variable(names[next])
+				next++
+				continue
+			}
+			terms[j] = term
+		}
+		fixed.Body[i] = syntax.Atom{Pred: atom.Pred, Terms: terms, Negated: atom.Negated, Expr: atom.Expr}
+	}
+	return strings.TrimSpace(fixed.String())
 }
 
 // constantToJSON converts a datalog.Constant to a value that serializes as

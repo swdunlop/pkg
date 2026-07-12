@@ -133,8 +133,10 @@ const mcpDatalogSyntaxSummary = `Datalog syntax summary:
   Builtins:    @contains(Str, "needle")   - constraint form (in the body, must hold)
                @time_diff(T2, T1, D)      - binding form (D is the output)
   Comments start with "%". "?" alone is the anonymous variable (matches
-  anything, binds nothing). A statement ends with "." (fact or rule) or
-  "?" (query).`
+  anything, binds nothing) - legal in rule bodies, but rejected in the
+  query tool's arguments, where every position should be a named variable
+  or an underscore-prefixed one. A statement ends with "." (fact or rule)
+  or "?" (query).`
 
 // mcpSetRulesDescription documents set_rules: whole-document replacement,
 // the syntax summary, and the embedded-query rejection.
@@ -168,9 +170,17 @@ and stats, then go back and adjust schema/rules as needed).
 
 ` + mcpDatalogSyntaxSummary + `
 
-The "query" argument is a single query statement, e.g.:
+The "query" argument is a single query statement. Name every variable you
+want returned as a column, and use an underscore-prefixed variable for
+positions you don't care about - the anonymous variable '?' is rejected
+in query arguments (it is only for aggregate rule bodies, via set_rules):
   suspicious(Host, Pid, Cmd)?
-  N = count : suspicious(?, ?, ?)?
+  exe_drop(Host, User, _Share, Path, _Ip)?
+
+A query over a predicate that no loaded data or rule defines is not an
+error - it just returns 0 rows. If a count is unexpectedly zero, check
+the predicate's name and arity with list_predicates before concluding
+the facts don't exist.
 
 "limit" caps how many rows are serialized into the response (default 100,
 hard cap 1000 - values above the cap are silently clamped, not rejected).

@@ -365,6 +365,38 @@ func TestQuery_DefaultLimitAndTruncation(t *testing.T) {
 	}
 }
 
+func TestQuery_RejectsAnonymousVariables(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 5)
+	h, done := newTestHandlers(t, dir)
+	defer done()
+
+	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+		t.Fatalf("set_schema: %v", err)
+	}
+
+	_, err := h.query(context.Background(), queryInput{Query: `event(?, Pid, ?)?`})
+	if err == nil {
+		t.Fatalf("query: expected anonymous-variable rejection, got success")
+	}
+	// The error must teach the fix using the model's own query: named
+	// variables substituted for the '?'s, the named Pid left alone.
+	for _, want := range []string{"anonymous variable", "_Ignored", "event(A, Pid, B)?"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("query error missing %q: %v", want, err)
+		}
+	}
+
+	// Underscore-prefixed variables remain the accepted don't-care form.
+	out, err := h.query(context.Background(), queryInput{Query: `event(_Host, Pid, _Cmd)?`})
+	if err != nil {
+		t.Fatalf("query with underscore vars: %v", err)
+	}
+	if out.Total != 5 {
+		t.Fatalf("query: total = %d, want 5", out.Total)
+	}
+}
+
 func TestQuery_HardCap(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 1500)
