@@ -3,6 +3,7 @@ package seminaive
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"swdunlop.dev/pkg/datalog/syntax"
 )
@@ -15,9 +16,17 @@ type stratum struct {
 }
 
 // depEdge represents a dependency from one predicate to another.
+//
+// negative marks edges that must not participate in a cycle: ordinary
+// negation edges (b.Negated) and aggregate-rule body edges, since
+// evaluation runs aggregates non-monotonically (once per stratum, after
+// the plain-rule fixpoint) rather than folding their output back into the
+// fixpoint. Both require "to" to be in a strictly lower stratum than
+// "from", and both are rejected if they land in the same SCC.
 type depEdge struct {
 	from, to string
 	negative bool
+	agg      bool // true if this edge comes from an aggregate rule's body
 }
 
 // stratify partitions rules into strata based on predicate dependencies.
@@ -42,7 +51,16 @@ func stratify(rules []syntax.Rule, aggRules []syntax.AggregateRule, builtins map
 				continue
 			}
 			allPreds[b.Pred] = true
-			edges = append(edges, depEdge{from: ar.Head.Pred, to: b.Pred, negative: b.Negated})
+			// Aggregates are non-monotonic like negation: evaluation runs
+			// plain rules to fixpoint and then evalAggregates exactly once
+			// per stratum, never feeding aggregate output back into the
+			// fixpoint. So every body predicate of an aggregate rule
+			// (including the aggregated predicate itself) must land in a
+			// strictly lower stratum than the aggregate's head, on pain of
+			// silently wrong (non-fixpoint) results. Mark these edges the
+			// same way negated edges are marked so a cycle through an
+			// aggregate is rejected at stratification time.
+			edges = append(edges, depEdge{from: ar.Head.Pred, to: b.Pred, negative: true, agg: true})
 		}
 	}
 
@@ -56,7 +74,15 @@ func stratify(rules []syntax.Rule, aggRules []syntax.AggregateRule, builtins map
 	}
 	for _, e := range edges {
 		if e.negative && predToSCC[e.from] == predToSCC[e.to] {
-			return nil, fmt.Errorf("unstratifiable: negation cycle involving %q and %q", e.from, e.to)
+			members := make([]string, 0, len(sccs[predToSCC[e.from]]))
+			for p := range sccs[predToSCC[e.from]] {
+				members = append(members, p)
+			}
+			slices.Sort(members)
+			if e.agg {
+				return nil, fmt.Errorf("unstratifiable: cycle through an aggregate involving %s", strings.Join(members, ", "))
+			}
+			return nil, fmt.Errorf("unstratifiable: negation cycle involving %s", strings.Join(members, ", "))
 		}
 	}
 

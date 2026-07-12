@@ -269,3 +269,78 @@ func TestParseErrorLineColumn(t *testing.T) {
 		t.Errorf("expected a caret under the offending column, got: %v", msg)
 	}
 }
+
+// TestParseAllStopsOnUnrecognizedChar guards against the lexer silently
+// treating a stray character as end of input: ParseAll must report an error
+// rather than truncating the ruleset. See ParseAll("a(1). ; b(2).") which
+// used to return one rule and a nil error, silently dropping b(2).
+func TestParseAllStopsOnUnrecognizedChar(t *testing.T) {
+	_, err := syntax.ParseAll("a(1). ; b(2).")
+	if err == nil {
+		t.Fatal("expected a parse error, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, `";"`) {
+		t.Errorf("expected the error to mention the offending ';', got: %v", msg)
+	}
+	if !strings.Contains(msg, "line 1, column 7") {
+		t.Errorf("expected the error to report line 1, column 7, got: %v", msg)
+	}
+}
+
+// TestParseAllUnrecognizedCharAtStart guards against ParseAll("#junk")
+// returning an empty ruleset with a nil error.
+func TestParseAllUnrecognizedCharAtStart(t *testing.T) {
+	rs, err := syntax.ParseAll("#junk")
+	if err == nil {
+		t.Fatalf("expected a parse error, got nil (ruleset: %+v)", rs)
+	}
+	if !strings.Contains(err.Error(), `"#"`) {
+		t.Errorf("expected the error to mention the offending '#', got: %v", err)
+	}
+}
+
+func TestParseLoneBangErrors(t *testing.T) {
+	_, err := syntax.ParseAll("a(1) ! b(2).")
+	if err == nil {
+		t.Fatal("expected a parse error for a lone '!', got nil")
+	}
+	if !strings.Contains(err.Error(), `"!"`) {
+		t.Errorf("expected the error to mention the offending '!', got: %v", err)
+	}
+}
+
+func TestParseLoneAtErrors(t *testing.T) {
+	_, err := syntax.ParseAll("a(1) @ b(2).")
+	if err == nil {
+		t.Fatal("expected a parse error for a lone '@', got nil")
+	}
+	if !strings.Contains(err.Error(), `"@"`) {
+		t.Errorf("expected the error to mention the offending '@', got: %v", err)
+	}
+}
+
+// TestParseAllValidProgramsStillParse is a broader smoke test that the
+// unrecognized-character fix did not disturb lexing of valid input.
+func TestParseAllValidProgramsStillParse(t *testing.T) {
+	rs, err := syntax.ParseAll(`
+		parent("tom", "bob").
+		ancestor(X, Y) :- parent(X, Y).
+		has(X) :- msg(X), @contains(X, "hello").
+		total(S, T) :- T = sum(V) : val(V).
+		q(X) :- val(X), X != 0, not excluded(X).
+		ancestor("tom", X)?
+	`)
+	if err != nil {
+		t.Fatalf("expected valid program to parse cleanly, got: %v", err)
+	}
+	if len(rs.Rules) != 4 {
+		t.Errorf("expected 4 rules, got %d", len(rs.Rules))
+	}
+	if len(rs.AggRules) != 1 {
+		t.Errorf("expected 1 aggregate rule, got %d", len(rs.AggRules))
+	}
+	if len(rs.Queries) != 1 {
+		t.Errorf("expected 1 query, got %d", len(rs.Queries))
+	}
+}

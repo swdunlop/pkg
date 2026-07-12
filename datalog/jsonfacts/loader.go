@@ -2,11 +2,13 @@ package jsonfacts
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/expr-lang/expr"
@@ -122,10 +124,13 @@ func loadSource(src Source, fsys fs.FS, counter *idCounter) ([]datalog.Fact, err
 			continue
 		}
 
+		dec := json.NewDecoder(bytes.NewReader(line))
+		dec.UseNumber()
 		var obj map[string]any
-		if err := json.Unmarshal(line, &obj); err != nil {
+		if err := dec.Decode(&obj); err != nil {
 			return nil, fmt.Errorf("line %d: %w", lineNum, err)
 		}
+		resolveNumbers(obj)
 
 		runEnv := map[string]any{"value": obj}
 
@@ -167,6 +172,50 @@ func loadSource(src Source, fsys fs.FS, counter *idCounter) ([]datalog.Fact, err
 	}
 
 	return facts, nil
+}
+
+// resolveNumbers walks a decoded JSON value in place, replacing every
+// json.Number leaf with an int64 (when the literal is exact and fits) or a
+// float64 otherwise. The JSONL decoder runs with UseNumber() so that large
+// integers (beyond float64's 2^53 exact range, e.g. IDs, hashes, and
+// nanosecond timestamps) survive decoding without precision loss; this walk
+// then converts those numbers into plain Go numeric types so expr mapping
+// and filter expressions (which do not support arithmetic or comparisons on
+// json.Number) keep working exactly as they did before UseNumber() was
+// introduced, while retaining int64 exactness that plain json.Unmarshal into
+// float64 would have destroyed.
+func resolveNumbers(v any) any {
+	switch val := v.(type) {
+	case json.Number:
+		return numberToConstantValue(val)
+	case map[string]any:
+		for k, elem := range val {
+			val[k] = resolveNumbers(elem)
+		}
+		return val
+	case []any:
+		for i, elem := range val {
+			val[i] = resolveNumbers(elem)
+		}
+		return val
+	default:
+		return v
+	}
+}
+
+// numberToConstantValue converts a json.Number into an int64 when the
+// literal has no fraction or exponent and fits in 64 bits, else a float64.
+func numberToConstantValue(n json.Number) any {
+	if i, err := strconv.ParseInt(n.String(), 10, 64); err == nil {
+		return i
+	}
+	f, err := n.Float64()
+	if err != nil {
+		// Should not happen for valid JSON numbers; fall back to the
+		// original string representation via normalizeToConstant.
+		return n
+	}
+	return f
 }
 
 // compileMappings compiles all mappings for a source.
@@ -350,18 +399,16 @@ func normalizeToConstant(v any) datalog.Constant {
 	case float32:
 		return datalog.Float(float64(val))
 	case bool:
-		if val {
-			return datalog.Integer(1)
-		}
-		return datalog.Integer(0)
+		return datalog.Bool(val)
 	case json.Number:
-		if i, err := val.Int64(); err == nil {
-			return datalog.Integer(i)
+		switch n := numberToConstantValue(val).(type) {
+		case int64:
+			return datalog.Integer(n)
+		case float64:
+			return datalog.Float(n)
+		default:
+			return datalog.String(val.String())
 		}
-		if f, err := val.Float64(); err == nil {
-			return datalog.Float(f)
-		}
-		return datalog.String(val.String())
 	default:
 		return datalog.String(fmt.Sprintf("%v", val))
 	}

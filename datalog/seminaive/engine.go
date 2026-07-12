@@ -184,16 +184,17 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 			rules = append(rules, r)
 		}
 	}
-	if len(e.decls) > 0 {
-		for _, ar := range ruleset.AggRules {
+	for _, ar := range ruleset.AggRules {
+		if err := checkAggRuleSafety(ar, e.builtins, e.multiBuiltins, e.externals); err != nil {
+			return nil, err
+		}
+		if err := checkRuleVarLimit(ar.Head, ar.Body); err != nil {
+			return nil, err
+		}
+		if len(e.decls) > 0 {
 			if err := checkAggRuleTypes(ar, e.decls); err != nil {
 				return nil, err
 			}
-		}
-	}
-	for _, ar := range ruleset.AggRules {
-		if err := checkRuleVarLimit(ar.Head, ar.Body); err != nil {
-			return nil, err
 		}
 	}
 
@@ -228,13 +229,69 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 //   - Variables in negated atoms and comparison constraints are bound.
 //   - All head variables are bound.
 func checkRuleSafety(r syntax.Rule, builtins map[string]BuiltinFunc, multiBuiltins map[string]multiBuiltin, externals map[string]externalPredicate) error {
+	bound, err := checkBodySafety(r.Body, builtins, multiBuiltins, externals)
+	if err != nil {
+		return err
+	}
+
+	// Check head variables are bound.
+	for _, t := range r.Head.Terms {
+		if v, ok := t.(datalog.Variable); ok {
+			if !bound[string(v)] {
+				return fmt.Errorf("unsafe rule: head variable %s not bound", string(v))
+			}
+		}
+	}
+	return nil
+}
+
+// checkAggRuleSafety applies the same body-safety analysis as checkRuleSafety
+// to an aggregate rule's body, then checks that every group-by variable in
+// the head (all head variables except ResultVar) and the aggregated variable
+// (AggTerm, when it's a variable rather than a constant) are bound by the
+// body. Without this, a group-by or aggregated variable that the body never
+// binds would silently compute over an empty/nonsensical grouping and then
+// be dropped when GroundCompiled fails to ground the head, rather than
+// failing at compile time like every other unsafe rule.
+func checkAggRuleSafety(ar syntax.AggregateRule, builtins map[string]BuiltinFunc, multiBuiltins map[string]multiBuiltin, externals map[string]externalPredicate) error {
+	bound, err := checkBodySafety(ar.Body, builtins, multiBuiltins, externals)
+	if err != nil {
+		return err
+	}
+
+	for _, t := range ar.Head.Terms {
+		v, ok := t.(datalog.Variable)
+		if !ok || string(v) == ar.ResultVar {
+			continue
+		}
+		if !bound[string(v)] {
+			return fmt.Errorf("unsafe aggregate rule: group-by variable %s not bound", string(v))
+		}
+	}
+
+	if v, ok := ar.AggTerm.(datalog.Variable); ok {
+		if !bound[string(v)] {
+			return fmt.Errorf("unsafe aggregate rule: aggregated variable %s not bound", string(v))
+		}
+	}
+	return nil
+}
+
+// checkBodySafety walks a rule/aggregate-rule body and returns the set of
+// variables that end up bound by its positive atoms (joins, is-atoms, and
+// binding builtins), after verifying that every negated atom, comparison
+// constraint, and binding-builtin/external input is itself bound by some
+// positive atom in the body. It does not check the head; callers apply their
+// own head-shape-specific checks (see checkRuleSafety and
+// checkAggRuleSafety) using the returned bound set.
+func checkBodySafety(body []syntax.Atom, builtins map[string]BuiltinFunc, multiBuiltins map[string]multiBuiltin, externals map[string]externalPredicate) (map[string]bool, error) {
 	bound := map[string]bool{}
-	for _, a := range r.Body {
+	for _, a := range body {
 		switch {
 		case a.Pred == "is":
 			if a.Expr != nil {
 				if err := checkExprSafety(a.Expr, bound); err != nil {
-					return err
+					return nil, err
 				}
 			}
 			if v, ok := a.Terms[0].(datalog.Variable); ok {
@@ -245,7 +302,7 @@ func checkRuleSafety(r syntax.Rule, builtins map[string]BuiltinFunc, multiBuilti
 			for _, t := range a.Terms[:len(a.Terms)-1] {
 				if v, ok := t.(datalog.Variable); ok {
 					if !bound[string(v)] {
-						return fmt.Errorf("unsafe rule: variable %s in %s not bound", string(v), a.Pred)
+						return nil, fmt.Errorf("unsafe rule: variable %s in %s not bound", string(v), a.Pred)
 					}
 				}
 			}
@@ -257,12 +314,12 @@ func checkRuleSafety(r syntax.Rule, builtins map[string]BuiltinFunc, multiBuilti
 			// Input args (all except the declared outputs) must be bound.
 			nOut := multiBuiltins[a.Pred].outputs
 			if len(a.Terms) < nOut {
-				return fmt.Errorf("builtin %s: expected at least %d args, got %d", a.Pred, nOut, len(a.Terms))
+				return nil, fmt.Errorf("builtin %s: expected at least %d args, got %d", a.Pred, nOut, len(a.Terms))
 			}
 			for _, t := range a.Terms[:len(a.Terms)-nOut] {
 				if v, ok := t.(datalog.Variable); ok {
 					if !bound[string(v)] {
-						return fmt.Errorf("unsafe rule: variable %s in %s not bound", string(v), a.Pred)
+						return nil, fmt.Errorf("unsafe rule: variable %s in %s not bound", string(v), a.Pred)
 					}
 				}
 			}
@@ -278,7 +335,7 @@ func checkRuleSafety(r syntax.Rule, builtins map[string]BuiltinFunc, multiBuilti
 			// Regular joins and external predicates bind all variables.
 			if ep, ok := externals[a.Pred]; ok {
 				if ep.arity != len(a.Terms) {
-					return fmt.Errorf("external predicate %s: expected arity %d, got %d", a.Pred, ep.arity, len(a.Terms))
+					return nil, fmt.Errorf("external predicate %s: expected arity %d, got %d", a.Pred, ep.arity, len(a.Terms))
 				}
 			}
 			for _, t := range a.Terms {
@@ -289,8 +346,12 @@ func checkRuleSafety(r syntax.Rule, builtins map[string]BuiltinFunc, multiBuilti
 		}
 	}
 
-	// Second pass: check negated atoms and comparisons.
-	for _, a := range r.Body {
+	// Second pass: check negated atoms and comparisons. Negated atoms'
+	// variables need only be bound by *some* positive atom in the body, not
+	// one preceding them lexically -- evaluation defers all negation checks
+	// to the end of the body (see compileBody/evalBodyRecursiveV), so
+	// safety analysis must accept that ordering too.
+	for _, a := range body {
 		if !a.Negated && !isConstraint(a) {
 			continue
 		}
@@ -305,21 +366,13 @@ func checkRuleSafety(r syntax.Rule, builtins map[string]BuiltinFunc, multiBuilti
 					if isConstraint(a) {
 						label = "comparison " + a.Pred
 					}
-					return fmt.Errorf("unsafe rule: variable %s in %s not bound", name, label)
+					return nil, fmt.Errorf("unsafe rule: variable %s in %s not bound", name, label)
 				}
 			}
 		}
 	}
 
-	// Check head variables are bound.
-	for _, t := range r.Head.Terms {
-		if v, ok := t.(datalog.Variable); ok {
-			if !bound[string(v)] {
-				return fmt.Errorf("unsafe rule: head variable %s not bound", string(v))
-			}
-		}
-	}
-	return nil
+	return bound, nil
 }
 
 // checkRuleVarLimit errors when a rule uses more distinct variables than the

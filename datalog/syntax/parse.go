@@ -14,6 +14,7 @@ type tokenKind int
 
 const (
 	tokEOF       tokenKind = iota
+	tokError               // unrecognized or incomplete token; val holds the offending text
 	tokIdent               // identifier (predicate name or variable, depending on context)
 	tokAnon                // ? (anonymous variable)
 	tokString              // "quoted string"
@@ -132,7 +133,7 @@ func (l *lexer) next() token {
 			return token{kind: tokNotEquals, val: "!=", pos: startPos}
 		}
 		l.advance()
-		return token{kind: tokEOF, val: "!", pos: startPos}
+		return token{kind: tokError, val: "!", pos: startPos}
 	case b == '=':
 		l.advance()
 		return token{kind: tokEquals, val: "=", pos: startPos}
@@ -210,10 +211,10 @@ func (l *lexer) next() token {
 			tok.kind = tokIdent
 			return tok
 		}
-		return token{kind: tokEOF, val: "@", pos: startPos}
+		return token{kind: tokError, val: "@", pos: startPos}
 	default:
 		l.advance()
-		return token{kind: tokEOF, val: string(b), pos: startPos}
+		return token{kind: tokError, val: string(b), pos: startPos}
 	}
 }
 
@@ -337,10 +338,19 @@ func (p *parser) advance() token {
 }
 
 func (p *parser) expect(kind tokenKind) (token, error) {
+	if p.current.kind == tokError {
+		return token{}, p.errorTok(p.current)
+	}
 	if p.current.kind != kind {
 		return token{}, p.errorf(p.current.pos, "expected %v, got %q", kindName(kind), p.current.val)
 	}
 	return p.advance(), nil
+}
+
+// errorTok reports a lexer error token (an unrecognized or incomplete
+// character sequence) as a positioned parse error.
+func (p *parser) errorTok(tok token) error {
+	return p.errorf(tok.pos, "unrecognized character %q", tok.val)
 }
 
 // errorf formats a parse error with the 1-based line and column of pos,
@@ -380,6 +390,8 @@ func kindName(k tokenKind) string {
 	switch k {
 	case tokEOF:
 		return "end of input"
+	case tokError:
+		return "unrecognized character"
 	case tokIdent:
 		return "identifier"
 	case tokAnon:
@@ -687,6 +699,9 @@ func (p *parser) parseAtom() (Atom, error) {
 		}
 	}
 
+	if p.current.kind == tokError {
+		return Atom{}, p.errorTok(p.current)
+	}
 	if p.current.kind != tokIdent {
 		return Atom{}, p.errorf(p.current.pos, "expected predicate name, got %q", p.current.val)
 	}
@@ -959,6 +974,8 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 
 func (p *parser) parseTerm() (datalog.Term, error) {
 	switch p.current.kind {
+	case tokError:
+		return nil, p.errorTok(p.current)
 	case tokIdent:
 		name := p.advance().val
 		// A bare "_" is anonymous per occurrence, as in Prolog — writing

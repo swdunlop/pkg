@@ -4,6 +4,7 @@ import (
 	"context"
 	"iter"
 	"slices"
+	"strings"
 	"testing"
 
 	"swdunlop.dev/pkg/datalog"
@@ -1109,5 +1110,211 @@ func TestExternalPredicateOnlyBody(t *testing.T) {
 	}
 	if count != 2 {
 		t.Errorf("expected 2 result facts, got %d", count)
+	}
+}
+
+// TestExternalPredicateDerivedAnchor is a regression test: fetchExternals
+// runs once before any stratum is evaluated, so an external predicate
+// anchored (via a shared variable) on a purely derived (IDB) predicate must
+// not receive a bound-but-empty candidate set — that reads to the external
+// function as "nothing matches" rather than "unknown, don't restrict". The
+// anchor position should be left unbound so the external is still called
+// with useful results.
+func TestExternalPredicateDerivedAnchor(t *testing.T) {
+	lookup := func(ctx context.Context, b seminaive.Bindings) iter.Seq[[]any] {
+		return func(yield func([]any) bool) {
+			for _, bt := range b.Bound {
+				if bt.Position != 0 {
+					continue
+				}
+				for _, v := range bt.Values {
+					s, ok := v.(string)
+					if !ok {
+						continue
+					}
+					if !yield([]any{s, strings.ToUpper(s)}) {
+						return
+					}
+				}
+				return
+			}
+			// No pushdown: return results for the known universe of inputs
+			// used by this test.
+			for _, s := range []string{"a", "b"} {
+				if !yield([]any{s, strings.ToUpper(s)}) {
+					return
+				}
+			}
+		}
+	}
+
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "e", Terms: []datalog.Constant{datalog.String("a")}})
+	b.AddFact(datalog.Fact{Name: "e", Terms: []datalog.Constant{datalog.String("b")}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`
+		d(X) :- e(X).
+		r(Y) :- d(X), lookup(X, Y).
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithExternal("lookup", 2, lookup))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var results []string
+	for row := range output.Facts("r", 1) {
+		results = append(results, string(row[0].(datalog.String)))
+	}
+	slices.Sort(results)
+	expected := []string{"A", "B"}
+	if !slices.Equal(results, expected) {
+		t.Errorf("expected %v, got %v", expected, results)
+	}
+}
+
+// TestExternalPredicateEDBAnchorStillPushesDown ensures the fix for the
+// derived-anchor case above doesn't regress pushdown for anchors that are
+// pure EDB (base fact) predicates: the external function should still
+// observe a non-nil bound candidate set for the shared variable position.
+func TestExternalPredicateEDBAnchorStillPushesDown(t *testing.T) {
+	var observedBound []any
+
+	lookup := func(ctx context.Context, b seminaive.Bindings) iter.Seq[[]any] {
+		for _, bt := range b.Bound {
+			if bt.Position == 0 {
+				observedBound = bt.Values
+			}
+		}
+		return func(yield func([]any) bool) {
+			for _, bt := range b.Bound {
+				if bt.Position != 0 {
+					continue
+				}
+				for _, v := range bt.Values {
+					s, ok := v.(string)
+					if !ok {
+						continue
+					}
+					if !yield([]any{s, strings.ToUpper(s)}) {
+						return
+					}
+				}
+			}
+		}
+	}
+
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "e", Terms: []datalog.Constant{datalog.String("a")}})
+	b.AddFact(datalog.Fact{Name: "e", Terms: []datalog.Constant{datalog.String("b")}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`r(Y) :- e(X), lookup(X, Y).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithExternal("lookup", 2, lookup))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if observedBound == nil {
+		t.Fatal("expected external to observe a non-nil bound candidate set for an EDB anchor")
+	}
+	if len(observedBound) != 2 {
+		t.Errorf("expected 2 pushed-down values, got %d", len(observedBound))
+	}
+
+	var results []string
+	for row := range output.Facts("r", 1) {
+		results = append(results, string(row[0].(datalog.String)))
+	}
+	slices.Sort(results)
+	expected := []string{"A", "B"}
+	if !slices.Equal(results, expected) {
+		t.Errorf("expected %v, got %v", expected, results)
+	}
+}
+
+// TestExternalPredicateMixedEDBAndIDBAnchor covers a predicate that has both
+// base facts and a rule deriving more facts for it. Since the rule-derived
+// facts aren't known yet when fetchExternals runs, this anchor must also be
+// treated as unbound (not just the facts already loaded).
+func TestExternalPredicateMixedEDBAndIDBAnchor(t *testing.T) {
+	lookup := func(ctx context.Context, b seminaive.Bindings) iter.Seq[[]any] {
+		return func(yield func([]any) bool) {
+			for _, bt := range b.Bound {
+				if bt.Position != 0 {
+					continue
+				}
+				for _, v := range bt.Values {
+					s, ok := v.(string)
+					if !ok {
+						continue
+					}
+					if !yield([]any{s, strings.ToUpper(s)}) {
+						return
+					}
+				}
+				return
+			}
+			// No pushdown: return results for the known universe of inputs
+			// used by this test, including the rule-derived one ("c").
+			for _, s := range []string{"a", "c"} {
+				if !yield([]any{s, strings.ToUpper(s)}) {
+					return
+				}
+			}
+		}
+	}
+
+	b := memory.NewBuilder()
+	// "e" is both a base fact (for "a") and derived by a rule (for "c",
+	// via "seed").
+	b.AddFact(datalog.Fact{Name: "e", Terms: []datalog.Constant{datalog.String("a")}})
+	b.AddFact(datalog.Fact{Name: "seed", Terms: []datalog.Constant{datalog.String("c")}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`
+		e(X) :- seed(X).
+		r(Y) :- e(X), lookup(X, Y).
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithExternal("lookup", 2, lookup))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var results []string
+	for row := range output.Facts("r", 1) {
+		results = append(results, string(row[0].(datalog.String)))
+	}
+	slices.Sort(results)
+	expected := []string{"A", "C"}
+	if !slices.Equal(results, expected) {
+		t.Errorf("expected %v, got %v", expected, results)
 	}
 }

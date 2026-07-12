@@ -2,7 +2,6 @@ package seminaive
 
 import (
 	"fmt"
-	"math"
 
 	"swdunlop.dev/pkg/datalog"
 	"swdunlop.dev/pkg/datalog/internal/interned"
@@ -119,7 +118,8 @@ func computeInternedAggregate(
 		return dict.Intern(int64(len(subs))), nil
 
 	case syntax.AggSum:
-		sum := 0.0
+		var sumInt int64
+		var sumFloat float64
 		isInt := true
 		for _, sub := range subs {
 			val, err := resolveInternedAggValue(aggVarName, aggConstID, aggIsConst, sub, dict)
@@ -128,22 +128,39 @@ func computeInternedAggregate(
 			}
 			switch v := val.(type) {
 			case int64:
-				sum += float64(v)
+				if isInt {
+					next, overflow := addInt64Checked(sumInt, v)
+					if overflow {
+						return 0, fmt.Errorf("sum overflows int64: %d + %d", sumInt, v)
+					}
+					sumInt = next
+				} else {
+					sumFloat += float64(v)
+				}
 			case float64:
-				sum += v
-				isInt = false
+				if isInt {
+					// Promote to float64, converting the running int64 total.
+					// This conversion may itself lose precision for very
+					// large accumulated sums; that's acceptable and matches
+					// ordinary float semantics once a float is involved.
+					sumFloat = float64(sumInt)
+					isInt = false
+				}
+				sumFloat += v
 			default:
 				return 0, fmt.Errorf("cannot sum non-numeric value: %v", val)
 			}
 		}
 		if isInt {
-			return dict.Intern(int64(sum)), nil
+			return dict.Intern(sumInt), nil
 		}
-		return dict.Intern(sum), nil
+		return dict.Intern(sumFloat), nil
 
 	case syntax.AggMin:
-		minVal := math.Inf(1)
+		var minInt int64
+		var minFloat float64
 		isInt := true
+		haveVal := false
 		for _, sub := range subs {
 			val, err := resolveInternedAggValue(aggVarName, aggConstID, aggIsConst, sub, dict)
 			if err != nil {
@@ -151,26 +168,51 @@ func computeInternedAggregate(
 			}
 			switch v := val.(type) {
 			case int64:
-				if float64(v) < minVal {
-					minVal = float64(v)
+				if !haveVal {
+					minInt = v
+				} else if isInt {
+					if v < minInt {
+						minInt = v
+					}
+				} else {
+					if float64(v) < minFloat {
+						minFloat = float64(v)
+					}
 				}
 			case float64:
-				isInt = false
-				if v < minVal {
-					minVal = v
+				if !haveVal {
+					minFloat = v
+					isInt = false
+				} else if isInt {
+					// Promote to float64, converting the running int64 min exactly
+					// (the min so far is a single value, so this conversion is
+					// exact for any int64 that fits a float64 range comparison).
+					if float64(minInt) < v {
+						minFloat = float64(minInt)
+					} else {
+						minFloat = v
+					}
+					isInt = false
+				} else {
+					if v < minFloat {
+						minFloat = v
+					}
 				}
 			default:
 				return 0, fmt.Errorf("cannot compute min of non-numeric value: %v", val)
 			}
+			haveVal = true
 		}
 		if isInt {
-			return dict.Intern(int64(minVal)), nil
+			return dict.Intern(minInt), nil
 		}
-		return dict.Intern(minVal), nil
+		return dict.Intern(minFloat), nil
 
 	case syntax.AggMax:
-		maxVal := math.Inf(-1)
+		var maxInt int64
+		var maxFloat float64
 		isInt := true
+		haveVal := false
 		for _, sub := range subs {
 			val, err := resolveInternedAggValue(aggVarName, aggConstID, aggIsConst, sub, dict)
 			if err != nil {
@@ -178,22 +220,42 @@ func computeInternedAggregate(
 			}
 			switch v := val.(type) {
 			case int64:
-				if float64(v) > maxVal {
-					maxVal = float64(v)
+				if !haveVal {
+					maxInt = v
+				} else if isInt {
+					if v > maxInt {
+						maxInt = v
+					}
+				} else {
+					if float64(v) > maxFloat {
+						maxFloat = float64(v)
+					}
 				}
 			case float64:
-				isInt = false
-				if v > maxVal {
-					maxVal = v
+				if !haveVal {
+					maxFloat = v
+					isInt = false
+				} else if isInt {
+					if float64(maxInt) > v {
+						maxFloat = float64(maxInt)
+					} else {
+						maxFloat = v
+					}
+					isInt = false
+				} else {
+					if v > maxFloat {
+						maxFloat = v
+					}
 				}
 			default:
 				return 0, fmt.Errorf("cannot compute max of non-numeric value: %v", val)
 			}
+			haveVal = true
 		}
 		if isInt {
-			return dict.Intern(int64(maxVal)), nil
+			return dict.Intern(maxInt), nil
 		}
-		return dict.Intern(maxVal), nil
+		return dict.Intern(maxFloat), nil
 
 	default:
 		return 0, fmt.Errorf("unknown aggregate kind: %v", kind)
@@ -212,4 +274,17 @@ func resolveInternedAggValue(
 		return nil, fmt.Errorf("unbound variable %s in aggregate", varName)
 	}
 	return dict.Resolve(id), nil
+}
+
+// addInt64Checked adds a and b, reporting overflow instead of wrapping. This
+// keeps int64 sums exact until the caller decides how to surface overflow,
+// rather than silently corrupting values by routing through float64.
+func addInt64Checked(a, b int64) (sum int64, overflow bool) {
+	sum = a + b
+	// Overflow occurred iff a and b have the same sign but the result's sign
+	// differs from theirs.
+	if (a >= 0) == (b >= 0) && (sum >= 0) != (a >= 0) {
+		return 0, true
+	}
+	return sum, false
 }

@@ -316,6 +316,23 @@ func (t *transformer) loadFromGeneric(input datalog.Database) (*interned.Dict, i
 // in rules, it collects all possible pushdown values from input facts and constants,
 // calls the external function once with the complete set, and adds results to existing.
 func (t *transformer) fetchExternals(ctx context.Context, dict *interned.Dict, existing interned.InternedFactSet) error {
+	// derivedHeads collects every predicate that appears as the head of a
+	// rule or aggregate rule. fetchExternals runs before any stratum is
+	// evaluated, so facts for these predicates are not known yet — even if
+	// the predicate also has base (EDB) facts loaded into existing. Using
+	// such a predicate as a pushdown anchor would collect only the
+	// pre-evaluation facts and, worse, an empty BoundTerm.Values (meaning
+	// "no candidates") when it has no EDB facts at all — which the external
+	// function reads as "nothing matches" rather than "unknown, don't
+	// restrict". So anchors on derived predicates must be left unbound.
+	derivedHeads := map[string]bool{}
+	for _, r := range t.rules {
+		derivedHeads[r.Head.Pred] = true
+	}
+	for _, ar := range t.aggRules {
+		derivedHeads[ar.Head.Pred] = true
+	}
+
 	// For each external predicate, collect pushdown values per position.
 	type pushdownInfo struct {
 		ep        externalPredicate
@@ -361,6 +378,14 @@ func (t *transformer) fetchExternals(ctx context.Context, dict *interned.Dict, e
 						continue
 					}
 					if _, isExt := t.externals[other.Pred]; isExt {
+						continue
+					}
+					if derivedHeads[other.Pred] {
+						// Anchor predicate is (at least partially) derived by a
+						// rule; its facts aren't materialized yet at this point
+						// in evaluation, so we cannot safely collect a bounded
+						// candidate set. Leave this position unbound rather than
+						// pushing down a partial (or empty) set.
 						continue
 					}
 					for j, ot := range other.Terms {

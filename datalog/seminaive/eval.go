@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 	"sync"
@@ -99,11 +100,35 @@ func checkConstraintV(pred string, terms []interned.CompiledTerm, sub *interned.
 	case "=":
 		lid, lok := resolveCompiledTermID(ct0, sub)
 		rid, rok := resolveCompiledTermID(ct1, sub)
-		return lok && rok && lid == rid
+		if !lok || !rok {
+			return false
+		}
+		if lid == rid {
+			return true
+		}
+		// Identical interned IDs cover exact matches (including equal
+		// strings/atoms); mixed int64/float64 constants intern to distinct
+		// IDs even when numerically equal, so fall back to a numeric
+		// comparison in that case.
+		lhs, rhs := dict.Resolve(lid), dict.Resolve(rid)
+		if c, ok := compareValues(lhs, rhs); ok {
+			return c == 0
+		}
+		return false
 	case "!=":
 		lid, lok := resolveCompiledTermID(ct0, sub)
 		rid, rok := resolveCompiledTermID(ct1, sub)
-		return lok && rok && lid != rid
+		if !lok || !rok {
+			return false
+		}
+		if lid == rid {
+			return false
+		}
+		lhs, rhs := dict.Resolve(lid), dict.Resolve(rid)
+		if c, ok := compareValues(lhs, rhs); ok {
+			return c != 0
+		}
+		return true
 	case "@contains":
 		lhs, lok := resolveCompiledTermValue(ct0, sub, dict)
 		rhs, rok := resolveCompiledTermValue(ct1, sub, dict)
@@ -192,16 +217,26 @@ func evalBindBuiltin(a syntax.Atom, sub interned.InternedSub, dict *interned.Dic
 	return dict.Intern(result), true
 }
 
-// compareValues compares two values of the same type.
+// compareValues compares two values, mirroring the int/float mixing that
+// applyBinOp supports for arithmetic. Mixed int64/float64 operands are
+// compared numerically rather than rejected outright, so that (for example)
+// an integer literal threshold matches a fact field that happens to decode
+// as a float (or vice versa).
 func compareValues(lhs, rhs any) (int, bool) {
 	switch l := lhs.(type) {
 	case int64:
-		if r, ok := rhs.(int64); ok {
+		switch r := rhs.(type) {
+		case int64:
 			return cmp.Compare(l, r), true
+		case float64:
+			return compareInt64Float64(l, r), true
 		}
 	case float64:
-		if r, ok := rhs.(float64); ok {
+		switch r := rhs.(type) {
+		case float64:
 			return cmp.Compare(l, r), true
+		case int64:
+			return -compareInt64Float64(r, l), true
 		}
 	case string:
 		if r, ok := rhs.(string); ok {
@@ -209,6 +244,41 @@ func compareValues(lhs, rhs any) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// compareInt64Float64 compares an int64 and a float64 exactly, without
+// losing precision for int64 magnitudes beyond 2^53 (where float64 can no
+// longer represent every integer exactly). NaN never compares equal, less,
+// or greater in the usual sense; we treat it as unordered by placing it
+// consistently below every int64 so that == is never (incorrectly) claimed
+// and < / > remain false for it, matching float64 NaN comparison semantics
+// as closely as a total order allows.
+func compareInt64Float64(l int64, r float64) int {
+	if math.IsNaN(r) {
+		return -1
+	}
+	rFloor := math.Floor(r)
+	// Compare the integral part of r against l using integer arithmetic when
+	// rFloor is within int64 range; otherwise r's magnitude alone decides.
+	if rFloor >= -9223372036854775808.0 && rFloor < 9223372036854775808.0 {
+		ri := int64(rFloor)
+		switch {
+		case l < ri:
+			return -1
+		case l > ri:
+			return 1
+		default:
+			// l == floor(r); any positive fractional part makes r larger.
+			if r > rFloor {
+				return -1
+			}
+			return 0
+		}
+	}
+	if r < 0 {
+		return 1
+	}
+	return -1
 }
 
 // resolveTermID returns the interned ID for a term under a substitution.
@@ -457,9 +527,78 @@ type bodyItem struct {
 	ca        interned.CompiledAtom // pre-compiled atom (for joins and negation)
 	cExpr     compiledExpr         // pre-compiled expression (for bodyItemIs)
 	joinIdx   int                  // for bodyItemJoin: index among join items (delta tracking)
-	negated   bool                 // for negated atoms in query body
 	outVarIdx int8                 // for bodyItemIs/bodyItemBind: VarSub index of output variable (-1 if unused)
 	multiOut  int                  // for bodyItemBindMulti: number of output positions (the atom's last multiOut terms)
+}
+
+// compileBody classifies each atom in a rule/query body into a bodyItem,
+// assigning per-body variable indices as it goes. It is the single atom
+// classification path shared by evalRules (plain rules) and evalAggregates
+// (aggregate rule bodies), so both pipelines agree on how "is", constraints,
+// binding builtins, and joins are compiled.
+//
+// Negated atoms are collected into a separate negativeBody slice rather than
+// left inline: negation is stratified (its predicates are always fully
+// decided in a strictly lower stratum, or -- for aggregate bodies -- fully
+// decided before the aggregate body scan begins), so deferring every
+// negation check to the end of the body is both sound and order-independent.
+// This matters because rule bodies are free to write negated atoms before
+// the positive atoms that bind their variables (see checkRuleSafety, which
+// allows negated atoms' variables to be bound by *any* positive atom in the
+// body, not just ones preceding it lexically); checking negation at its
+// lexical position instead would spuriously fail on unbound variables or
+// (worse) silently match everything via matchesAnyV's "no bound args"
+// fallback.
+//
+// joinCount counts the positive join atoms (bodyItemJoin), which the caller
+// uses both for delta-based semi-naive iteration and to detect join-free
+// bodies.
+func compileBody(body []syntax.Atom, dict *interned.Dict, builtins map[string]BuiltinFunc, multiBuiltins map[string]multiBuiltin) (items []bodyItem, negativeBody []interned.CompiledAtom, joinCount int, varMap map[string]int8) {
+	varMap = make(map[string]int8)
+	items = make([]bodyItem, 0, len(body))
+
+	for _, a := range body {
+		switch {
+		case a.Negated:
+			negativeBody = append(negativeBody, interned.CompileAtomV(a.Pred, a.Terms, dict, varMap))
+		case a.Pred == "is":
+			registerExprVars(a.Expr, varMap)
+			outVarIdx := int8(-1)
+			if v, ok := a.Terms[0].(datalog.Variable); ok {
+				name := string(v)
+				if idx, exists := varMap[name]; exists {
+					outVarIdx = idx
+				} else {
+					outVarIdx = int8(len(varMap))
+					varMap[name] = outVarIdx
+				}
+			}
+			ce := compileExpr(a.Expr, dict, varMap)
+			items = append(items, bodyItem{kind: bodyItemIs, atom: a, cExpr: ce, outVarIdx: outVarIdx})
+		case isConstraint(a):
+			items = append(items, bodyItem{kind: bodyItemCompare, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, dict, varMap)})
+		case isBindBuiltin(a, builtins):
+			registerAtomVars(a, varMap)
+			outVarIdx := int8(-1)
+			if v, ok := a.Terms[len(a.Terms)-1].(datalog.Variable); ok {
+				name := string(v)
+				if idx, exists := varMap[name]; exists {
+					outVarIdx = idx
+				} else {
+					outVarIdx = int8(len(varMap))
+					varMap[name] = outVarIdx
+				}
+			}
+			items = append(items, bodyItem{kind: bodyItemBind, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, dict, varMap), outVarIdx: outVarIdx})
+		case isMultiBindBuiltin(a, multiBuiltins):
+			registerAtomVars(a, varMap)
+			items = append(items, bodyItem{kind: bodyItemBindMulti, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, dict, varMap), multiOut: multiBuiltins[a.Pred].outputs})
+		default:
+			items = append(items, bodyItem{kind: bodyItemJoin, ca: interned.CompileAtomV(a.Pred, a.Terms, dict, varMap), joinIdx: joinCount})
+			joinCount++
+		}
+	}
+	return items, negativeBody, joinCount, varMap
 }
 
 // evaluator holds per-evaluation state.
@@ -489,52 +628,19 @@ func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existin
 	compiled := make([]compiledRule, 0, len(rules))
 	for _, rule := range rules {
 		var cr compiledRule
-		varMap := make(map[string]int8)
+		items, negativeBody, joinCount, varMap := compileBody(rule.Body, ev.dict, ev.builtins, ev.multiBuiltins)
 		cr.head = interned.CompileAtomV(rule.Head.Pred, rule.Head.Terms, ev.dict, varMap)
-		for _, a := range rule.Body {
-			switch {
-			case a.Negated:
-				cr.negativeBody = append(cr.negativeBody, interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap))
-			case a.Pred == "is":
-				registerExprVars(a.Expr, varMap)
-				outVarIdx := int8(-1)
-				if v, ok := a.Terms[0].(datalog.Variable); ok {
-					name := string(v)
-					if idx, exists := varMap[name]; exists {
-						outVarIdx = idx
-					} else {
-						outVarIdx = int8(len(varMap))
-						varMap[name] = outVarIdx
-					}
-				}
-				ce := compileExpr(a.Expr, ev.dict, varMap)
-				cr.body = append(cr.body, bodyItem{kind: bodyItemIs, atom: a, cExpr: ce, outVarIdx: outVarIdx})
-			case isConstraint(a):
-				cr.body = append(cr.body, bodyItem{kind: bodyItemCompare, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap)})
-			case isBindBuiltin(a, ev.builtins):
-				registerAtomVars(a, varMap)
-				outVarIdx := int8(-1)
-				if v, ok := a.Terms[len(a.Terms)-1].(datalog.Variable); ok {
-					name := string(v)
-					if idx, exists := varMap[name]; exists {
-						outVarIdx = idx
-					} else {
-						outVarIdx = int8(len(varMap))
-						varMap[name] = outVarIdx
-					}
-				}
-				cr.body = append(cr.body, bodyItem{kind: bodyItemBind, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap), outVarIdx: outVarIdx})
-			case isMultiBindBuiltin(a, ev.multiBuiltins):
-				registerAtomVars(a, varMap)
-				cr.body = append(cr.body, bodyItem{kind: bodyItemBindMulti, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap), multiOut: ev.multiBuiltins[a.Pred].outputs})
-			default:
-				cr.body = append(cr.body, bodyItem{kind: bodyItemJoin, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap), joinIdx: cr.joinCount})
-				cr.joinCount++
-			}
-		}
-		if cr.joinCount == 0 {
-			continue
-		}
+		cr.body = items
+		cr.negativeBody = negativeBody
+		cr.joinCount = joinCount
+		// A rule with no positive join atom (body is only is-atoms, bind
+		// builtins, constraints, and/or negation) can't grow across
+		// iterations: negation is already fully decided (stratified), and
+		// is/builtins/constraints are deterministic given their inputs, so
+		// one pass with the empty substitution on iteration 0 is sound and
+		// complete. It is still compiled and reordered like any other rule;
+		// only the per-iteration dispatch below (see "iterations == 0"
+		// below) treats it specially, running it once and never again.
 		cr.body = reorderBody(cr.body)
 		cr.varNames = make([]string, len(varMap))
 		for name, idx := range varMap {
@@ -573,7 +679,13 @@ func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existin
 			if iterations == 0 {
 				ev.evalBodyRecursiveV(cr.body, cr.negativeBody, cr.varNames,
 					-1, delta, existing, emitted, &sub, 0, emit)
-			} else {
+			} else if cr.joinCount > 0 {
+				// Join-free rules (joinCount == 0) were already fully
+				// evaluated on iteration 0 above -- their derivations don't
+				// depend on the delta, so re-running them here would either
+				// no-op (facts already in existing/emitted) or, worse,
+				// re-derive nothing new while wasting a full body scan every
+				// iteration. Skip them entirely once iteration 0 has run.
 				for deltaJoinIdx := range cr.joinCount {
 					var deltaCA interned.CompiledAtom
 					for _, item := range cr.body {
@@ -1078,175 +1190,39 @@ func exprVarsBound(expr compiledExpr, boundVars uint16) bool {
 	return true
 }
 
-// queryInternedFacts evaluates a query body using VarSub-based evaluation,
-// returning results as InternedSub for compatibility with aggregate grouping.
+// queryInternedFacts evaluates a query/aggregate-rule body against a single
+// static fact set, returning results as InternedSub for compatibility with
+// aggregate grouping. It shares its atom classification (compileBody), body
+// reordering (reorderBody), and join/negation evaluation (evalBodyRecursiveV)
+// with the plain-rule pipeline in evalRules, so aggregate bodies get the same
+// selectivity-driven ordering and the same deferred (order-independent)
+// negation semantics as plain rules -- negation checked at the end of the
+// body against fully-known facts, not at its lexical position.
+//
+// memFacts is treated as a single static "existing" fact set with an empty
+// delta: aggregate bodies are evaluated once per stratum against the
+// fully-converged lower strata (stratify.go requires every predicate an
+// aggregate body touches, including transitively via the aggregated
+// predicate, to sit in a strictly lower stratum), so there is no
+// semi-naive delta to track here -- deltaJoinIdx is always -1 and every join
+// scans memFacts directly, mirroring how evalRules itself falls back to a
+// full existing/emitted scan on iteration 0.
 func (ev *evaluator) queryInternedFacts(body []syntax.Atom, memFacts interned.InternedFactSet) []interned.InternedSub {
-	varMap := make(map[string]int8)
-	items := make([]bodyItem, 0, len(body))
-
-	for _, a := range body {
-		switch {
-		case a.Negated:
-			items = append(items, bodyItem{kind: bodyItemJoin, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap), negated: true})
-		case a.Pred == "is":
-			registerExprVars(a.Expr, varMap)
-			outVarIdx := int8(-1)
-			if v, ok := a.Terms[0].(datalog.Variable); ok {
-				name := string(v)
-				if idx, exists := varMap[name]; exists {
-					outVarIdx = idx
-				} else {
-					outVarIdx = int8(len(varMap))
-					varMap[name] = outVarIdx
-				}
-			}
-			ce := compileExpr(a.Expr, ev.dict, varMap)
-			items = append(items, bodyItem{kind: bodyItemIs, atom: a, cExpr: ce, outVarIdx: outVarIdx})
-		case isConstraint(a):
-			items = append(items, bodyItem{kind: bodyItemCompare, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap)})
-		case isBindBuiltin(a, ev.builtins):
-			registerAtomVars(a, varMap)
-			outVarIdx := int8(-1)
-			if v, ok := a.Terms[len(a.Terms)-1].(datalog.Variable); ok {
-				name := string(v)
-				if idx, exists := varMap[name]; exists {
-					outVarIdx = idx
-				} else {
-					outVarIdx = int8(len(varMap))
-					varMap[name] = outVarIdx
-				}
-			}
-			items = append(items, bodyItem{kind: bodyItemBind, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap), outVarIdx: outVarIdx})
-		case isMultiBindBuiltin(a, ev.multiBuiltins):
-			registerAtomVars(a, varMap)
-			items = append(items, bodyItem{kind: bodyItemBindMulti, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap), multiOut: ev.multiBuiltins[a.Pred].outputs})
-		default:
-			items = append(items, bodyItem{kind: bodyItemJoin, ca: interned.CompileAtomV(a.Pred, a.Terms, ev.dict, varMap)})
-		}
-	}
+	items, negativeBody, _, varMap := compileBody(body, ev.dict, ev.builtins, ev.multiBuiltins)
+	items = reorderBody(items)
 
 	varNames := make([]string, len(varMap))
 	for name, idx := range varMap {
 		varNames[idx] = name
 	}
 
+	noDelta := interned.InternedFactSet{}
+	noEmitted := interned.InternedFactSet{}
+
 	var results []interned.InternedSub
 	var sub interned.VarSub
-	ev.queryRecursiveV(items, memFacts, &sub, varNames, 0, func(vs *interned.VarSub) {
+	ev.evalBodyRecursiveV(items, negativeBody, varNames, -1, noDelta, memFacts, noEmitted, &sub, 0, func(vs *interned.VarSub) {
 		results = append(results, varSubToInternedSub(vs, varNames))
 	})
 	return results
-}
-
-// queryRecursiveV evaluates a query body using VarSub (zero-alloc hot path).
-func (ev *evaluator) queryRecursiveV(
-	body []bodyItem,
-	memFacts interned.InternedFactSet,
-	sub *interned.VarSub,
-	varNames []string,
-	bodyIdx int,
-	emit func(*interned.VarSub),
-) {
-	if bodyIdx == len(body) {
-		emit(sub)
-		return
-	}
-
-	item := body[bodyIdx]
-
-	if item.negated {
-		if !ev.matchesAnyV(item.ca, sub, memFacts, interned.InternedFactSet{}) {
-			ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
-		}
-		return
-	}
-
-	switch item.kind {
-	case bodyItemCompare:
-		if checkConstraintV(item.atom.Pred, item.ca.Terms, sub, ev.dict) {
-			ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
-		}
-
-	case bodyItemIs:
-		var valID uint64
-		var ok bool
-		if item.cExpr != nil {
-			valID, ok = evalExprIDV(item.cExpr, sub, ev.dict)
-		} else {
-			isub := varSubToInternedSub(sub, varNames)
-			valID, ok = evalExpr(item.atom.Expr, isub, ev.dict)
-		}
-		if !ok {
-			return
-		}
-		outIdx := item.outVarIdx
-		if outIdx < 0 {
-			return
-		}
-		if sub.Mask>>uint(outIdx)&1 != 0 {
-			if sub.Vals[outIdx] == valID {
-				ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
-			}
-		} else {
-			sub.Set(int(outIdx), valID)
-			ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
-			sub.Clear(int(outIdx))
-		}
-
-	case bodyItemBind:
-		isub := varSubToInternedSub(sub, varNames)
-		valID, ok := evalBindBuiltin(item.atom, isub, ev.dict, ev.builtins)
-		if !ok {
-			return
-		}
-		outIdx := item.outVarIdx
-		if outIdx < 0 {
-			// Constant output position acts as a filter.
-			if last := item.ca.Terms[item.ca.Arity-1]; last.VarIdx < 0 && last.ConstID == valID {
-				ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
-			}
-			return
-		}
-		if sub.Mask>>uint(outIdx)&1 != 0 {
-			if sub.Vals[outIdx] == valID {
-				ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
-			}
-		} else {
-			sub.Set(int(outIdx), valID)
-			ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
-			sub.Clear(int(outIdx))
-		}
-
-	case bodyItemBindMulti:
-		ev.evalBindMulti(item, sub, func() {
-			ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
-		})
-
-	case bodyItemJoin:
-		ca := item.ca
-		if interned.AllTermsBoundV(ca, sub) {
-			fact, ok := interned.GroundV(ca, sub)
-			if ok {
-				fk := interned.InternedFactHash(fact)
-				if _, exists := memFacts.Index[fk]; exists {
-					ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
-				}
-			}
-			return
-		}
-		bs := interned.BoundArgsV(ca, sub)
-		savedMask := sub.Mask
-		scan := memFacts.Scan(ca.Pred, ca.Arity, &bs)
-		for i := range scan.Len() {
-			fact := scan.Fact(i)
-			if !interned.MatchesBound(&bs, fact) {
-				continue
-			}
-			if interned.UnifyV(ca, fact, sub) {
-				ev.queryRecursiveV(body, memFacts, sub, varNames, bodyIdx+1, emit)
-				sub.Mask = savedMask
-			}
-		}
-
-	}
 }
