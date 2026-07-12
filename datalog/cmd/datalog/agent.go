@@ -342,10 +342,12 @@ func toolEntry(ev agentEvent, done bool) html.Content {
 	if done && ev.Result != "" {
 		body = append(body, toolResultBody(name, ev))
 	}
+	// The floated status precedes the code in source order so it pins to
+	// the first line's right edge even when a long summary wraps.
 	return tag.New("details",
 		tag.New("summary.tool-line",
-			tag.New("code", html.Text(compact)),
 			toolStatus(ev, done),
+			tag.New("code", html.Text(compact)),
 		),
 		body,
 	)
@@ -431,6 +433,9 @@ func formatToolResult(s string) string {
 	return buf.String()
 }
 
+// toolStatus marks the summary line only when there is something to say:
+// "running…" while the call is in flight, a red "error" on failure, and
+// nothing at all on success — a finished call with no flag is the ok state.
 func toolStatus(ev agentEvent, done bool) html.Content {
 	switch {
 	case !done:
@@ -438,7 +443,7 @@ func toolStatus(ev agentEvent, done bool) html.Content {
 	case ev.IsError:
 		return tag.New("span.tool-status.error", html.Text("error"))
 	default:
-		return tag.New("span.tool-status", html.Text("ok"))
+		return html.Group{}
 	}
 }
 

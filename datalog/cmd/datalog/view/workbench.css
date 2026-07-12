@@ -392,8 +392,10 @@ section#console {
   margin-block: var(--space-1);
 }
 /* Kept inline (not flex) so the <details> disclosure marker survives —
- * display:flex on a summary drops its list-item marker. */
+ * display:flex on a summary drops its list-item marker. The status floats
+ * to the row's far edge rather than trailing the tool name mid-line. */
 .console-entry summary.tool-line .tool-status {
+  float: right;
   margin-inline-start: var(--space-2);
 }
 .console-entry .tool-status {
