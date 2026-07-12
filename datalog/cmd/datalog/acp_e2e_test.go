@@ -29,6 +29,12 @@ package main
 //     agent.go's auto-allow policy (readOnlyToolName) must answer it
 //     without the human, exercised end to end through runAgentTurn's real
 //     driver.Answer call rather than a fakeDriver stand-in.
+//   - "sparse-terminal-update": a tool_call with title+rawInput followed by
+//     a terminal tool_call_update carrying ONLY status+content (no title, no
+//     rawInput) — the exact shape the real claude-agent-acp adapter sends,
+//     and the regression live testing caught (acp.go's toolState doc
+//     comment): the transcript's summary line must still show the tool name
+//     and args after the terminal update lands.
 
 import (
 	"context"
@@ -196,6 +202,8 @@ func (a *fakeACPAgent) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		panic("unreachable")
 	case "readonly-perm":
 		return a.promptReadOnlyPermScript(ctx, params)
+	case "sparse-terminal-update":
+		return a.promptSparseTerminalUpdateScript(ctx, params)
 	default:
 		return a.promptFullScript(ctx, params)
 	}
@@ -330,6 +338,49 @@ func (a *fakeACPAgent) promptReadOnlyPermScript(ctx context.Context, params acp.
 		return acp.PromptResponse{}, err
 	}
 
+	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+}
+
+// promptSparseTerminalUpdateScript reproduces the shape found in live
+// testing against the real claude-agent-acp adapter (acp.go's toolState doc
+// comment): a tool_call carrying a title and rawInput, immediately followed
+// by its terminal tool_call_update carrying ONLY status and content — Title
+// and RawInput both nil/absent, exactly as that adapter's completed update
+// arrives on the wire. Before the driver-level toolState fix, mapSessionUpdate
+// mapped that sparse terminal update into a "tool-result" event with empty
+// ToolName/ToolArgs, and runAgentTurn's morph re-rendered the whole tool
+// entry from it, wiping the name/args off the summary line even though the
+// initial tool_call had supplied both. This script exists so an e2e test can
+// assert the transcript's summary line still names the tool and its
+// arguments after the terminal update lands.
+func (a *fakeACPAgent) promptSparseTerminalUpdateScript(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
+	const toolCallID = acp.ToolCallId("call-1")
+	if err := a.conn.SessionUpdate(ctx, acp.SessionNotification{
+		SessionId: params.SessionId,
+		Update: acp.StartToolCall(toolCallID, "list_predicates",
+			acp.WithStartRawInput(map[string]any{})),
+	}); err != nil {
+		return acp.PromptResponse{}, err
+	}
+	// Deliberately built WITHOUT WithUpdateTitle/WithUpdateRawInput — only
+	// status and content, matching the real adapter's sparse terminal
+	// update this script exists to reproduce.
+	if err := a.conn.SessionUpdate(ctx, acp.SessionNotification{
+		SessionId: params.SessionId,
+		Update: acp.UpdateToolCall(toolCallID,
+			acp.WithUpdateStatus(acp.ToolCallStatusCompleted),
+			acp.WithUpdateContent([]acp.ToolCallContent{
+				acp.ToolContent(acp.TextBlock("14 rows")),
+			})),
+	}); err != nil {
+		return acp.PromptResponse{}, err
+	}
+	if err := a.conn.SessionUpdate(ctx, acp.SessionNotification{
+		SessionId: params.SessionId,
+		Update:    acp.UpdateAgentMessageText("done"),
+	}); err != nil {
+		return acp.PromptResponse{}, err
+	}
 	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
 }
 
@@ -698,6 +749,38 @@ func TestACPDriver_PermissionForReadOnlyToolAutoAllowed(t *testing.T) {
 	wb.permMu.Unlock()
 	if n != 0 {
 		t.Fatalf("auto-allowed request left an entry in wb.pendingPerm: %d entries remain", n)
+	}
+}
+
+// TestACPDriver_SparseTerminalToolCallUpdateKeepsName drives the
+// "sparse-terminal-update" script through the workbench's own console
+// handlers, reproducing exactly what live testing against the real
+// claude-agent-acp adapter found: every finished tool call rendering an
+// empty `<summary class='tool-line'><code></code></summary>` because the
+// terminal tool_call_update carried only status+content, and
+// mapSessionUpdate's stateless per-notification mapping had nothing else to
+// fill ToolName/ToolArgs from. acpDriver's toolState fix (acp.go) harvests
+// the initial tool_call's title/rawInput and fills the terminal
+// tool-result event from it; this test asserts the transcript's completed
+// tool entry still names the tool ("list_predicates") after the turn ends,
+// not an empty summary line.
+func TestACPDriver_SparseTerminalToolCallUpdateKeepsName(t *testing.T) {
+	wb, srv, cfg := newACPTestWorkbenchAndServer(t)
+	setFakeACPAgentScript(t, "sparse-terminal-update")
+	wb.agentCfg = cfg
+
+	resp := postSignals(t, srv, "/console/prompt", map[string]any{"consolePrompt": "check things"})
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	waitFor(t, func() bool { return strings.Contains(renderLog(wb, "agent"), "done") })
+
+	log := renderLog(wb, "agent")
+	if !strings.Contains(log, "list_predicates") {
+		t.Fatalf("completed tool entry lost its name after a sparse terminal tool_call_update: %s", log)
+	}
+	if strings.Contains(log, "<code></code>") {
+		t.Fatalf("tool summary line rendered empty (the regression live testing caught): %s", log)
 	}
 }
 

@@ -38,6 +38,11 @@ func TestReadOnlyToolName(t *testing.T) {
 		{"mcp__datalog__set_rules", "", false},
 		{"some other tool", "", false},
 		{"query_history", "", false}, // trailing-token match only, not a prefix/substring one
+		{"db-query", "", false},      // single-token dash-joined prefix, but not a known namespace shape
+		{"psql-query", "", false},
+		{"web-query", "", false},
+		{"foo:query", "", false},
+		{"foo__query", "", false},
 	}
 
 	for _, c := range cases {

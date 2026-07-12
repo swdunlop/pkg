@@ -63,7 +63,34 @@ type acpDriver struct {
 	// single field suffices rather than a per-call registry.
 	sink func(agentEvent)
 
+	// toolState accumulates each tool call's title/rawInput across its whole
+	// tool_call/tool_call_update sequence, keyed by ToolCallId. ACP's
+	// tool_call_update notifications are PARTIAL PATCHES over the state a
+	// prior tool_call (or update) already established — observed live
+	// against the real claude-agent-acp adapter, whose terminal update
+	// carries only status and content, Title and RawInput both nil. Mapping
+	// each notification statelessly (as mapSessionUpdate alone does) loses
+	// the name/args the instant a terminal update omits them, so
+	// SessionUpdate harvests every notification's fields into this map
+	// before handing the (still stateless) mapped event to mergeToolState,
+	// which fills any empty ToolName/ToolArgs from what was accumulated.
+	// Guarded by mu alongside sink, since SessionUpdate callbacks can arrive
+	// concurrently per the SDK's contract; cleared in Prompt's turn-end
+	// defer so it cannot grow unboundedly across a long conversation (ACP
+	// does not promise tool-call IDs are unique beyond one turn).
+	toolState map[acp.ToolCallId]toolCallState
+
 	nextReqID uint64
+}
+
+// toolCallState is one tool call's accumulated title/rawInput, built up
+// across its tool_call and tool_call_update notifications (see acpDriver.
+// toolState's doc comment). ToolArgs is kept pre-marshalled (rather than
+// the raw `any`) since that is the only shape mergeToolState and
+// permissionEvent ever need it in.
+type toolCallState struct {
+	title string
+	args  string // JSON-encoded RawInput, "" if never supplied
 }
 
 // newACPDriver spawns cfg.AgentCommand (split shell-style — a simple
@@ -96,11 +123,12 @@ func newACPDriver(cfg agentConfig) (*acpDriver, error) {
 	}
 
 	d := &acpDriver{
-		cmd:      cmd,
-		exited:   make(chan struct{}),
-		mcpURL:   cfg.MCPURL,
-		mcpToken: cfg.MCPToken,
-		pending:  map[string]chan acp.RequestPermissionOutcome{},
+		cmd:       cmd,
+		exited:    make(chan struct{}),
+		mcpURL:    cfg.MCPURL,
+		mcpToken:  cfg.MCPToken,
+		pending:   map[string]chan acp.RequestPermissionOutcome{},
+		toolState: map[acp.ToolCallId]toolCallState{},
 	}
 	d.conn = acp.NewClientSideConnection(d, stdin, stdout)
 
@@ -224,6 +252,12 @@ func (d *acpDriver) Prompt(ctx context.Context, text string, sink func(agentEven
 	defer func() {
 		d.mu.Lock()
 		d.sink = nil
+		// Cleared per-turn (not per-driver): tool-call IDs are only
+		// meaningful within the turn that minted them, and a driver serves
+		// many turns across a long conversation — retaining every turn's
+		// accumulated titles/args forever would grow this map unboundedly
+		// (toolState's doc comment).
+		d.toolState = map[acp.ToolCallId]toolCallState{}
 		d.mu.Unlock()
 	}()
 
@@ -474,16 +508,101 @@ func (d *acpDriver) WaitForTerminalExit(ctx context.Context, params acp.WaitForT
 // Prompt would be a protocol violation by the agent; silently dropping is
 // safer than panicking on a nil sink).
 func (d *acpDriver) SessionUpdate(ctx context.Context, params acp.SessionNotification) error {
+	ev, ok := mapSessionUpdate(params.Update)
+
 	d.mu.Lock()
 	sink := d.sink
+	// Harvest every notification's title/rawInput into toolState BEFORE
+	// mapping, including non-terminal tool_call_updates — those are still
+	// dropped as EVENTS below (mapSessionUpdate's non-terminal-status
+	// branch), but the real claude-agent-acp adapter is sometimes where a
+	// title or input FIRST appears, so their fields must not be discarded
+	// along with the (correctly) suppressed event. The merge itself also
+	// happens under mu — d.toolState is a plain map, not safe to read or
+	// write outside the lock that guards it, and SessionUpdate/
+	// RequestPermission callbacks can race each other per the SDK's
+	// contract (toolState's doc comment).
+	harvestToolState(d.toolState, params.Update)
+	if ok {
+		ev = mergeToolState(ev, d.toolState)
+	}
 	d.mu.Unlock()
-	if sink == nil {
+
+	if sink == nil || !ok {
 		return nil
 	}
-	if ev, ok := mapSessionUpdate(params.Update); ok {
-		sink(ev)
-	}
+	sink(ev)
 	return nil
+}
+
+// harvestToolState folds one SessionUpdate's title/rawInput (if it carries
+// either) into the accumulated per-tool-call state, keyed by ToolCallId.
+// Called for EVERY tool_call and tool_call_update notification, terminal or
+// not — mapSessionUpdate alone drops non-terminal updates as events (by
+// design: they render nothing), but their fields are exactly what a
+// stripped-down terminal update is often missing, so they must be captured
+// here regardless of whether the notification itself produces a rendered
+// event. A field already present in state is only overwritten when the new
+// notification actually supplies a non-empty replacement — ACP's patch
+// semantics mean a later, sparser update must never blank out an earlier,
+// richer one.
+func harvestToolState(state map[acp.ToolCallId]toolCallState, u acp.SessionUpdate) {
+	var id acp.ToolCallId
+	var title string
+	var rawInput any
+	switch {
+	case u.ToolCall != nil:
+		id, title, rawInput = u.ToolCall.ToolCallId, u.ToolCall.Title, u.ToolCall.RawInput
+	case u.ToolCallUpdate != nil:
+		id, rawInput = u.ToolCallUpdate.ToolCallId, u.ToolCallUpdate.RawInput
+		if u.ToolCallUpdate.Title != nil {
+			title = *u.ToolCallUpdate.Title
+		}
+	default:
+		return
+	}
+	s := state[id]
+	if title != "" {
+		s.title = title
+	}
+	if args := rawInputJSON(rawInput); args != "" {
+		s.args = args
+	}
+	state[id] = s
+}
+
+// mergeToolState fills a mapped agentEvent's ToolName/ToolArgs from the
+// tool call's accumulated state when the event itself arrived empty of
+// either — the fix for tool summaries going blank on a terminal
+// tool_call_update that carries only status and content (this file's doc
+// comment on acpDriver.toolState). Only "tool-call", "tool-result", and
+// "permission" kinds carry these fields at all (permissionEvent's ToolName/
+// ToolArgs are similarly sparse when the request's embedded ToolCallUpdate
+// omits Title/RawInput — RequestPermission calls this too); everything else
+// passes through unchanged. A non-empty field on the event always wins over
+// state — this only ever fills gaps, never overrides what the notification
+// itself supplied.
+func mergeToolState(ev agentEvent, state map[acp.ToolCallId]toolCallState) agentEvent {
+	if ev.Kind != "tool-call" && ev.Kind != "tool-result" && ev.Kind != "permission" {
+		return ev
+	}
+	s, ok := state[acp.ToolCallId(ev.ToolCallID)]
+	if !ok {
+		return ev
+	}
+	if ev.ToolName == "" || ev.ToolName == ev.ToolCallID {
+		// toolCallTitle's fallback (mapSessionUpdate's tool-call branch)
+		// already substitutes the raw ID when Title is nil, so an event
+		// whose ToolName IS the ID is exactly as uninformative as one that
+		// is empty — both are worth replacing with the accumulated title.
+		if s.title != "" {
+			ev.ToolName = s.title
+		}
+	}
+	if ev.ToolArgs == "" && s.args != "" {
+		ev.ToolArgs = s.args
+	}
+	return ev
 }
 
 // RequestPermission implements session/request_permission: it parks a
@@ -497,6 +616,12 @@ func (d *acpDriver) RequestPermission(ctx context.Context, params acp.RequestPer
 	d.nextReqID++
 	reqID := fmt.Sprintf("perm-%d", d.nextReqID)
 	sink := d.sink
+	// mergeToolState reads d.toolState directly here, under the same lock
+	// that guards every write to it (harvestToolState in SessionUpdate) —
+	// a plain map is not safe to read outside that lock, and
+	// RequestPermission can race a concurrent SessionUpdate callback per the
+	// SDK's contract (toolState's doc comment).
+	ev := mergeToolState(permissionEvent(reqID, params), d.toolState)
 	d.mu.Unlock()
 
 	ch := make(chan acp.RequestPermissionOutcome, 1)
@@ -505,7 +630,7 @@ func (d *acpDriver) RequestPermission(ctx context.Context, params acp.RequestPer
 	d.pendingMu.Unlock()
 
 	if sink != nil {
-		sink(permissionEvent(reqID, params))
+		sink(ev)
 	}
 
 	select {

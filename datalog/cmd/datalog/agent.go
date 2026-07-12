@@ -260,14 +260,16 @@ var readOnlyTools = map[string]bool{
 // "psql query" splits into two tokens ("psql", "query") on whitespace, and
 // only the trailing one ("query") is considered — so this case actually
 // looks like it matches. To guard against that specific shape (a bare tool
-// invocation embedded at the end of an unrelated title), the function also
+// invocation embedded at the end of an unrelated title), and against a
+// single-token dash-joined title like "db-query" or "web-query" that could
+// just as easily be some OTHER agent's own built-in tool, the function
 // requires that everything BEFORE the matched trailing token, once trimmed
-// of separators, is either empty or itself looks like a namespace/prefix
-// token (no internal whitespace) — "Bash: psql" has internal whitespace, so
-// "Bash: psql query" is rejected; "datalog - query (MCP)" and
-// "mcp__datalog__query" both pass because their prefixes ("datalog -" once
-// the trailing parenthetical is stripped, and "mcp__datalog") are single
-// tokens once "__"/"-" separators are accounted for.
+// of separators, is one of a small explicit allowlist of namespace shapes
+// this package's own tools actually appear under — see the switch below —
+// rather than merely "no internal whitespace". "Bash: psql" and "db"/"web"
+// are not on that list, so "Bash: psql query", "db-query", and "web-query"
+// are all rejected; "datalog - query (MCP)" and "mcp__datalog__query" both
+// pass because their folded prefixes ("datalog" and "mcp__datalog") are.
 func readOnlyToolName(title string) (string, bool) {
 	s := strings.TrimSpace(title)
 	if s == "" {
@@ -329,17 +331,31 @@ func readOnlyToolName(title string) (string, bool) {
 		return "", false
 	}
 
-	// Reject a prefix that itself contains whitespace or a stray "-" once
-	// trimmed: a genuine MCP-namespace prefix ("datalog", "mcp__datalog",
-	// "datalog -") is one token from the caller's naming convention, while
-	// "Bash: psql" or "some other tool" reads as unrelated prose that
-	// happens to end in a read-only tool's name — the precise-extraction
-	// rule this function is built around means such a title must NOT match.
+	// The accumulated prefix must be one of the known namespace shapes this
+	// package's own MCP tools actually appear under, not merely "one token
+	// with no whitespace" — that looser rule let a single-token dash-joined
+	// title like "db-query" or "web-query" through, which reads as some
+	// OTHER agent's own tool (a plausible name for an external agent's
+	// built-in), not this package's. A false positive here auto-grants
+	// permission with no human in the loop, so the accepted set is an
+	// explicit allowlist derived from how the extraction above actually
+	// folds each legitimate shape: bare ("query" -> ""), MCP-namespaced
+	// double-underscore ("datalog__query" -> "datalog",
+	// "mcp__datalog__query" -> "mcp__datalog"), colon-prefixed
+	// ("datalog:query" -> "datalog"), and dash/space-decorated
+	// ("datalog - query (MCP)" -> "datalog", after the trailing "(MCP)" is
+	// stripped and the "-" trimmed). "mcp datalog" is included too since an
+	// adapter could plausibly render the mcp/datalog namespace with a space
+	// instead of "__" even though none of the currently-observed shapes
+	// produce it. Everything else — "db", "psql", "foo", "web", "bash psql",
+	// "some other" — is rejected.
 	prefix = strings.TrimSpace(strings.Trim(prefix, "-"))
-	if strings.ContainsAny(prefix, " \t") {
+	switch prefix {
+	case "", "datalog", "mcp__datalog", "mcp datalog":
+		return name, true
+	default:
 		return "", false
 	}
-	return name, true
 }
 
 // autoAllowOption picks the permission option the auto-allow policy answers
