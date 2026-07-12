@@ -49,10 +49,21 @@ to fix rules while the agent is working. Conflict management can layer
 in later if needed.
 
 **4. Hypermedia keeps state where the engine lives.** Go stdlib
-(`net/http`, `html/template`) plus Datastar for SSE-driven DOM
-patching and debounced inputs, Oat CSS for zero-JS styling, Mermaid.js
-for client-rendered proof trees. No Node build step, so the binary
-stays self-contained and Nix packaging stays trivial.
+(`net/http`) plus Datastar for SSE-driven DOM patching and debounced
+inputs, Oat CSS for zero-JS styling, Mermaid.js for client-rendered
+proof trees. No Node build step, so the binary stays self-contained and
+Nix packaging stays trivial. HTML is built with
+[`html-go`](https://github.com/swdunlop/html-go) rather than
+`html/template`: the workbench is exactly the "sustained project,
+Datastar in production, reusable UI primitives across domain types"
+case doc/notes/datastar.md §10 calls out for it — four panes share
+table/pagination/error-list shapes, and compile-time checking on
+`session` field access matters more here than designer-editable
+markup. `html-go/datastar` builds SSE events (`Elements`, `Signal`,
+`Batch`) directly from `html.Content`, so no fragment ever passes
+through `fmt.Sprintf`. See doc/notes/datastar.md for the Go+Datastar
+idioms this feature follows throughout, and its Appendix A for the
+html-go cheat sheet.
 
 **5. Keystrokes buy errors; Transforms are explicit.** The main value
 of live feedback while typing rules is the error list, and parse +
@@ -91,9 +102,17 @@ pull case.
 
 The session (per mcp-server.md, extended with `schemaText` and
 `rulesText`) is the single source of truth. Editors are views: typing
-updates the document server-side via the debounced input flow;
+updates the document server-side via a debounced `data-on:keydown__debounce.500ms="@post(...)"`
+action (doc/notes/datastar.md §2, §4) that decodes signals with
+`datastar.Decode` and re-renders just the error-list fragment;
 agent-side `set_schema`/`set_rules` calls update the same fields and
-patch the editors over SSE.
+patch the editors over the Fact Browser's subscription SSE connection
+(doc/notes/datastar.md §8) — one write path, two triggers. Per §6's
+signal-hygiene rule, the editors bind `data-bind:schema-text` /
+`data-bind:rules-text` to the textarea because the content genuinely
+needs to be observed keystroke-by-keystroke; every other pane sticks to
+`value`-attribute rendering and re-render-on-change, since the server
+owns that state.
 
 Nothing touches disk until the user clicks **Save**, which writes the
 file and, if the project directory is a git repo, runs `git add` +
@@ -110,40 +129,62 @@ acp-integration.md), in a single-page layout.
 
 **Data Browser.** Raw JSONL records in a semantic table, one file at a
 time (file list from `sources[].file`). Server-side pagination, 50
-rows per chunk, "Load More" appends via Datastar; files re-read per
-request, zip members decompressed to a temp file on first access.
-Each row has a "Test" button that selects it as the jsonfacts editor's
-evaluation target.
+rows per chunk; "Load More" is a plain `data-on:click="@get('/data/{{file}}?offset=N')"`
+action SSE call (doc/notes/datastar.md §1–§2) whose handler
+`MergeFragments`-appends the next chunk with `Mode("append")` rather
+than replacing the table body — files re-read per request, zip members
+decompressed to a temp file on first access. Each row has a "Test"
+button (`data-on:click="@get('/jsonfacts/test/{{row}}')"`) that selects
+it as the jsonfacts editor's evaluation target and patches the
+jsonfacts Editor's row pane and live-output pane in the same response.
 
 **jsonfacts Editor.** Three-pane grid: the selected source row
 pretty-printed; the config as a raw YAML textarea (no structured
 forms — the config is a serializable struct and raw YAML is the
-simplest faithful mapping); live output. Input debounced at 500ms;
-each event parses the YAML, compiles the expr mappings, and extracts
-from the **single selected row only** — fast feedback against a
-representative sample. **Apply** re-extracts everything and runs a
-full Transform via the `set_schema` handler (spinner, disabled while
-running; in-memory only). Errors render as a list below the editor
-with `line:col` prefixes, verbatim from the parsers.
+simplest faithful mapping); live output. Input debounced at 500ms via
+`data-on:keydown__debounce.500ms="@post('/jsonfacts/preview')"`; each
+event parses the YAML, compiles the expr mappings, and extracts from
+the **single selected row only** — fast feedback against a
+representative sample, cheap enough to skip the long-running-action
+machinery below. **Apply** follows the streaming-progress shape from
+doc/notes/datastar.md §9: `data-indicator:_applying` +
+`data-attr:disabled="$_applying"` on the button, `@post('/jsonfacts/apply')`
+re-extracts everything and runs a full Transform via the `set_schema`
+handler (in-memory only), gated through the sandbox's per-resource
+`Jobs.Begin` so a second Apply click while one is in flight is a no-op
+rather than a race. Errors render as a list below the editor with
+`line:col` prefixes, verbatim from the parsers — an in-form error
+surface per doc/notes/datastar.md §4, not a toast, since the fix is
+the user's to make.
 
 **Datalog Editor.** One textarea using the REPL's `.`/`?` terminator
-convention, so `.dl` files paste directly. Debounced 500ms; each event
+convention, so `.dl` files paste directly. Debounced 500ms
+(`data-on:keydown__debounce.500ms="@post('/rules/check')"`); each event
 runs parse + compile only (observation 5), refreshing the error list —
 `line:col` prefixes, verbatim from the parser/compiler — with a
 cursor-position indicator to aid navigation; no inline highlighting,
-no rich editor. A "Run" button applies the document via `set_rules`
+no rich editor. A "Run" button (`data-indicator:_running`,
+`data-attr:disabled="$_running"`) applies the document via `set_rules`
 and executes its queries through the `query` handler under the 5s
-timeout; a timeout reports "evaluation timed out, results may be
-incomplete".
+timeout, streaming a `#status` fragment per doc/notes/datastar.md §9 so
+the button doesn't just freeze; a timeout reports "evaluation timed
+out, results may be incomplete" in that same `#status` div. The
+sandbox's Global Cancel button (below) targets the same job key.
 
 **Fact Browser.** Predicates with fact counts (the REPL's `.list`),
 each labeled **base** (EDB) or **derived** (IDB) from the ruleset.
 Expanding a predicate pages its facts 50 at a time via the
 `iter.Seq[[]Constant]` from `Database.Facts`. Composite terms render
 as a one-level `<details>`: the summary shows ~80 chars of canonical
-JSON, expansion shows the full `json.MarshalIndent` output. Patched
-over SSE whenever a Transform completes — including Transforms
-triggered by agent tool calls.
+JSON, expansion shows the full `json.MarshalIndent` output. This is
+the pane that owns the page's one long-lived subscription connection
+(doc/notes/datastar.md §8): a `<div data-init="@get('/events', {openWhenHidden: true, requestCancellation: 'disabled'})">`
+opens on page load, the handler subscribes to the session's
+Transform-completed bus *before* sending the initial fact listing (the
+subscribe-before-render ordering in §8, to avoid losing a Transform
+that lands mid-render), then forwards each subsequent completion —
+including ones triggered by agent tool calls — as a `MergeFragments`
+patch to the predicate list.
 
 ### Execution sandbox
 
@@ -162,8 +203,11 @@ assume it.
 - **Stale suppression**: a newer evaluation supersedes an in-flight
   one; only the result for the latest editor content is patched.
 - **Global Cancel**: the server keeps a set of `context.CancelFunc`s,
-  one per running operation; Cancel fires them all — the emergency
-  brake, not surgical — and also cancels any active agent turn
+  one per running operation, structured as the `Jobs` map from
+  doc/notes/datastar.md §9 (`(userID, resourceID, jobName)` keys
+  collapse here to just `jobName`, since it's single-user); Cancel is
+  `@post('/cancel')` and fires them all — the emergency brake, not
+  surgical — and also cancels any active agent turn
   (acp-integration.md). Single-user makes the blunt instrument
   acceptable.
 
@@ -180,23 +224,32 @@ see mcp-server.md and acp-integration.md.
 
 1. **`serve` subcommand** (`cmd/datalog/serve.go`): flags, startup
    loading, the third arm of the subcommand switch.
-2. **Session document fields**: add `schemaText`/`rulesText` to the
+2. **`view` package scaffolding**: per the html-go bootstrapping
+   checklist (doc/notes/datastar.md Appendix A.12) —
+   `view/tags.go` for cached prototypes (form fields, action buttons,
+   error lists shared across panes), `view/page.go` for the page shell
+   struct implementing `AppendHTML`, one `view/<pane>.go` per pane
+   below pairing with a `handler/<pane>.go`.
+3. **Session document fields**: add `schemaText`/`rulesText` to the
    session (mcp-server.md work item 1 grows two fields); handlers
    update them.
-3. **SSE hub + layout**: Datastar plumbing, Oat CSS shell, pane
+4. **SSE hub + layout**: `html-go/datastar` `Stream`/`Elements`
+   plumbing (doc/notes/datastar.md Appendix A.11), Oat CSS shell, pane
    scaffolding.
-4. **Data Browser**: pagination, zip temp-file handling, row
+5. **Data Browser**: pagination, zip temp-file handling, row
    selection.
-5. **jsonfacts Editor**: debounced single-row extraction endpoint;
-   Apply via the `set_schema` handler.
-6. **Datalog Editor**: debounced parse/compile endpoint for the error
-   list; Run via the `set_rules` + `query` handlers.
-7. **Fact Browser**: predicate listing with EDB/IDB labels, fact
-   paging, composite rendering.
-8. **Save/git**: write + add + commit; skip git outside a repo.
-9. **Sandbox plumbing**: cancel-set, panic recovery, stale
-   suppression, fact cap.
-10. **Tests**: handler tests against `examples/mordor`; timeout,
+6. **jsonfacts Editor**: debounced single-row extraction endpoint;
+   Apply via the `set_schema` handler, gated by `Jobs.Begin`.
+7. **Datalog Editor**: debounced parse/compile endpoint for the error
+   list; Run via the `set_rules` + `query` handlers, streaming
+   `#status` progress.
+8. **Fact Browser**: predicate listing with EDB/IDB labels, fact
+   paging, composite rendering, subscription SSE endpoint
+   (subscribe-before-render).
+9. **Save/git**: write + add + commit; skip git outside a repo.
+10. **Sandbox plumbing**: `Jobs` cancel-set, panic recovery, stale
+    suppression, fact cap.
+11. **Tests**: handler tests against `examples/mordor`; timeout,
     cancel, and stale-suppression tests.
 
 ## Risks / open questions
