@@ -481,15 +481,10 @@ func permissionEntry(ev agentEvent) html.Content {
 // permissionResolvedEntry renders a request after it stops being pending —
 // either Answer succeeded (note names the chosen option) or the turn ended
 // with it still unanswered (runAgentTurn's cleanup, driver-side
-// cancellation per acp-integration.md work item 9). ev is nil when the
-// caller (runAgentTurn's cleanup) only has the entry id, not the original
-// event — wb.pendingPerm maps RequestID to entry id only, not the event, to
-// keep that map small; the resulting summary is generic ("a pending
-// permission request") rather than naming the tool again, which is an
-// acceptable loss for an abandoned request nobody can act on anymore.
-// handleConsoleAnswer, which does have the original event via
-// pendingPermEvent, passes it through so the resolved line still names the
-// tool.
+// cancellation per acp-integration.md work item 9). Both callers hold the
+// original event via wb.pendingPerm, so the resolved line still names the
+// tool it gated; ev is a pointer only to tolerate a future caller without
+// one, falling back to a generic subject.
 func permissionResolvedEntry(ev *agentEvent, note string) html.Content {
 	subject := "a pending permission request"
 	if ev != nil {
