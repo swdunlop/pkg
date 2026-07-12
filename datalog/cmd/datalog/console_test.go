@@ -224,7 +224,7 @@ func TestRunAgentTurnTranscript(t *testing.T) {
 	log := renderLog(wb, "agent")
 	for _, want := range []string{
 		"let me look",     // thought accumulated
-		"query {",         // tool line, datalog__ prefix stripped
+		"query copied_to(F,H)?", // tool line: the query text, not its JSON envelope
 		"3 rows",          // tool result behind the disclosure
 		"Found 3 copies.", // message chunks accumulated into one entry
 	} {
@@ -239,6 +239,76 @@ func TestRunAgentTurnTranscript(t *testing.T) {
 	}
 	if strings.Contains(log, "turn failed") || strings.Contains(log, "turn ended") {
 		t.Fatalf("clean stop should not add a terminal entry: %s", log)
+	}
+}
+
+func renderContent(c html.Content) string {
+	return string(html.Append(nil, c))
+}
+
+func TestToolEntryQueryTable(t *testing.T) {
+	ev := agentEvent{
+		Kind:     "tool-result",
+		ToolName: "datalog__query",
+		ToolArgs: `{"query":"smb_conn(H, S, D)?"}`,
+		Result:   `{"vars":["H","S","D"],"rows":[["host1","10.0.0.5",445]],"total":150,"truncated":true}`,
+	}
+	got := renderContent(toolEntry(ev, true))
+	for _, want := range []string{
+		"query smb_conn(H, S, D)?", // the query itself, not JSON args
+		"<th>H</th>",               // variable-named header
+		"<td>host1</td>",           // string cell as-is
+		"<td>445</td>",             // numeric cell without float formatting
+		"showing 1 of 150 rows",    // truncation note
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("query entry missing %q: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "summary") {
+		t.Fatalf("query result should be a table, not a disclosure: %s", got)
+	}
+}
+
+func TestToolEntryErrorRendered(t *testing.T) {
+	ev := agentEvent{
+		Kind:     "tool-result",
+		ToolName: "datalog__query",
+		ToolArgs: `{"query":"smb_conn(?)?"}`,
+		Result:   "query: anonymous variables are not allowed",
+		IsError:  true,
+	}
+	got := renderContent(toolEntry(ev, true))
+	if !strings.Contains(got, "anonymous variables are not allowed") {
+		t.Fatalf("error text not rendered: %s", got)
+	}
+	if strings.Contains(got, "<details") {
+		t.Fatalf("errors must be in the open, not behind a disclosure: %s", got)
+	}
+
+	ev.ToolName = "datalog__set_rules"
+	ev.ToolArgs = `{"rules":"bad(X :-"}`
+	ev.Result = "parse error at line 1"
+	got = renderContent(toolEntry(ev, true))
+	if !strings.Contains(got, "parse error at line 1") || strings.Contains(got, "<details") {
+		t.Fatalf("generic tool error not rendered in the open: %s", got)
+	}
+}
+
+func TestToolEntryElidedArgsDisclosure(t *testing.T) {
+	long := `{"rules":"` + strings.Repeat("suspicious(H) :- smb_conn(H, S, D). ", 10) + `"}`
+	ev := agentEvent{Kind: "tool-call", ToolName: "datalog__set_rules", ToolArgs: long}
+	got := renderContent(toolEntry(ev, false))
+	if !strings.Contains(got, "…") {
+		t.Fatalf("long args not elided on the tool line: %s", got)
+	}
+	if !strings.Contains(got, "<summary>arguments</summary>") {
+		t.Fatalf("elided args must stay reachable behind a disclosure: %s", got)
+	}
+
+	short := renderContent(toolEntry(agentEvent{Kind: "tool-call", ToolName: "datalog__list_predicates", ToolArgs: `{}`}, false))
+	if strings.Contains(short, "<summary>arguments</summary>") {
+		t.Fatalf("un-elided args need no disclosure: %s", short)
 	}
 }
 

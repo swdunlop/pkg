@@ -226,6 +226,12 @@ every open page; clearing the Agent tab also drops the embedded
 driver, so it is a conversation reset (the model forgets too). A turn
 still running is cancelled first — Clear means "start over", so it
 implies Stop rather than demanding it as a separate click.
+Agent tool calls render for the operator, not the wire: a `query`
+call shows the query text and a variable-named result table (the same
+rendering as the editor's embedded queries), a failed call shows its
+error in the open, and JSON is never elided outright — wherever the
+one-line form truncates arguments or a result stays raw, the full
+pretty-printed document sits behind a `<details>` disclosure.
 A drawer rather than a fourth column because the three-column rhythm
 was hard-won; the ultrawide case is an open question below.
 

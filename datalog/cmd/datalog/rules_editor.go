@@ -299,7 +299,13 @@ func resultBlock(b queryResultBlock) html.Content {
 	if b.Err != "" {
 		return tag.New("div.result-block", heading, tag.New("ul.errors", tag.New("li", html.Text(b.Err))))
 	}
+	return tag.New("div.result-block", heading, resultTable(b))
+}
 
+// resultTable renders b's variable-named table and truncation note — shared
+// between the editor's result blocks and the agent transcript's query
+// entries, which supply their own headings.
+func resultTable(b queryResultBlock) html.Content {
 	header := make([]html.Content, len(b.Vars))
 	for i, v := range b.Vars {
 		header[i] = tag.New("th", html.Text(v))
@@ -318,12 +324,11 @@ func resultBlock(b queryResultBlock) html.Content {
 		note = tag.New("p.truncated", html.Text(fmt.Sprintf("showing %d of %d rows", len(b.Rows), b.Total)))
 	}
 
-	return tag.New("div.result-block",
-		heading,
+	return html.Group{
 		tag.New("table",
 			tag.New("thead", tag.New("tr", header...)),
 			tag.New("tbody", rows...),
 		),
 		note,
-	)
+	}
 }

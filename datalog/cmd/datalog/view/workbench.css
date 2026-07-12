@@ -388,6 +388,9 @@ section#console {
   overflow: auto;
   margin-block: var(--space-1);
 }
+.console-entry table {
+  margin-block: var(--space-1);
+}
 .console-entry p.tool-line {
   margin: 0;
   display: flex;
