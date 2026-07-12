@@ -29,6 +29,13 @@ func main() {
 		return
 	}
 
+	// datalog serve dispatches to the web workbench the same way; see
+	// runServe.
+	if len(os.Args) > 1 && os.Args[1] == "serve" {
+		runServe(os.Args[2:])
+		return
+	}
+
 	flag.Parse()
 
 	if *cpuProfile != "" {

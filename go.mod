@@ -7,6 +7,7 @@ require (
 	github.com/lmorg/readline/v4 v4.2.2
 	github.com/mark3labs/mcp-go v0.56.0
 	github.com/spf13/pflag v1.0.10
+	github.com/swdunlop/html-go v0.0.0-20260516020012-2f75bf10154d
 	golang.org/x/term v0.42.0
 	gopkg.in/yaml.v3 v3.0.1
 	zombiezen.com/go/sqlite v1.4.2
