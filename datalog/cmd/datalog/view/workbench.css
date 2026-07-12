@@ -6,6 +6,32 @@
  * Only oat theme variables are used for color/spacing, so light and dark
  * schemes both work without a second palette. */
 
+/* Palette: medea's Nord-derived colors (~/src/medea/www/style.css's --md-*
+ * tokens), remapped onto oat's theme tokens so oat's own element styles
+ * (buttons, inputs, tables) and this chrome all pick them up together.
+ * light-dark() pairs are (medea light, medea dark); oat's theme layer
+ * already sets color-scheme: light dark, and this unlayered :root outranks
+ * oat's @layer theme one. */
+:root {
+  --background: light-dark(#eceff4, #1e2229);         /* md-bg */
+  --foreground: light-dark(#2e3440, #eceff4);         /* md-text */
+  --card: light-dark(#e5e9f0, #2e3440);               /* md-surface */
+  --card-foreground: light-dark(#2e3440, #eceff4);
+  --border: light-dark(#cdd3db, #434c5e);             /* md-border */
+  --input: light-dark(#cdd3db, #3b4252);              /* md-input-border */
+  --primary: light-dark(#2e6ca3, #88c0d0);            /* md-accent */
+  --primary-foreground: light-dark(#ffffff, #2e3440);
+  --ring: light-dark(#2e6ca3, #88c0d0);
+  --accent: light-dark(#d8dee9, #3b4252);             /* md-hover */
+  --muted: light-dark(#d8dee9, #3b4252);
+  --muted-foreground: light-dark(#4c566a, #8b95a7);   /* md-text-muted */
+  --secondary: light-dark(#d8dee9, #3b4252);
+  --secondary-foreground: light-dark(#2e3440, #eceff4);
+  --faint: light-dark(#d8dee9, #3b4252);
+  --faint-foreground: light-dark(#4c566a, #8b95a7);
+  --danger: light-dark(#a3333d, #bf616a);             /* md-error */
+}
+
 /* Header bar: title left, Global Cancel right. */
 header#chrome {
   display: flex;
@@ -52,6 +78,7 @@ section.pane > h2 {
 textarea.editor {
   width: 100%;
   min-height: 18rem;
+  background-color: light-dark(#ffffff, #1a1e26); /* md-input-bg */
   font-family: var(--font-mono);
   font-size: var(--text-7);
   line-height: var(--leading-normal);

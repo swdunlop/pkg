@@ -20,7 +20,10 @@ func DataBrowser() html.Content {
 	return PaneSection.Set("id", "pane-data-browser").Add(
 		PaneHeading.Add(html.Text("Data Browser")),
 		ErrorList.Set("id", "data-error"),
-		tag.New("div#data-files"),
+		// data-init fetches the configured file list as soon as the pane
+		// mounts — without it the pane renders empty until something else
+		// happens to request /data, which nothing does.
+		tag.New("div#data-files").Set("data-init", "@get('/data')"),
 		Table.Set("id", "data-table").Add(
 			TableBody.Set("id", "data-table-body"),
 		),
