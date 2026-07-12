@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"testing"
 
 	acp "github.com/coder/acp-go-sdk"
@@ -180,5 +181,93 @@ func TestPermissionEvent(t *testing.T) {
 	}
 	if ev.Options[1].ID != "reject" || ev.Options[1].Kind != "reject_once" {
 		t.Errorf("Options[1] = %+v", ev.Options[1])
+	}
+}
+
+// TestMcpServerConfig_HTTP checks the mcpServers entry ensureSession builds
+// when the agent DID advertise mcpCapabilities.http at initialize
+// (acp-integration.md handshake step 3): the HTTP transport, URL, and
+// bearer token as an Authorization header — never the stdio shim.
+func TestMcpServerConfig_HTTP(t *testing.T) {
+	d := &acpDriver{
+		mcpURL:   "http://127.0.0.1:8080/mcp",
+		mcpToken: "the-token",
+	}
+	d.agentCaps.McpCapabilities.Http = true
+
+	cfg, err := d.mcpServerConfig()
+	if err != nil {
+		t.Fatalf("mcpServerConfig: %v", err)
+	}
+	if cfg.Http == nil {
+		t.Fatalf("mcpServerConfig with Http capability: got %+v, want an Http entry", cfg)
+	}
+	if cfg.Http.Url != d.mcpURL {
+		t.Errorf("Http.Url = %q, want %q", cfg.Http.Url, d.mcpURL)
+	}
+	found := false
+	for _, h := range cfg.Http.Headers {
+		if h.Name == "Authorization" && h.Value == "Bearer the-token" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Http.Headers = %+v, want an Authorization: Bearer the-token header", cfg.Http.Headers)
+	}
+}
+
+// TestMcpServerConfig_StdioFallback checks the mcpServers entry
+// ensureSession builds for an agent that did NOT advertise
+// mcpCapabilities.http: the datalog mcp --proxy stdio shim
+// (doc/features/acp-integration.md work item 7), command = this process's
+// own executable path, args = ["mcp", "--proxy", <url>], and the bearer
+// token carried in the environment (DATALOG_MCP_TOKEN) — never argv, per
+// the handshake's "the token travels ... never in argv" rule.
+func TestMcpServerConfig_StdioFallback(t *testing.T) {
+	d := &acpDriver{
+		mcpURL:   "http://127.0.0.1:8080/mcp",
+		mcpToken: "the-token",
+	}
+	// agentCaps.McpCapabilities.Http defaults to false.
+
+	cfg, err := d.mcpServerConfig()
+	if err != nil {
+		t.Fatalf("mcpServerConfig: %v", err)
+	}
+	if cfg.Stdio == nil {
+		t.Fatalf("mcpServerConfig without Http capability: got %+v, want a Stdio entry", cfg)
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	if cfg.Stdio.Command != self {
+		t.Errorf("Stdio.Command = %q, want %q (datalog's own executable)", cfg.Stdio.Command, self)
+	}
+	wantArgs := []string{"mcp", "--proxy", d.mcpURL}
+	if len(cfg.Stdio.Args) != len(wantArgs) {
+		t.Fatalf("Stdio.Args = %v, want %v", cfg.Stdio.Args, wantArgs)
+	}
+	for i, a := range wantArgs {
+		if cfg.Stdio.Args[i] != a {
+			t.Errorf("Stdio.Args[%d] = %q, want %q", i, cfg.Stdio.Args[i], a)
+		}
+	}
+	for _, a := range cfg.Stdio.Args {
+		if a == d.mcpToken {
+			t.Fatalf("Stdio.Args = %v: bearer token leaked into argv", cfg.Stdio.Args)
+		}
+	}
+	tokenFound := false
+	for _, e := range cfg.Stdio.Env {
+		if e.Name == "DATALOG_MCP_TOKEN" {
+			tokenFound = true
+			if e.Value != d.mcpToken {
+				t.Errorf("DATALOG_MCP_TOKEN env value = %q, want %q", e.Value, d.mcpToken)
+			}
+		}
+	}
+	if !tokenFound {
+		t.Errorf("Stdio.Env = %+v, want a DATALOG_MCP_TOKEN entry", cfg.Stdio.Env)
 	}
 }

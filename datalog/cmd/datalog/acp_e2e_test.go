@@ -716,3 +716,37 @@ func TestACPDriver_AgentExitSurfacesAsPromptError(t *testing.T) {
 func TestMCP_TokenAuthNegative_AlreadyCovered(t *testing.T) {
 	t.Skip("covered by TestMCP_UnauthorizedWithoutOrWrongToken in serve_test.go (no Authorization header and a wrong bearer token both assert 401 against a live /mcp mount)")
 }
+
+// TestACPDriver_StdioFallback_NotE2E documents why "an agent without HTTP
+// capability falls all the way through to a working stdio proxy shim" is
+// NOT exercised as a full subprocess-spawning e2e test here, even though
+// this file's fake-agent harness makes declining Http in Initialize (see
+// fakeACPAgent.Initialize's McpCapabilities.Http: true, which a "no-http"
+// script variant could simply omit) essentially free.
+//
+// The gap is one layer down: ensureSession's stdio path (acp.go's
+// mcpServerConfig) hands the AGENT a command to spawn — os.Executable(),
+// "mcp", "--proxy", <url> — but the fake agent here is THIS TEST BINARY
+// re-exec'd (fakeACPAgentCommand's doc comment), not a real `datalog`
+// binary. Its os.Executable() is the compiled test binary, which has no
+// "mcp" subcommand at all; actually spawning it per mcpServerConfig's
+// instructions would try to exec the test binary as
+// `<test-binary> mcp --proxy <url>` and fail on argument parsing, not
+// prove anything about the real shim. Making this real would require
+// `go build`-ing the actual datalog binary into a temp dir first (a
+// meaningfully slower, more failure-prone step the other e2e tests here
+// avoid entirely by re-exec'ing) purely to spawn it as a subprocess a
+// second time, once as the fake agent and again as its child proxy.
+//
+// The two things that gap would have proven are covered independently
+// instead: mcpServerConfig's output shape (command/args/env, no token in
+// argv) by TestMcpServerConfig_StdioFallback in acp_test.go, and the proxy
+// shim's own stdio<->HTTP forwarding correctness by
+// TestMCPProxy_RoundTrip/MissingToken/WrongToken in mcp_proxy_test.go
+// (driven via transport.NewIO against in-memory pipes, no subprocess
+// needed since the proxy's core already takes io.Reader/io.Writer).
+// Together they cover every behavior the missing e2e test would have,
+// without the `go build` step.
+func TestACPDriver_StdioFallback_NotE2E(t *testing.T) {
+	t.Skip("subprocess e2e would need a real `go build`-ed datalog binary (this file's fake agent is the test binary re-exec'd, which has no mcp subcommand); mcpServerConfig's stdio shape is covered by TestMcpServerConfig_StdioFallback (acp_test.go) and the shim's forwarding by TestMCPProxy_* (mcp_proxy_test.go)")
+}

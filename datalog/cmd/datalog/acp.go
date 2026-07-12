@@ -151,27 +151,17 @@ func (d *acpDriver) ensureSession(ctx context.Context) error {
 	if d.haveSess {
 		return nil
 	}
-	if !d.agentCaps.McpCapabilities.Http {
-		// The proxy shim (datalog mcp --proxy <url>, acp-integration.md
-		// work item 7) is a separate task; until it lands, an agent without
-		// HTTP MCP support cannot reach the workbench's session at all.
-		return fmt.Errorf("agent does not support HTTP MCP servers, and the stdio proxy shim (datalog mcp --proxy) is not yet implemented")
-	}
 	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("resolving cwd for agent session: %w", err)
 	}
+	mcpServer, err := d.mcpServerConfig()
+	if err != nil {
+		return err
+	}
 	resp, err := d.conn.NewSession(ctx, acp.NewSessionRequest{
-		Cwd: cwd,
-		McpServers: []acp.McpServer{
-			{Http: &acp.McpServerHttpInline{
-				Name: "datalog",
-				Url:  d.mcpURL,
-				Headers: []acp.HttpHeader{
-					{Name: "Authorization", Value: "Bearer " + d.mcpToken},
-				},
-			}},
-		},
+		Cwd:        cwd,
+		McpServers: []acp.McpServer{mcpServer},
 	})
 	if err != nil {
 		return fmt.Errorf("agent session/new: %w", err)
@@ -179,6 +169,41 @@ func (d *acpDriver) ensureSession(ctx context.Context) error {
 	d.sessionID = resp.SessionId
 	d.haveSess = true
 	return nil
+}
+
+// mcpServerConfig builds the one mcpServers entry session/new gets, per
+// acp-integration.md's handshake step 3: the HTTP mount when the agent
+// declared mcpCapabilities.http at initialize, or — for agents that only
+// support the baseline stdio transport ACP requires of every agent — the
+// stdio proxy shim (`datalog mcp --proxy <url>`, mcp_proxy.go, work item 7)
+// declared as a subprocess the agent spawns itself. Either way the bearer
+// token travels off of argv: HTTP gets it as a header, stdio gets it as an
+// environment variable in the McpServerStdio.Env the agent launches the
+// shim with (never a --token flag — see mcp_proxy.go's doc comment on why
+// argv is unsafe for this).
+func (d *acpDriver) mcpServerConfig() (acp.McpServer, error) {
+	if d.agentCaps.McpCapabilities.Http {
+		return acp.McpServer{Http: &acp.McpServerHttpInline{
+			Name: "datalog",
+			Url:  d.mcpURL,
+			Headers: []acp.HttpHeader{
+				{Name: "Authorization", Value: "Bearer " + d.mcpToken},
+			},
+		}}, nil
+	}
+
+	self, err := os.Executable()
+	if err != nil {
+		return acp.McpServer{}, fmt.Errorf("resolving datalog's own executable path for the mcp --proxy shim: %w", err)
+	}
+	return acp.McpServer{Stdio: &acp.McpServerStdio{
+		Name:    "datalog",
+		Command: self,
+		Args:    []string{"mcp", "--proxy", d.mcpURL},
+		Env: []acp.EnvVariable{
+			{Name: "DATALOG_MCP_TOKEN", Value: d.mcpToken},
+		},
+	}}, nil
 }
 
 // Prompt sends one user turn and blocks until the agent ends it, mapping

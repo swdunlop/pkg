@@ -32,13 +32,23 @@ import (
 // main's subcommand switch must never share flag state.
 func runMCP(args []string) {
 	flags := stdflag.NewFlagSet("mcp", stdflag.ExitOnError)
-	dataDir := flags.String("d", "", "data directory or .zip file (required; the security boundary for all file access)")
+	dataDir := flags.String("d", "", "data directory or .zip file (required unless --proxy is given; the security boundary for all file access)")
 	configPath := flags.String("c", "", "path to a JSON or YAML jsonfacts config file to preload")
 	timeout := flags.Duration("timeout", 60*time.Second, "per-query evaluation timeout")
+	proxy := flags.String("proxy", "", "bridge stdio to a remote streamable-HTTP MCP endpoint (e.g. a running datalog serve's /mcp) instead of serving a local session; the bearer token comes from DATALOG_MCP_TOKEN, never a flag — argv is visible to every process listing")
 	if err := flags.Parse(args); err != nil {
 		// flag.ExitOnError already printed usage and exited on real errors;
 		// this only returns for -h/-help.
 		os.Exit(0)
+	}
+
+	if *proxy != "" {
+		// The stdio<->HTTP bridge (doc/features/acp-integration.md work item
+		// 7): -d/-c/rule-file args describe a LOCAL session and have no
+		// meaning when proxying a REMOTE one, so runMCPProxy takes over
+		// entirely rather than sharing any of the setup below.
+		runMCPProxy(*proxy, os.Getenv("DATALOG_MCP_TOKEN"), os.Stdin, os.Stdout)
+		return
 	}
 
 	if *dataDir == "" {
