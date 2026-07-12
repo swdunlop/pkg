@@ -185,13 +185,21 @@ no rich editor. A "Run" button applies the document via `set_rules`
 and executes its queries through the `query` handler under the 5s
 timeout, streaming a `#status` fragment per doc/notes/datastar.md §9 so
 the button doesn't just freeze; a timeout reports "evaluation timed
-out, results may be incomplete" in that same `#status` div. Run
-participates in the server-published `$busy` mutex (`'run'`, `'apply'`,
-`'agent'` or empty): while its own job runs it morphs into a
+out, results may be incomplete" in that same `#status` div, while a
+user Stop reports "run stopped" (`evalHaltStatus` distinguishes
+`context.Canceled` from the deadline). Run participates in the
+server-published `$busy` mutex (`'run'`, `'apply'`, `'agent'`,
+`'query'` or empty): while its own job runs it morphs into a
 spinner-ringed Stop posting the sandbox's Global Cancel (below), and
-while another job holds the mutex it greys out — the same shape Apply
-and the agent Send control follow, so there is no standalone Stop
-button.
+while another job holds the mutex it greys out — the same shape Apply,
+the console query's Run, and the agent Send control follow, so there
+is no standalone Stop button. The console query's Stop is effective
+mid-evaluation because query evaluation holds no session lock (the
+snapshot narrowing in `session.snapshotForQuery`) and the seminaive
+engine samples ctx inside the fixpoint and aggregate loops; a stopped
+query appends "query stopped" to the scrollback, and the Query tab
+button spins while a query runs with the drawer closed, mirroring the
+Agent tab.
 
 **Fact Browser.** Predicates with fact counts (the REPL's `.list`), each
 labeled **base** (EDB) or **derived** (IDB) from the ruleset — but each

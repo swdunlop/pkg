@@ -48,7 +48,10 @@ func consoleBar() html.Content {
 			Set("data-on:click", "$_consoleOpen = !$_consoleOpen").
 			Set("data-text", "$_consoleOpen ? '▾ Console' : '▸ Console'").
 			Add(html.Text("▸ Console")),
-		consoleTabButton("query", "Query"),
+		consoleTabButton("query", "Query").
+			Set("data-spinner", "small").
+			Set("data-attr:aria-busy",
+				"$busy === 'query' && !($_consoleOpen && $_consoleTab === 'query') ? 'true' : false"),
 		consoleTabButton("agent", "Agent").
 			Set("data-spinner", "small").
 			Set("data-attr:aria-busy",
@@ -59,10 +62,11 @@ func consoleBar() html.Content {
 }
 
 // busyStatusExpr renders the run/apply side of the busy mutex as words,
-// complementing those buttons' Stop morphs. The agent case is deliberately
-// absent: agent activity already shows in the chat pane (agentActivity) or
-// on the Agent tab's spinner when the pane is hidden — a third copy of
-// "agent turn running…" on the bar was one indicator too many.
+// complementing those buttons' Stop morphs. The agent and query cases are
+// deliberately absent: their activity already shows in their own pane (the
+// agentActivity line, the query Run button's Stop morph) or on their tab's
+// spinner when the pane is hidden — a third copy on the bar was one
+// indicator too many.
 const busyStatusExpr = `$busy === 'run' ? 'run in flight…' : $busy === 'apply' ? 'apply in flight…' : ''`
 
 func consoleTabButton(tab, label string) tag.Interface {
@@ -107,15 +111,17 @@ func ConsoleLog(tab string, entries ...html.Content) html.Content {
 
 // queryInputRow is the Query tab's input: Enter (or the Run button) posts
 // the query. The input keeps focus, so a probe-refine loop is all keyboard.
+// The Run button rides the page-wide $busy mutex under the "query" key, so
+// while its own query runs it morphs into Stop (posting /cancel, which the
+// snapshot-narrowed query path honors mid-Transform); Enter is guarded on
+// !$busy like the agent composer so it cannot start work mid-mutex.
 func queryInputRow() html.Content {
 	return tag.New("div.console-input",
 		tag.New("input#console-query[type=text][placeholder=ancestor(X, Y)?]").
 			Set("spellcheck", "false").
 			Set("data-bind:console-query").
-			Set("data-on:keydown", "evt.key === 'Enter' && @post('/console/query')"),
-		ActionButton.
-			Set("data-on:click", "@post('/console/query')").
-			Add(html.Text("Run")),
+			Set("data-on:keydown", "evt.key === 'Enter' && !$busy && @post('/console/query')"),
+		BusyActionButton("console-run", "query", "Run", "/console/query"),
 	)
 }
 

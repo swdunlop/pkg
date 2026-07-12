@@ -4,11 +4,16 @@ import (
 	"context"
 	"errors"
 	"io"
+	"iter"
+	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	html "github.com/swdunlop/html-go"
+
+	"swdunlop.dev/pkg/datalog/seminaive"
 )
 
 // renderLog joins one tab's rendered scrollback into a string for
@@ -22,6 +27,64 @@ func renderLog(wb *workbench, tab string) string {
 }
 
 // -- console query tab -------------------------------------------------------
+
+// TestConsoleQueryStop exercises the query Stop path end to end: a query
+// parked mid-Transform on a blocking external is cancelled via POST /cancel
+// (what the Run button's Stop morph posts), and the scrollback reports
+// "query stopped" rather than the timeout wording.
+func TestConsoleQueryStop(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	srv := startTestServer(wb)
+	defer srv.Close()
+
+	inTransform := make(chan struct{})
+	var once sync.Once
+	wb.h.mu.Lock()
+	wb.h.sess.engineOpts = append(wb.h.sess.engineOpts,
+		seminaive.WithExternal("slow", 1, func(ctx context.Context, _ seminaive.Bindings) iter.Seq[[]any] {
+			return func(yield func([]any) bool) {
+				once.Do(func() { close(inTransform) })
+				<-ctx.Done() // parked until Stop cancels the job ctx
+			}
+		}))
+	wb.h.mu.Unlock()
+
+	queryDone := make(chan struct{})
+	go func() {
+		defer close(queryDone)
+		resp := postSignals(t, srv, "/console/query", map[string]any{
+			"consoleQuery": "slow(X)",
+		})
+		defer resp.Body.Close()
+		_, _ = io.ReadAll(resp.Body) // EOF == handler returned
+	}()
+
+	select {
+	case <-inTransform:
+	case <-time.After(10 * time.Second):
+		t.Fatal("query never reached the blocking external")
+	}
+
+	resp, err := http.Post(srv.URL+"/cancel", "", nil)
+	if err != nil {
+		t.Fatalf("POST /cancel: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case <-queryDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("query handler did not return after /cancel")
+	}
+
+	log := renderLog(wb, "query")
+	if !strings.Contains(log, "query stopped") {
+		t.Fatalf("scrollback missing 'query stopped': %s", log)
+	}
+	if strings.Contains(log, "timed out") {
+		t.Fatalf("user cancel misreported as timeout: %s", log)
+	}
+}
 
 func TestConsoleQuery(t *testing.T) {
 	wb := newMordorWorkbench(t)

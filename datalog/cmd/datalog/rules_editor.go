@@ -143,7 +143,7 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 	})
 
 	if ctx.Err() != nil {
-		_ = stream.Emit(datastar.Elements(statusFragment("evaluation timed out, results may be incomplete")))
+		_ = stream.Emit(datastar.Elements(statusFragment(evalHaltStatus(ctx))))
 		return
 	}
 	if applyErr != nil {
@@ -177,7 +177,7 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 		return err
 	})
 	if ctx.Err() != nil {
-		_ = stream.Emit(datastar.Elements(statusFragment("evaluation timed out, results may be incomplete")))
+		_ = stream.Emit(datastar.Elements(statusFragment(evalHaltStatus(ctx))))
 		return
 	}
 	if wb.gen.Stale(token) {
@@ -250,9 +250,19 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 
 	status := ""
 	if timedOut {
-		status = "evaluation timed out, results may be incomplete"
+		status = evalHaltStatus(ctx)
 	}
 	_ = stream.Emit(datastar.Elements(statusFragment(status)), datastar.Elements(resultsFragment(blocks)))
+}
+
+// evalHaltStatus words the status line for an evaluation ctx that ended
+// early: a user Stop (context.Canceled via /cancel or a closed page) reads
+// differently from the evalTimeout deadline expiring.
+func evalHaltStatus(ctx context.Context) string {
+	if ctx.Err() == context.Canceled {
+		return "run stopped"
+	}
+	return "evaluation timed out, results may be incomplete"
 }
 
 // queryResultBlock is one embedded query's rendered outcome: either an

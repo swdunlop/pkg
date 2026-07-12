@@ -177,6 +177,11 @@ func (wb *workbench) handleConsoleQuery(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	defer done()
+	// "query", not consoleQueryJobKey: publishBusy speaks the UI's $busy
+	// vocabulary (see its doc) — this is what morphs the console Run button
+	// into Stop and spins the Query tab while the drawer is closed.
+	wb.publishBusy("query")
+	defer wb.publishBusy("")
 
 	_ = stream.Emit(datastar.Signal(map[string]any{"consoleQuery": ""}))
 
@@ -218,8 +223,11 @@ func (wb *workbench) handleConsoleQuery(w http.ResponseWriter, r *http.Request) 
 			return err
 		})
 		if ctx.Err() != nil {
-			wb.consoleAppend("query", "error", queryEcho(q.String()),
-				html.Text("evaluation timed out, results may be incomplete"))
+			msg := "evaluation timed out, results may be incomplete"
+			if ctx.Err() == context.Canceled {
+				msg = "query stopped" // user hit Stop (/cancel), not the deadline
+			}
+			wb.consoleAppend("query", "error", queryEcho(q.String()), html.Text(msg))
 			return
 		}
 		if qErr != nil {
