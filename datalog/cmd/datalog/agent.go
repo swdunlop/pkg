@@ -325,8 +325,8 @@ func thoughtEntry(text string) html.Content {
 // toolEntry renders one tool call as a single collapsed <details>: the
 // summary line is the tool name, elided arguments, and status — one line of
 // drawer real estate per call — and expanding it reveals the full
-// arguments, the result, or the error. The status span turns red on error,
-// so a failed call is visible without expanding. Result text is already
+// arguments, the result, or the error. The status span shows a red ✕ badge
+// on error, so a failed call is visible without expanding. Result text is already
 // bounded by the MCP tools' own limits (row caps, sample truncation), and
 // nothing elided on the summary line is lost — the body always carries the
 // full documents. The query tool's body renders as a result table instead
@@ -342,12 +342,13 @@ func toolEntry(ev agentEvent, done bool) html.Content {
 	if done && ev.Result != "" {
 		body = append(body, toolResultBody(name, ev))
 	}
-	// The floated status precedes the code in source order so it pins to
-	// the first line's right edge even when a long summary wraps.
+	// oat's summary is a flex row (space-between, trailing chevron ::after),
+	// so source order is layout order: code takes the flexible middle and
+	// the status icon rides the right edge beside the chevron.
 	return tag.New("details",
 		tag.New("summary.tool-line",
-			toolStatus(ev, done),
 			tag.New("code", html.Text(compact)),
+			toolStatus(ev, done),
 		),
 		body,
 	)
@@ -413,9 +414,72 @@ func cellString(v any) string {
 }
 
 // toolError renders a failed tool call's message, matching the Datalog
-// Editor's error-list styling.
+// Editor's error-list styling. The message is unwrapped from whatever JSON
+// envelope the transport put around it first — the operator reads prose,
+// not payloads.
 func toolError(text string) html.Content {
-	return tag.New("ul.errors", tag.New("li", html.Text(text)))
+	return tag.New("ul.errors", tag.New("li", html.Text(toolErrorText(text))))
+}
+
+// toolErrorText digs the human-readable message out of a failed call's
+// result. Providers and transports wrap tool errors in JSON envelopes (MCP
+// content blocks, {"error": ...} objects, bare JSON strings); showing the
+// envelope buries the one line the operator needs. Anything unrecognized
+// falls back to formatToolResult so no information is ever dropped.
+func toolErrorText(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" || (trimmed[0] != '{' && trimmed[0] != '[' && trimmed[0] != '"') {
+		return s // already prose
+	}
+	if msg := jsonErrorMessage([]byte(trimmed)); msg != "" {
+		return msg
+	}
+	return formatToolResult(s)
+}
+
+// jsonErrorMessage extracts a message from the JSON error shapes seen in
+// practice, returning "" when the document matches none of them.
+func jsonErrorMessage(b []byte) string {
+	var str string
+	if json.Unmarshal(b, &str) == nil {
+		return str
+	}
+
+	type textBlock struct {
+		Text string `json:"text"`
+	}
+	joinBlocks := func(blocks []textBlock) string {
+		parts := make([]string, 0, len(blocks))
+		for _, blk := range blocks {
+			if t := strings.TrimSpace(blk.Text); t != "" {
+				parts = append(parts, t)
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+
+	var blocks []textBlock
+	if json.Unmarshal(b, &blocks) == nil {
+		return joinBlocks(blocks)
+	}
+
+	var env struct {
+		Content []textBlock     `json:"content"`
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
+	}
+	if json.Unmarshal(b, &env) != nil {
+		return ""
+	}
+	if msg := joinBlocks(env.Content); msg != "" {
+		return msg
+	}
+	if len(env.Error) > 0 {
+		if msg := jsonErrorMessage(env.Error); msg != "" {
+			return msg
+		}
+	}
+	return env.Message
 }
 
 // formatToolResult pretty-prints a JSON tool result for the disclosure —
@@ -433,15 +497,22 @@ func formatToolResult(s string) string {
 	return buf.String()
 }
 
-// toolStatus marks the summary line only when there is something to say:
-// "running…" while the call is in flight, a red "error" on failure, and
-// nothing at all on success — a finished call with no flag is the ok state.
+// toolStatus marks the summary line only when there is something to say —
+// with an icon, not a word: oat's small spinner while the call is in
+// flight, a red ✕ badge (drawn by .tool-status.error's ::before) on
+// failure, and nothing at all on success — a finished call with no flag is
+// the ok state. The title attribute keeps the meaning reachable by hover
+// and assistive tech.
 func toolStatus(ev agentEvent, done bool) html.Content {
 	switch {
 	case !done:
-		return tag.New("span.tool-status", html.Text("running…"))
+		return tag.New("span.tool-status.running").
+			Set("aria-busy", "true").
+			Set("data-spinner", "small").
+			Set("title", "running")
 	case ev.IsError:
-		return tag.New("span.tool-status.error", html.Text("error"))
+		return tag.New("span.tool-status.error").
+			Set("title", "tool call failed")
 	default:
 		return html.Group{}
 	}

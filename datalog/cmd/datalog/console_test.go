@@ -300,6 +300,29 @@ func TestToolEntryErrorRendered(t *testing.T) {
 	}
 }
 
+func TestToolErrorText(t *testing.T) {
+	// The operator reads prose, not the transport's JSON envelope: every
+	// error shape seen in practice unwraps to its message.
+	for _, tc := range []struct{ in, want string }{
+		{"plain parse error", "plain parse error"},
+		{`"quoted message"`, "quoted message"},
+		{`{"content":[{"type":"text","text":"query: no such predicate"}],"isError":true}`,
+			"query: no such predicate"},
+		{`[{"type":"text","text":"first"},{"type":"text","text":"second"}]`, "first\nsecond"},
+		{`{"error":"boom"}`, "boom"},
+		{`{"error":{"message":"nested boom"}}`, "nested boom"},
+		{`{"message":"top-level message"}`, "top-level message"},
+	} {
+		if got := toolErrorText(tc.in); got != tc.want {
+			t.Errorf("toolErrorText(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	// Unrecognized JSON still shows in full, pretty-printed — never dropped.
+	if got := toolErrorText(`{"weird":true}`); !strings.Contains(got, `"weird": true`) {
+		t.Errorf("unrecognized envelope not preserved: %q", got)
+	}
+}
+
 func TestToolEntryElidedArgsInBody(t *testing.T) {
 	inner := strings.Repeat("suspicious(H) :- smb_conn(H, S, D). ", 10)
 	long := `{"rules":"` + inner + `"}`

@@ -30,6 +30,9 @@
   --faint: light-dark(#d8dee9, #3b4252);
   --faint-foreground: light-dark(#4c566a, #8b95a7);
   --danger: light-dark(#a3333d, #bf616a);             /* md-error */
+  /* Text on a --danger-filled surface. White clears both danger shades
+   * (nord11 #bf616a included); nord0/nord6 land near-equal value on it. */
+  --danger-foreground: #ffffff;
 }
 
 /* The page itself never scrolls: main fills the whole viewport, and each
@@ -156,14 +159,17 @@ div.actions button.action[aria-busy='true']::before {
 }
 
 /* In-form error lists (doc/notes/datastar.md §4). The :empty rule hiding
- * these when clear lives inline in page.go. */
+ * these when clear lives inline in page.go. Filled danger surface, not
+ * danger-colored text — red text on the card's dark blue-grey lands at
+ * near-equal value and disappears. */
 ul.errors {
   list-style: none;
   padding: var(--space-2) var(--space-3);
   margin-block: var(--space-3);
-  border: 1px solid var(--danger);
+  border: none;
   border-radius: var(--radius-medium);
-  color: var(--danger);
+  background: var(--danger);
+  color: var(--danger-foreground);
   font-family: var(--font-mono);
   font-size: var(--text-7);
 }
@@ -286,7 +292,8 @@ section.pane details pre {
 }
 #toast.error {
   border-color: var(--danger);
-  color: var(--danger);
+  background: var(--danger);
+  color: var(--danger-foreground);
 }
 
 /* Muted placeholder text ("No row selected yet…"). */
@@ -401,7 +408,11 @@ section#console {
   white-space: pre-wrap;
 }
 .console-entry.error {
-  color: var(--danger);
+  background: var(--danger);
+  color: var(--danger-foreground);
+  border-radius: var(--radius-medium);
+  padding: var(--space-2) var(--space-3);
+  white-space: pre-wrap;
 }
 .console-entry.note {
   color: var(--muted-foreground);
@@ -419,18 +430,43 @@ section#console {
 .console-entry table {
   margin-block: var(--space-1);
 }
-/* Kept inline (not flex) so the <details> disclosure marker survives —
- * display:flex on a summary drops its list-item marker. The status floats
- * to the row's far edge rather than trailing the tool name mid-line. */
-.console-entry summary.tool-line .tool-status {
-  float: right;
-  margin-inline-start: var(--space-2);
+/* oat's details component paddings suit page prose, not log lines: at
+ * var(--space-4) a collapsed tool call was almost as much padding as
+ * text. Tighten both the summary row and the disclosure body. */
+.console-entry details summary {
+  padding: var(--space-1) var(--space-2);
+}
+.console-entry details > *:not(summary) {
+  margin: var(--space-2);
+}
+/* oat's summary is a flex row (justify-content: space-between, trailing
+ * chevron ::after). The code takes the flexible middle so the status icon
+ * hugs the right edge beside the chevron instead of space-between handing
+ * it a column of its own on the left. */
+.console-entry summary.tool-line code {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .console-entry .tool-status {
-  color: var(--muted-foreground);
+  flex: none;
+  display: inline-flex;
+  align-items: center;
 }
-.console-entry .tool-status.error {
-  color: var(--danger);
+/* Status is an icon, not a word: oat's small spinner (via aria-busy on the
+ * span) while running, a red ✕ badge on error. */
+.console-entry .tool-status.error::before {
+  content: '✕';
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1rem;
+  height: 1rem;
+  border-radius: var(--radius-full);
+  background: var(--danger);
+  color: var(--danger-foreground);
+  font-size: 0.7rem;
+  line-height: 1;
 }
 
 /* Console input rows: input grows; any sibling button (the Query tab's
@@ -452,6 +488,23 @@ section#console {
   resize: none;
 }
 .console-input button {
+  flex: none;
+}
+
+/* Turn-level activity line between the agent scrollback and the composer:
+ * the composer button's overlay ring alone was too subtle a tell. Primary
+ * color to match the spinner's moving edge; data-show removes it entirely
+ * when the agent isn't running. */
+.agent-activity {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  color: var(--primary);
+  font-size: var(--text-7);
+}
+.agent-activity::before {
   flex: none;
 }
 

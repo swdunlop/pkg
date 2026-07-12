@@ -30,7 +30,7 @@ func Console(queryLog, agentLog []html.Content) html.Content {
 			consoleBar(),
 			tag.New("div#console-body").Set("data-show", "$_consoleOpen").Add(
 				consoleTabPanel("query", queryLog, queryInputRow()),
-				consoleTabPanel("agent", agentLog, promptInputRow()),
+				consoleTabPanel("agent", agentLog, html.Group{agentActivity(), promptInputRow()}),
 			),
 		)
 }
@@ -113,6 +113,20 @@ func queryInputRow() html.Content {
 			Set("data-on:click", "@post('/console/query')").
 			Add(html.Text("Run")),
 	)
+}
+
+// agentActivity is the chat pane's turn-level activity line, pinned between
+// the scrollback and the composer whenever the agent holds the $busy mutex.
+// The composer button's overlay ring proved too subtle a tell on its own;
+// this line is unmissable while a turn runs and takes no space when idle.
+// aria-busy is static — data-show removes the whole line when the mutex
+// isn't 'agent', so the spinner never spins unseen.
+func agentActivity() html.Content {
+	return tag.New("div.agent-activity").
+		Set("data-show", "$busy === 'agent'").
+		Set("aria-busy", "true").
+		Set("data-spinner", "small").
+		Add(html.Text("agent turn running…"))
 }
 
 // promptInputRow is the Agent tab's input: a chat-style composer — the send
