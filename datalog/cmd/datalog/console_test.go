@@ -254,8 +254,11 @@ func TestToolEntryQueryTable(t *testing.T) {
 		Result:   `{"vars":["H","S","D"],"rows":[["host1","10.0.0.5",445]],"total":150,"truncated":true}`,
 	}
 	got := renderContent(toolEntry(ev, true))
+	if !strings.HasPrefix(got, "<details>") {
+		t.Fatalf("tool entry should be one collapsed disclosure: %s", got)
+	}
 	for _, want := range []string{
-		"query smb_conn(H, S, D)?", // the query itself, not JSON args
+		"query smb_conn(H, S, D)?", // summary: the query itself, not JSON args
 		"<th>H</th>",               // variable-named header
 		"<td>host1</td>",           // string cell as-is
 		"<td>445</td>",             // numeric cell without float formatting
@@ -265,8 +268,8 @@ func TestToolEntryQueryTable(t *testing.T) {
 			t.Fatalf("query entry missing %q: %s", want, got)
 		}
 	}
-	if strings.Contains(got, "summary") {
-		t.Fatalf("query result should be a table, not a disclosure: %s", got)
+	if strings.Contains(got, `"vars"`) {
+		t.Fatalf("query result should render as a table, not raw JSON: %s", got)
 	}
 }
 
@@ -282,33 +285,36 @@ func TestToolEntryErrorRendered(t *testing.T) {
 	if !strings.Contains(got, "anonymous variables are not allowed") {
 		t.Fatalf("error text not rendered: %s", got)
 	}
-	if strings.Contains(got, "<details") {
-		t.Fatalf("errors must be in the open, not behind a disclosure: %s", got)
+	// A collapsed entry must still signal failure: the summary's status span
+	// carries the error class.
+	if !strings.Contains(got, "tool-status error") {
+		t.Fatalf("summary line does not flag the error: %s", got)
 	}
 
 	ev.ToolName = "datalog__set_rules"
 	ev.ToolArgs = `{"rules":"bad(X :-"}`
 	ev.Result = "parse error at line 1"
 	got = renderContent(toolEntry(ev, true))
-	if !strings.Contains(got, "parse error at line 1") || strings.Contains(got, "<details") {
-		t.Fatalf("generic tool error not rendered in the open: %s", got)
+	if !strings.Contains(got, "parse error at line 1") || !strings.Contains(got, "tool-status error") {
+		t.Fatalf("generic tool error not rendered: %s", got)
 	}
 }
 
-func TestToolEntryElidedArgsDisclosure(t *testing.T) {
-	long := `{"rules":"` + strings.Repeat("suspicious(H) :- smb_conn(H, S, D). ", 10) + `"}`
+func TestToolEntryElidedArgsInBody(t *testing.T) {
+	inner := strings.Repeat("suspicious(H) :- smb_conn(H, S, D). ", 10)
+	long := `{"rules":"` + inner + `"}`
 	ev := agentEvent{Kind: "tool-call", ToolName: "datalog__set_rules", ToolArgs: long}
 	got := renderContent(toolEntry(ev, false))
 	if !strings.Contains(got, "…") {
-		t.Fatalf("long args not elided on the tool line: %s", got)
+		t.Fatalf("long args not elided on the summary line: %s", got)
 	}
-	if !strings.Contains(got, "<summary>arguments</summary>") {
-		t.Fatalf("elided args must stay reachable behind a disclosure: %s", got)
+	if !strings.Contains(got, inner) {
+		t.Fatalf("elided args must stay reachable in the disclosure body: %s", got)
 	}
 
 	short := renderContent(toolEntry(agentEvent{Kind: "tool-call", ToolName: "datalog__list_predicates", ToolArgs: `{}`}, false))
-	if strings.Contains(short, "<summary>arguments</summary>") {
-		t.Fatalf("un-elided args need no disclosure: %s", short)
+	if strings.Contains(short, "<pre>") {
+		t.Fatalf("un-elided args need no body copy: %s", short)
 	}
 }
 

@@ -226,12 +226,16 @@ every open page; clearing the Agent tab also drops the embedded
 driver, so it is a conversation reset (the model forgets too). A turn
 still running is cancelled first — Clear means "start over", so it
 implies Stop rather than demanding it as a separate click.
-Agent tool calls render for the operator, not the wire: a `query`
-call shows the query text and a variable-named result table (the same
-rendering as the editor's embedded queries), a failed call shows its
-error in the open, and JSON is never elided outright — wherever the
-one-line form truncates arguments or a result stays raw, the full
-pretty-printed document sits behind a `<details>` disclosure.
+Agent tool calls render for the operator, not the wire, and the
+drawer's vertical real estate is the constraint: each call is one
+collapsed `<details>` whose summary line carries the tool name, its
+elided arguments (a `query` call shows the query text itself, not its
+JSON envelope), and a status that turns red on failure — one line per
+call until the operator opens it. The body holds the rest: query
+results as the editor's variable-named table, errors as its error
+list, other results as pretty-printed JSON, and — whenever the
+summary line truncated the arguments — the full document, so elision
+never loses anything.
 A drawer rather than a fourth column because the three-column rhythm
 was hard-won; the ultrawide case is an open question below.
 

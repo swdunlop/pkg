@@ -391,11 +391,10 @@ section#console {
 .console-entry table {
   margin-block: var(--space-1);
 }
-.console-entry p.tool-line {
-  margin: 0;
-  display: flex;
-  gap: var(--space-2);
-  align-items: baseline;
+/* Kept inline (not flex) so the <details> disclosure marker survives —
+ * display:flex on a summary drops its list-item marker. */
+.console-entry summary.tool-line .tool-status {
+  margin-inline-start: var(--space-2);
 }
 .console-entry .tool-status {
   color: var(--muted-foreground);

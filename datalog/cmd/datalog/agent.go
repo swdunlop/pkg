@@ -322,84 +322,78 @@ func thoughtEntry(text string) html.Content {
 	)
 }
 
-// toolEntry renders one tool call's line: name, compact input, status, and
-// (once done) the result behind a disclosure. Result text is already
-// bounded by the MCP tools' own limits (row caps, sample truncation).
-// Errors are rendered in the open — an agent's failed call is exactly what
-// the operator needs to see — and JSON is never elided outright: when the
-// one-line form truncates the arguments, the full document sits behind a
-// disclosure. The query tool gets its own rendering entirely.
+// toolEntry renders one tool call as a single collapsed <details>: the
+// summary line is the tool name, elided arguments, and status — one line of
+// drawer real estate per call — and expanding it reveals the full
+// arguments, the result, or the error. The status span turns red on error,
+// so a failed call is visible without expanding. Result text is already
+// bounded by the MCP tools' own limits (row caps, sample truncation), and
+// nothing elided on the summary line is lost — the body always carries the
+// full documents. The query tool's body renders as a result table instead
+// of raw JSON.
 func toolEntry(ev agentEvent, done bool) html.Content {
 	name := strings.TrimPrefix(ev.ToolName, "datalog__")
-	if name == "query" {
-		return queryToolEntry(ev, done)
-	}
-	compact, elided := compactArgs(ev.ToolArgs)
-	parts := html.Group{tag.New("p.tool-line",
-		tag.New("code", html.Text(name+" "+compact)),
-		toolStatus(ev, done),
-	)}
+	headText := name + " " + argsSummary(name, ev.ToolArgs)
+	compact, elided := compactArgs(headText)
+	body := html.Group{}
 	if elided {
-		parts = append(parts, tag.New("details",
-			tag.New("summary", html.Text("arguments")),
-			tag.New("pre", html.Text(formatToolResult(ev.ToolArgs))),
-		))
+		body = append(body, tag.New("pre", html.Text(formatToolResult(ev.ToolArgs))))
 	}
-	if !done || ev.Result == "" {
-		return parts
+	if done && ev.Result != "" {
+		body = append(body, toolResultBody(name, ev))
 	}
-	if ev.IsError {
-		return append(parts, toolError(ev.Result))
-	}
-	return append(parts, tag.New("details",
-		tag.New("summary", html.Text("result")),
-		tag.New("pre", html.Text(formatToolResult(ev.Result))),
-	))
+	return tag.New("details",
+		tag.New("summary.tool-line",
+			tag.New("code", html.Text(compact)),
+			toolStatus(ev, done),
+		),
+		body,
+	)
 }
 
-// queryToolEntry renders the query tool's calls the way the Datalog Editor
-// renders embedded queries: the query text itself as the heading and the
-// rows as a variable-named table — the JSON on the wire is transport, not
-// something the operator should have to read.
-func queryToolEntry(ev agentEvent, done bool) html.Content {
-	queryText := strings.TrimSpace(ev.ToolArgs)
-	var in queryInput
-	if json.Unmarshal([]byte(ev.ToolArgs), &in) == nil && in.Query != "" {
-		queryText = in.Query
-	}
-	head := tag.New("p.tool-line",
-		tag.New("code", html.Text("query "+queryText)),
-		toolStatus(ev, done),
-	)
-	if !done || ev.Result == "" {
-		return head
-	}
-	if ev.IsError {
-		return html.Group{head, toolError(ev.Result)}
-	}
-	var out queryOutput
-	if json.Unmarshal([]byte(ev.Result), &out) != nil {
-		// Not the tool's structured shape (a transport quirk); fall back to
-		// the generic disclosure rather than render an empty table.
-		return html.Group{head, tag.New("details",
-			tag.New("summary", html.Text("result")),
-			tag.New("pre", html.Text(formatToolResult(ev.Result))),
-		)}
-	}
-	rows := make([][]string, len(out.Rows))
-	for i, row := range out.Rows {
-		cells := make([]string, len(row))
-		for j, c := range row {
-			cells[j] = cellString(c)
+// argsSummary reduces a tool call's JSON arguments to their essence for the
+// summary line: the query tool shows the query itself (the JSON envelope is
+// transport, not something the operator should read); everything else shows
+// its compacted JSON.
+func argsSummary(name, args string) string {
+	if name == "query" {
+		var in queryInput
+		if json.Unmarshal([]byte(args), &in) == nil && in.Query != "" {
+			return in.Query
 		}
-		rows[i] = cells
 	}
-	return html.Group{head, resultTable(queryResultBlock{
-		Vars:      out.Vars,
-		Rows:      rows,
-		Total:     out.Total,
-		Truncated: out.Truncated,
-	})}
+	return strings.TrimSpace(args)
+}
+
+// toolResultBody renders a finished call's outcome inside the disclosure:
+// errors as the editor's error-list styling, query results as the editor's
+// variable-named table, and anything else as pretty-printed JSON.
+func toolResultBody(name string, ev agentEvent) html.Content {
+	if ev.IsError {
+		return toolError(ev.Result)
+	}
+	if name == "query" {
+		var out queryOutput
+		if json.Unmarshal([]byte(ev.Result), &out) == nil {
+			rows := make([][]string, len(out.Rows))
+			for i, row := range out.Rows {
+				cells := make([]string, len(row))
+				for j, c := range row {
+					cells[j] = cellString(c)
+				}
+				rows[i] = cells
+			}
+			return resultTable(queryResultBlock{
+				Vars:      out.Vars,
+				Rows:      rows,
+				Total:     out.Total,
+				Truncated: out.Truncated,
+			})
+		}
+		// Not the tool's structured shape (a transport quirk); fall through
+		// to the raw rendering rather than show an empty table.
+	}
+	return tag.New("pre", html.Text(formatToolResult(ev.Result)))
 }
 
 // cellString displays one decoded result cell: strings as-is, everything
@@ -416,8 +410,8 @@ func cellString(v any) string {
 	return string(b)
 }
 
-// toolError renders a failed tool call's message in the open, matching the
-// Datalog Editor's error-list styling.
+// toolError renders a failed tool call's message, matching the Datalog
+// Editor's error-list styling.
 func toolError(text string) html.Content {
 	return tag.New("ul.errors", tag.New("li", html.Text(text)))
 }
@@ -448,9 +442,9 @@ func toolStatus(ev agentEvent, done bool) html.Content {
 	}
 }
 
-// compactArgs bounds a tool call's JSON arguments to one readable line,
-// reporting whether anything was cut so the caller can hang the full
-// document behind a disclosure (elided JSON must always stay reachable).
+// compactArgs bounds a tool call's summary line to one readable length,
+// reporting whether anything was cut so the caller can put the full
+// document in the disclosure body (elided JSON must always stay reachable).
 func compactArgs(args string) (string, bool) {
 	args = strings.Join(strings.Fields(args), " ")
 	const max = 120
