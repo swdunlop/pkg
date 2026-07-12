@@ -150,13 +150,15 @@ func TestConsoleClearAgentResetsDriver(t *testing.T) {
 	}
 }
 
-func TestConsoleClearAgentRefusedMidTurn(t *testing.T) {
+func TestConsoleClearAgentCancelsRunningTurn(t *testing.T) {
 	wb := newMordorWorkbench(t)
 	srv := startTestServer(wb)
 	defer srv.Close()
 
-	release := make(chan struct{})
-	wb.agent = &blockingDriver{release: release}
+	// A driver that blocks until its context is cancelled — Clear must
+	// cancel the turn itself (it implies Stop), wait it out, then reset.
+	driver := &blockingDriver{release: make(chan struct{})}
+	wb.agent = driver
 	resp1 := postSignals(t, srv, "/console/prompt", map[string]any{"consolePrompt": "hi"})
 	_, _ = io.ReadAll(resp1.Body)
 	resp1.Body.Close()
@@ -165,19 +167,18 @@ func TestConsoleClearAgentRefusedMidTurn(t *testing.T) {
 	_, _ = io.ReadAll(resp2.Body)
 	resp2.Body.Close()
 
-	log := renderLog(wb, "agent")
-	if !strings.Contains(log, "stop it before clearing") {
-		t.Fatalf("mid-turn clear was not refused: %s", log)
+	if log := renderLog(wb, "agent"); log != "" {
+		t.Fatalf("agent scrollback not empty after mid-turn clear: %s", log)
 	}
 	wb.agentMu.Lock()
 	live := wb.agent
 	wb.agentMu.Unlock()
-	if live == nil {
-		t.Fatalf("mid-turn clear dropped the running driver")
+	if live != nil {
+		t.Fatalf("mid-turn clear did not drop the driver")
 	}
-
-	close(release)
-	waitFor(t, func() bool { return strings.Contains(renderLog(wb, "agent"), "done") })
+	if !driver.closed {
+		t.Fatalf("cancelled turn's driver was not closed")
+	}
 }
 
 // -- agent turn runner --------------------------------------------------------
@@ -238,6 +239,26 @@ func TestRunAgentTurnTranscript(t *testing.T) {
 	}
 	if strings.Contains(log, "turn failed") || strings.Contains(log, "turn ended") {
 		t.Fatalf("clean stop should not add a terminal entry: %s", log)
+	}
+}
+
+func TestRunAgentTurnNoReplyNote(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	// A turn that runs tools but never composes a reply — small models end
+	// on a tool round routinely; silence would read as a hang.
+	driver := &fakeDriver{
+		events: []agentEvent{
+			{Kind: "tool-call", ToolCallID: "t1", ToolName: "datalog__query", ToolArgs: `{}`},
+			{Kind: "tool-result", ToolCallID: "t1", ToolName: "datalog__query", ToolArgs: `{}`, Result: "0 rows"},
+		},
+		stopReason: "tool_calls",
+	}
+
+	wb.runAgentTurn(context.Background(), driver, "which hosts?")
+
+	log := renderLog(wb, "agent")
+	if !strings.Contains(log, "without a reply (stop reason: tool_calls)") {
+		t.Fatalf("expected a no-reply note: %s", log)
 	}
 }
 
@@ -309,7 +330,10 @@ func TestConsolePromptGatesOneTurn(t *testing.T) {
 	}
 }
 
-type blockingDriver struct{ release chan struct{} }
+type blockingDriver struct {
+	release chan struct{}
+	closed  bool
+}
 
 func (d *blockingDriver) Prompt(ctx context.Context, text string, sink func(agentEvent)) (string, error) {
 	select {
@@ -321,7 +345,7 @@ func (d *blockingDriver) Prompt(ctx context.Context, text string, sink func(agen
 	return "stop", nil
 }
 
-func (d *blockingDriver) Close() error { return nil }
+func (d *blockingDriver) Close() error { d.closed = true; return nil }
 
 // waitFor polls cond until it holds or the deadline passes — the prompt
 // endpoint hands its turn to a goroutine, so tests must wait for the

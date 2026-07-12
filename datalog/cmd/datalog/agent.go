@@ -102,7 +102,13 @@ func newKitDriver(ctx context.Context, cfg agentConfig, mcpSrv *server.MCPServer
 // (doc/notes/kit.md §4's subscribe-then-PromptResult idiom). Subscriptions
 // are per-turn rather than per-driver so sink never outlives its turn.
 func (d *kitDriver) Prompt(ctx context.Context, text string, sink func(agentEvent)) (string, error) {
+	// MessageUpdateEvent fires per STREAMING chunk only — when the provider
+	// (or kit's resolved streaming mode) doesn't stream the final text, the
+	// reply exists solely in TurnResult.Response, so it is replayed below as
+	// one message event rather than silently dropped.
+	var sawMessage bool
 	unsubMsg := d.k.OnMessageUpdate(func(e kit.MessageUpdateEvent) {
+		sawMessage = true
 		sink(agentEvent{Kind: "message", Text: e.Chunk})
 	})
 	defer unsubMsg()
@@ -127,6 +133,9 @@ func (d *kitDriver) Prompt(ctx context.Context, text string, sink func(agentEven
 	res, err := d.k.PromptResult(ctx, text)
 	if err != nil {
 		return "", err
+	}
+	if !sawMessage && res.Response != "" {
+		sink(agentEvent{Kind: "message", Text: res.Response})
 	}
 	return res.StopReason, nil
 }
@@ -272,12 +281,25 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 	}
 
 	stopReason, err := driver.Prompt(ctx, text, sink)
+	mu.Lock()
+	gotReply := msgID != 0
+	mu.Unlock()
 	switch {
 	case ctx.Err() != nil:
 		wb.consoleAppend("agent", "note", html.Text("turn cancelled"))
 	case err != nil:
 		wb.consoleAppend("agent", "error", html.Text(fmt.Sprintf("turn failed: %v", err)))
 		wb.dropAgentDriver(driver)
+	case !gotReply:
+		// A model may end its turn on a tool round without composing any
+		// reply (small models do this routinely). Rendering nothing would
+		// read as a hang — say so instead (acp-integration.md: an ended
+		// turn always has explicit terminal state).
+		if stopReason == "" {
+			stopReason = "unknown"
+		}
+		wb.consoleAppend("agent", "note",
+			html.Text("the model ended the turn without a reply (stop reason: "+stopReason+")"))
 	case stopReason != "" && stopReason != "stop" && stopReason != "end_turn" && stopReason != "tool_calls":
 		wb.consoleAppend("agent", "note", html.Text("turn ended: "+stopReason))
 	}

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	html "github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/datastar"
@@ -225,8 +226,10 @@ func (wb *workbench) handleConsoleQuery(w http.ResponseWriter, r *http.Request) 
 // scrollback and morphs the emptied log div onto every open page. Clearing
 // the Agent tab is a conversation reset, not just a display wipe: the kit
 // driver carries the model's memory across turns, so it is dropped too and
-// the next prompt starts a fresh conversation. That reset is refused while
-// a turn is running — closing a driver mid-turn is undefined; Stop first.
+// the next prompt starts a fresh conversation. A turn still running is
+// cancelled, not refused — Clear means "start over", so it implies Stop;
+// the driver just cannot be closed until the turn's goroutine has released
+// the job key, hence the acquire loop below.
 func (wb *workbench) handleConsoleClear(w http.ResponseWriter, r *http.Request) {
 	tab := r.URL.Query().Get("tab")
 	if tab != "query" && tab != "agent" {
@@ -238,11 +241,19 @@ func (wb *workbench) handleConsoleClear(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if tab == "agent" {
+		wb.jobs.Cancel(agentTurnJobKey)
 		jobCtx, done := wb.jobs.Begin(context.Background(), agentTurnJobKey)
-		if jobCtx == nil {
-			wb.consoleAppend("agent", "error",
-				html.Text("a turn is running — stop it before clearing"))
-			return
+		for deadline := time.Now().Add(5 * time.Second); jobCtx == nil; {
+			if time.Now().After(deadline) {
+				// The turn ignored its cancelled context (a wedged provider
+				// call); closing the driver under it would be worse. Leave
+				// the transcript alone and say so.
+				wb.consoleAppend("agent", "error",
+					html.Text("the running turn is not stopping; clear again once it ends"))
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+			jobCtx, done = wb.jobs.Begin(context.Background(), agentTurnJobKey)
 		}
 		defer done()
 		wb.agentMu.Lock()
