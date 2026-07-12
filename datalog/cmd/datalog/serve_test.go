@@ -28,7 +28,7 @@ import (
 // stderr.
 func newTestWorkbench(t *testing.T, dir, configPath string, ruleFiles []string, token string) *workbench {
 	t.Helper()
-	wb, closeFn, err := newWorkbench(dir, configPath, ruleFiles, token)
+	wb, closeFn, err := newWorkbench(dir, configPath, ruleFiles, token, agentConfig{})
 	if err != nil {
 		t.Fatalf("newWorkbench: %v", err)
 	}

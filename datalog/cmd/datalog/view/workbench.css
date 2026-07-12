@@ -291,3 +291,128 @@ section.pane details pre {
 p.text-light {
   color: var(--muted-foreground);
 }
+
+/* Console drawer (doc/features/web-ui.md "Console drawer"): a full-width
+ * strip beneath the three columns on both views. The bar is always visible;
+ * the body only exists when $_consoleOpen (data-show), and takes its height
+ * from the flex column — body is the flex container and main#workbench is
+ * flex:1, so an open drawer compresses the panes rather than scrolling the
+ * page. */
+section#console {
+  flex: none;
+  border-top: 1px solid var(--border);
+  background: var(--card);
+  color: var(--card-foreground);
+}
+#console-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-4);
+}
+#console-bar button.console-tab {
+  background: none;
+  border: none;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-medium);
+  color: var(--muted-foreground);
+  font-size: var(--text-7);
+  cursor: pointer;
+}
+#console-bar button.console-tab:hover {
+  background: var(--accent);
+}
+#console-bar button.console-tab.active {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+#console-status {
+  margin-inline-start: auto;
+  color: var(--muted-foreground);
+  font-size: var(--text-7);
+}
+
+/* Open drawer body: capped height, scrollback scrolls, input row pinned
+ * beneath it. The first-child margin-top:auto rule below bottom-pins a
+ * short log, terminal-style, without any scroll scripting. */
+#console-body {
+  height: 35vh;
+  display: flex;
+  flex-direction: column;
+}
+.console-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 0 var(--space-4) var(--space-3);
+}
+.console-log {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  font-size: var(--text-7);
+}
+.console-log > .console-entry:first-child {
+  margin-top: auto; /* short logs pin to the bottom, like a terminal */
+}
+.console-entry {
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--border);
+}
+.console-entry:last-child {
+  border-bottom: none;
+}
+.console-entry.user {
+  color: var(--primary);
+  white-space: pre-wrap;
+}
+.console-entry.agent {
+  white-space: pre-wrap;
+}
+.console-entry.error {
+  color: var(--danger);
+}
+.console-entry.note {
+  color: var(--muted-foreground);
+}
+.console-entry.thought summary,
+.console-entry.tool summary {
+  color: var(--muted-foreground);
+  cursor: pointer;
+}
+.console-entry pre {
+  max-height: 12rem;
+  overflow: auto;
+  margin-block: var(--space-1);
+}
+.console-entry p.tool-line {
+  margin: 0;
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+}
+.console-entry .tool-status {
+  color: var(--muted-foreground);
+}
+.console-entry .tool-status.error {
+  color: var(--danger);
+}
+
+/* Console input rows: input grows, button hugs the right. */
+.console-input {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  flex: none;
+}
+.console-input input,
+.console-input textarea {
+  flex: 1 1 auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-7);
+  background-color: light-dark(#ffffff, #1a1e26); /* md-input-bg */
+  resize: none;
+}

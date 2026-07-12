@@ -33,6 +33,12 @@ type Page struct {
 	// differ (view/facts.go and view/rules.go build them), and Page itself
 	// only needs to lay three columns out, not know what's in them.
 	Columns []html.Content
+
+	// Console is the drawer beneath the columns (view/console.go), shared
+	// by both views. Optional so fragment-only tests can render a bare
+	// Page; nil renders nothing (view.When's never-nil rule applies at the
+	// render site, not here).
+	Console html.Content
 }
 
 // emptyCSS hides the shared error/status/toast divs when they render with
@@ -78,6 +84,7 @@ func body(p Page) html.Content {
 		// present and no-ops on the other).
 		tag.New("div").Set("data-init", "@get('/events', {openWhenHidden: true, requestCancellation: 'disabled'})"),
 		tag.New("main#workbench", p.Columns...),
+		When(p.Console != nil, p.Console),
 	)
 }
 

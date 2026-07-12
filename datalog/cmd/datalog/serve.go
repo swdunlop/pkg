@@ -35,6 +35,9 @@ func runServe(args []string) {
 	configPath := flags.String("c", "", "path to a JSON or YAML jsonfacts config file to preload")
 	listen := flags.String("listen", "127.0.0.1:8080", "address to listen on")
 	mcpToken := flags.String("mcp-token", "", "bearer token required on /mcp (default: generate one and print it to stderr)")
+	model := flags.String("model", "", "embedded agent model, kit-style (e.g. anthropic/claude-sonnet-5, openai/<alias>); empty defers to KIT_MODEL / ~/.kit.yml")
+	providerURL := flags.String("provider-url", "", "override the agent model provider's base URL (e.g. an OpenAI-compatible llama-swap endpoint)")
+	providerKey := flags.String("provider-api-key", "", "override the agent model provider's API key; empty defers to provider env vars")
 	if err := flags.Parse(args); err != nil {
 		// flag.ExitOnError already printed usage and exited on real errors;
 		// this only returns for -h/-help.
@@ -54,7 +57,8 @@ func runServe(args []string) {
 	// doc comment for the full path-resolution policy.
 	ruleFiles := flags.Args()
 
-	wb, closeFn, err := newWorkbench(*dataDir, *configPath, ruleFiles, *mcpToken)
+	wb, closeFn, err := newWorkbench(*dataDir, *configPath, ruleFiles, *mcpToken,
+		agentConfig{Model: *model, ProviderURL: *providerURL, ProviderAPIKey: *providerKey})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "datalog serve: %v\n", err)
 		os.Exit(1)
@@ -88,12 +92,13 @@ func runServe(args []string) {
 
 // newWorkbench builds a *workbench wired exactly like runServe does: it
 // opens the data source, preloads schema/rules, generates (or accepts) the
-// /mcp bearer token, and wires the onChange patch-back seam — everything
-// runServe needs except the flag parsing and the HTTP listener itself.
-// Factored out so tests can build a workbench against a temp directory or
-// the mordor example without going through flag parsing or os.Exit calls.
-// tokenFlag is the --mcp-token flag's value; empty means "generate one".
-func newWorkbench(dataDir, configPath string, ruleFiles []string, tokenFlag string) (*workbench, func() error, error) {
+// /mcp bearer token, builds the shared MCP server value, and wires the
+// onChange patch-back seam — everything runServe needs except the flag
+// parsing and the HTTP listener itself. Factored out so tests can build a
+// workbench against a temp directory or the mordor example without going
+// through flag parsing or os.Exit calls. tokenFlag is the --mcp-token
+// flag's value; empty means "generate one".
+func newWorkbench(dataDir, configPath string, ruleFiles []string, tokenFlag string, agentCfg agentConfig) (*workbench, func() error, error) {
 	h, closeFn, err := newMCPHandlers(dataDir, configPath, ruleFiles, evalTimeout)
 	if err != nil {
 		return nil, nil, err
@@ -108,10 +113,22 @@ func newWorkbench(dataDir, configPath string, ruleFiles []string, tokenFlag stri
 		}
 	}
 
+	// One MCP server value serves both consumers: mounted at /mcp for
+	// external agents (mountMCP) and registered in-process with the
+	// embedded kit agent (newKitDriver) — the "one pipeline, N frontends"
+	// rule extended to the tool surface itself.
+	srv := server.NewMCPServer("datalog", "0.1.0",
+		server.WithInstructions(mcpServerInstructions),
+	)
+	h.registerTools(srv)
+
 	wb := &workbench{
 		h:          h,
 		bus:        newBus(),
 		jobs:       newJobs(),
+		console:    &consoleLog{},
+		mcpSrv:     srv,
+		agentCfg:   agentCfg,
 		schemaPath: configPath,
 		rulesPath:  firstOrEmpty(ruleFiles),
 		mcpToken:   token,
@@ -167,18 +184,13 @@ func generateToken() (string, error) {
 // <token> or 401, checked with crypto/subtle.ConstantTimeCompare so token
 // comparison isn't timing-observable.
 func (wb *workbench) mountMCP(mux *http.ServeMux) {
-	srv := server.NewMCPServer("datalog", "0.1.0",
-		server.WithInstructions(mcpServerInstructions),
-	)
-	wb.h.registerTools(srv)
-
 	// WithStateLess: the workbench is single-user/single-session (design
 	// constraint 3), so there is no benefit to the streamable transport's
 	// stateful session bookkeeping (an Mcp-Session-Id the client must carry
 	// across calls) — every request already shares the one *mcpHandlers/
 	// session this server was built around, regardless of transport-level
 	// session identity.
-	streamable := server.NewStreamableHTTPServer(srv, server.WithStateLess(true))
+	streamable := server.NewStreamableHTTPServer(wb.mcpSrv, server.WithStateLess(true))
 	mux.Handle("/mcp", wb.requireBearerToken(streamable))
 }
 
@@ -216,6 +228,19 @@ type workbench struct {
 	bus  *bus
 	jobs *jobs
 	gen  generation
+
+	// console is the drawer's server-owned scrollback (console.go); mcpSrv
+	// is the shared MCP server value built in newWorkbench, consumed by
+	// both mountMCP (streamable HTTP at /mcp) and the embedded kit agent
+	// (in-process registration).
+	console *consoleLog
+	mcpSrv  *server.MCPServer
+
+	// agentMu guards the lazily-constructed embedded agent (agent.go).
+	// agentCfg is operator-trusted flag input, immutable after startup.
+	agentMu  sync.Mutex
+	agent    agentDriver
+	agentCfg agentConfig
 
 	// schemaPath and rulesPath are the operator-given startup paths for the
 	// schema (-c) and rules (first positional .dl file) documents,
@@ -284,6 +309,11 @@ func (wb *workbench) routes(mux *http.ServeMux) {
 	// Fact Browser (view/fact_browser.go stub; wave 8 fills in).
 	mux.HandleFunc("GET /facts/{predicate}/{arity}", wb.handleFacts)
 
+	// Console drawer (console.go, agent.go): the Query tab's ad-hoc probe
+	// and the Agent tab's prompt (doc/features/web-ui.md "Console drawer").
+	mux.HandleFunc("POST /console/query", wb.handleConsoleQuery)
+	mux.HandleFunc("POST /console/prompt", wb.handleConsolePrompt)
+
 	// Global Cancel — implemented fully now (doc/features/web-ui.md
 	// "Execution sandbox").
 	mux.HandleFunc("POST /cancel", wb.handleCancel)
@@ -318,6 +348,7 @@ func (wb *workbench) handleFactsView(w http.ResponseWriter, r *http.Request) {
 			view.JSONFactsEditor(schemaText, output),
 			view.FactBrowser("base", "Base Facts"),
 		},
+		Console: view.Console(wb.console.Render("query"), wb.console.Render("agent")),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	buf := html.Append(nil, page)
@@ -340,6 +371,7 @@ func (wb *workbench) handleRulesView(w http.ResponseWriter, r *http.Request) {
 			view.RulesEditor(rulesText),
 			view.FactBrowser("derived", "Derived Facts"),
 		},
+		Console: view.Console(wb.console.Render("query"), wb.console.Render("agent")),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	buf := html.Append(nil, page)
