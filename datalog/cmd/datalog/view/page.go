@@ -5,22 +5,32 @@ import (
 	"github.com/swdunlop/html-go/tag"
 )
 
-// Page is the full-page shell for GET / — doctype, head, and the four-pane
-// body — implementing html.Content per doc/notes/datastar.md Appendix A.8's
-// layout-as-struct idiom. Fragment responses (the SSE action/subscription
-// endpoints) never construct a Page; they emit pane-scoped html.Content
-// directly.
+// Page is the full-page shell for the workbench's two views — doctype,
+// head, nav chrome, and a three-column body — implementing html.Content per
+// doc/notes/datastar.md Appendix A.8's layout-as-struct idiom. Fragment
+// responses (the SSE action/subscription endpoints) never construct a
+// Page; they emit pane-scoped html.Content directly.
+//
+// The single four-pane page was split into two three-pane views (Facts,
+// Rules) because four disjoint panes on one screen was unworkable — each
+// view now pairs the editor under test with the panes that show its input
+// and its effect:
+//
+//   - Facts view (/facts): Data Browser | jsonfacts Editor | Fact Browser
+//     (base) — authoring how base facts are extracted from JSONL.
+//   - Rules view (/rules): Fact Browser (base) | Datalog Editor | Fact
+//     Browser (derived) — authoring how rules derive facts from base facts.
+//
+// Active names the current view ("facts" or "rules") for nav highlighting.
 type Page struct {
-	Title string
+	Title  string
+	Active string
 
-	// DataBrowser, JSONFactsEditor, RulesEditor, FactBrowser are the four
-	// workspace panes (doc/features/web-ui.md). Each pane's view builder
-	// lives in its own view/<pane>.go file so later waves can flesh out
-	// pane content without touching this shell.
-	DataBrowser     html.Content
-	JSONFactsEditor html.Content
-	RulesEditor     html.Content
-	FactBrowser     html.Content
+	// Columns holds exactly the view's three panes, left to right. A slice
+	// rather than named fields since the two views' pane compositions
+	// differ (view/facts.go and view/rules.go build them), and Page itself
+	// only needs to lay three columns out, not know what's in them.
+	Columns []html.Content
 }
 
 // emptyCSS hides the shared error/status/toast divs when they render with
@@ -59,16 +69,39 @@ func body(p Page) html.Content {
 	return tag.New("body",
 		tag.New("header#chrome",
 			tag.New("h1", html.Text("datalog workbench")),
+			navLinks(p.Active),
 			cancelButton,
 		),
 		tag.New("div#toast"),
-		tag.New("main#workbench",
-			p.DataBrowser,
-			p.JSONFactsEditor,
-			p.RulesEditor,
-			p.FactBrowser,
-		),
+		// The Fact Browser subscription (doc/notes/datastar.md §8) is
+		// page-scoped, not pane-scoped: whichever of #predicates-base /
+		// #predicates-derived exist on the current view, this one
+		// connection keeps both in sync (publishSessionChanged always
+		// fans out both fragments; Datastar morphs whichever id is
+		// present and no-ops on the other).
+		tag.New("div").Set("data-init", "@get('/events', {openWhenHidden: true, requestCancellation: 'disabled'})"),
+		tag.New("main#workbench", p.Columns...),
 	)
+}
+
+// navLinks renders the Facts/Rules view switcher. active names the current
+// view ("facts" or "rules") so its link can be styled distinctly; full
+// page navigation (doc/notes/datastar.md §7), not a Datastar action, since
+// switching views is a real URL change a user should be able to bookmark
+// or reload.
+func navLinks(active string) html.Content {
+	return tag.New("nav#views",
+		navLink("/facts", "Facts", active == "facts"),
+		navLink("/rules", "Rules", active == "rules"),
+	)
+}
+
+func navLink(href, label string, active bool) html.Content {
+	a := tag.New("a").Set("href", href).Add(html.Text(label))
+	if active {
+		a = a.Class("active")
+	}
+	return a
 }
 
 // Toast renders the #toast fragment: a system-level surface per

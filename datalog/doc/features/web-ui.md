@@ -124,8 +124,24 @@ button is the persistence step for agent-authored documents too
 
 ### The panes
 
-Four workspace panes plus the chat pane (defined in
-acp-integration.md), in a single-page layout.
+Four workspace panes plus the chat pane (defined in acp-integration.md),
+split across two three-column views rather than one page — four disjoint
+panes on a single screen proved unworkable, and each pair naturally shares
+a Fact Browser as its "what did that just produce" column:
+
+- **Facts view** (`/facts`): Data Browser | jsonfacts Editor | Fact Browser
+  (base facts only) — authoring how base facts are extracted from JSONL.
+- **Rules view** (`/rules`): Fact Browser (base facts only) | Datalog
+  Editor | Fact Browser (derived facts only) — authoring how rules derive
+  facts from base facts, base on the left as the rules' input, derived on
+  the right as their output.
+
+A nav switcher in the header (`/facts`, `/rules`) moves between them via
+plain full-page navigation (doc/notes/datastar.md §7) — a real URL change,
+bookmarkable and reloadable, not a Datastar action. `GET /` redirects to
+`/facts`, the authoring loop's usual starting point. The Fact Browser's
+subscription connection (below) moved from pane-scoped to page-scoped so
+the Rules view's two panes share one connection instead of opening two.
 
 **Data Browser.** Raw JSONL records in a semantic table, one file at a
 time (file list from `sources[].file`). Server-side pagination, 50
@@ -171,20 +187,25 @@ the button doesn't just freeze; a timeout reports "evaluation timed
 out, results may be incomplete" in that same `#status` div. The
 sandbox's Global Cancel button (below) targets the same job key.
 
-**Fact Browser.** Predicates with fact counts (the REPL's `.list`),
-each labeled **base** (EDB) or **derived** (IDB) from the ruleset.
+**Fact Browser.** Predicates with fact counts (the REPL's `.list`), each
+labeled **base** (EDB) or **derived** (IDB) from the ruleset — but each
+Fact Browser *instance* only lists one kind, since the Facts and Rules
+views each show base and/or derived in separate columns rather than one
+mixed list (`view.FactBrowser(kind, heading)`, `kind` = `"base"` or
+`"derived"`, rendering into `#predicates-base` / `#predicates-derived`).
 Expanding a predicate pages its facts 50 at a time via the
 `iter.Seq[[]Constant]` from `Database.Facts`. Composite terms render
 as a one-level `<details>`: the summary shows ~80 chars of canonical
-JSON, expansion shows the full `json.MarshalIndent` output. This is
-the pane that owns the page's one long-lived subscription connection
-(doc/notes/datastar.md §8): a `<div data-init="@get('/events', {openWhenHidden: true, requestCancellation: 'disabled'})">`
+JSON, expansion shows the full `json.MarshalIndent` output. The page
+shell (not this pane) owns the page's one long-lived subscription
+connection (doc/notes/datastar.md §8): a `<div data-init="@get('/events', {openWhenHidden: true, requestCancellation: 'disabled'})">`
 opens on page load, the handler subscribes to the session's
-Transform-completed bus *before* sending the initial fact listing (the
-subscribe-before-render ordering in §8, to avoid losing a Transform
-that lands mid-render), then forwards each subsequent completion —
-including ones triggered by agent tool calls — as a `MergeFragments`
-patch to the predicate list.
+Transform-completed bus *before* sending the initial base+derived fact
+listings as one `Batch` (the subscribe-before-render ordering in §8, to
+avoid losing a Transform that lands mid-render), then forwards each
+subsequent completion — including ones triggered by agent tool calls —
+as a `Batch` of both fragments; Datastar morphs whichever id the current
+view actually has on screen and no-ops on the other.
 
 ### Execution sandbox
 

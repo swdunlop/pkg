@@ -32,7 +32,7 @@
   --danger: light-dark(#a3333d, #bf616a);             /* md-error */
 }
 
-/* Header bar: title left, Global Cancel right. */
+/* Header bar: title, view nav, and Global Cancel, left to right. */
 header#chrome {
   display: flex;
   align-items: center;
@@ -47,12 +47,33 @@ header#chrome h1 {
   font-size: var(--text-4);
 }
 
-/* Four panes in a responsive grid: two columns when the viewport allows,
- * collapsing to one on narrow windows. align-items:start keeps a short pane
- * from stretching to its row partner's height. */
+/* Facts/Rules view switcher, between the title and Cancel. */
+nav#views {
+  display: flex;
+  gap: var(--space-2);
+  margin-inline-start: auto;
+  margin-inline-end: var(--space-4);
+}
+nav#views a {
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-medium);
+  color: var(--muted-foreground);
+  text-decoration: none;
+}
+nav#views a:hover {
+  background: var(--accent);
+}
+nav#views a.active {
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+
+/* Each view's three panes in a responsive grid: three columns when the
+ * viewport allows, collapsing on narrower windows. align-items:start keeps
+ * a short pane from stretching to its row partner's height. */
 main#workbench {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(30rem, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(24rem, 1fr));
   gap: var(--space-4);
   align-items: start;
   padding: var(--space-4);

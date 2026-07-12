@@ -42,6 +42,19 @@ type session struct {
 	// an editor and an agent submitting a document are the same operation.
 	schemaText string
 	rulesText  string
+
+	// derivedDB caches the last full Transform's output (doc/features/web-ui.md
+	// design constraint 2's snapshot pointer): base facts plus every
+	// rule-derived predicate, populated by evaluate() and consumed by
+	// evaluatedDB(). Transform returns the datalog.Database interface (not
+	// concretely *memory.Database), so this field is typed to match. nil
+	// means "no successful evaluation since the last rules/schema/fact
+	// change" — evaluatedDB() falls back to buildDB's EDB-only snapshot in
+	// that case. Every mutator that can change what evaluate() would
+	// produce (setSchema, setRules, setRulesWithQueries, loadProgram,
+	// loadData) clears it, so a stale Run's derived facts never survive an
+	// unapplied edit.
+	derivedDB datalog.Database
 }
 
 // setDataSource configures the session to load facts from a jsonfacts config.
@@ -78,6 +91,7 @@ func (s *session) loadData() error {
 	s.cfg = cfg
 	s.schemaText = string(data)
 	s.dataDB = db
+	s.derivedDB = nil
 	return nil
 }
 
@@ -192,6 +206,7 @@ func (s *session) setSchema(text string, format string, fsys fs.FS, confine conf
 	s.cfg = cfg
 	s.schemaText = text
 	s.dataDB = db
+	s.derivedDB = nil
 	return nil
 }
 
@@ -221,6 +236,7 @@ func (s *session) setRules(source string) error {
 	s.rules = ruleset.Rules
 	s.aggRules = ruleset.AggRules
 	s.rulesText = source
+	s.derivedDB = nil
 	return nil
 }
 
@@ -249,6 +265,7 @@ func (s *session) setRulesWithQueries(source string) ([]syntax.Query, error) {
 	s.rules = ruleset.Rules
 	s.aggRules = ruleset.AggRules
 	s.rulesText = source
+	s.derivedDB = nil
 	return ruleset.Queries, nil
 }
 
@@ -268,6 +285,7 @@ func (s *session) loadProgram(src string) ([]syntax.Query, error) {
 		}
 	}
 	s.aggRules = append(s.aggRules, ruleset.AggRules...)
+	s.derivedDB = nil
 	return ruleset.Queries, nil
 }
 
@@ -287,6 +305,41 @@ func (s *session) buildDB() (*memory.Database, error) {
 		}
 	}
 	return b.Build(), nil
+}
+
+// evaluate compiles the session's current ruleset and runs a full seminaive
+// Transform against buildDB()'s EDB, returning the resulting database: base
+// facts plus every rule-derived predicate. This is the same computation
+// runQuery performs per query (with its extra synthetic _q_ rule mixed in)
+// minus the synthetic head — callers that want a snapshot of "what does the
+// current ruleset actually derive," not just one query's answer, call this
+// instead and cache the result themselves (see derivedDB, evaluatedDB).
+func (s *session) evaluate(ctx context.Context) (datalog.Database, error) {
+	ruleset := syntax.Ruleset{Rules: s.rules, AggRules: s.aggRules}
+	t, err := seminaive.New(s.engineOpts...).Compile(ruleset)
+	if err != nil {
+		return nil, err
+	}
+	db, err := s.buildDB()
+	if err != nil {
+		return nil, err
+	}
+	return t.Transform(ctx, db)
+}
+
+// evaluatedDB returns derivedDB if a successful evaluate() has populated it
+// since the last rules/schema/fact change, otherwise falls back to
+// buildDB's EDB-only snapshot. Fact-browsing callers (the workbench's Fact
+// Browser) use this instead of buildDB directly so a predicate's "derived"
+// facts reflect the last Run rather than always reading as empty
+// (buildDB alone never runs rule evaluation — see doc/features/web-ui.md
+// design constraint 2's snapshot-pointer intent). REPL and MCP fact-listing
+// paths still call buildDB directly and are unaffected by this cache.
+func (s *session) evaluatedDB() (datalog.Database, error) {
+	if s.derivedDB != nil {
+		return s.derivedDB, nil
+	}
+	return s.buildDB()
 }
 
 // runQuery compiles the session's rules plus a synthetic _q_ rule for q,

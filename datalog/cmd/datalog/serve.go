@@ -249,7 +249,12 @@ type workbench struct {
 // full-page shell, static CSS, the /events subscription skeleton, and
 // Global Cancel are implemented completely in this wave.
 func (wb *workbench) routes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /{$}", wb.handleIndex)
+	// GET / has no natural pane composition of its own — it redirects to
+	// the Facts view, the authoring loop's usual starting point (raw data
+	// in, base facts out).
+	mux.HandleFunc("GET /{$}", wb.handleRoot)
+	mux.HandleFunc("GET /facts", wb.handleFactsView)
+	mux.HandleFunc("GET /rules", wb.handleRulesView)
 	mux.HandleFunc("GET /oat.css", wb.handleOatCSS)
 	mux.HandleFunc("GET /workbench.css", wb.handleWorkbenchCSS)
 	mux.HandleFunc("GET /events", wb.handleEvents)
@@ -278,25 +283,54 @@ func (wb *workbench) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /save/{doc}", wb.handleSave)
 }
 
-// handleIndex renders the full page shell with the four panes as
-// placeholder sections carrying stable element ids. Later waves patch
-// pane content over SSE; this is the only handler that renders a full
-// <html> document (doc/notes/datastar.md §1: full renders happen only on
-// browser navigation).
-func (wb *workbench) handleIndex(w http.ResponseWriter, r *http.Request) {
+// handleRoot redirects GET / to the Facts view, the authoring loop's usual
+// starting point (raw data in, base facts out).
+func (wb *workbench) handleRoot(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/facts", http.StatusFound)
+}
+
+// handleFactsView renders the Facts view (view/page.go's doc comment):
+// Data Browser | jsonfacts Editor | Fact Browser (base) — authoring how
+// base facts are extracted from JSONL. This and handleRulesView are the
+// only handlers that render a full <html> document (doc/notes/datastar.md
+// §1: full renders happen only on browser navigation).
+func (wb *workbench) handleFactsView(w http.ResponseWriter, r *http.Request) {
 	wb.h.mu.Lock()
 	schemaText := wb.h.sess.schemaText
-	rulesText := wb.h.sess.rulesText
 	wb.h.mu.Unlock()
 
 	sel, output := wb.renderJSONFactsSelection()
 
 	page := view.Page{
-		Title:           "datalog workbench",
-		DataBrowser:     view.DataBrowser(),
-		JSONFactsEditor: view.JSONFactsEditor(schemaText, sel, output),
-		RulesEditor:     view.RulesEditor(rulesText),
-		FactBrowser:     view.FactBrowser(),
+		Title:  "datalog workbench — facts",
+		Active: "facts",
+		Columns: []html.Content{
+			view.DataBrowser(),
+			view.JSONFactsEditor(schemaText, sel, output),
+			view.FactBrowser("base", "Base Facts"),
+		},
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	buf := html.Append(nil, page)
+	_, _ = w.Write(buf)
+}
+
+// handleRulesView renders the Rules view: Fact Browser (base) | Datalog
+// Editor | Fact Browser (derived) — authoring how rules derive facts from
+// base facts.
+func (wb *workbench) handleRulesView(w http.ResponseWriter, r *http.Request) {
+	wb.h.mu.Lock()
+	rulesText := wb.h.sess.rulesText
+	wb.h.mu.Unlock()
+
+	page := view.Page{
+		Title:  "datalog workbench — rules",
+		Active: "rules",
+		Columns: []html.Content{
+			view.FactBrowser("base", "Base Facts"),
+			view.RulesEditor(rulesText),
+			view.FactBrowser("derived", "Derived Facts"),
+		},
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	buf := html.Append(nil, page)
@@ -324,15 +358,15 @@ func (wb *workbench) handleCancel(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleEvents is the Fact Browser's long-lived subscription connection
+// handleEvents is the page's one long-lived subscription connection
 // (doc/notes/datastar.md §8), opened once per page load by the
-// data-init="@get('/events', ...)" div in view.FactBrowser. Ordering
-// matters: subscribe to the bus BEFORE sending the initial fragment, so a
-// Transform-completed notification that lands mid-render is queued rather
-// than lost (the subscribe-before-render trap the design doc calls out).
-// The initial predicate listing and per-event fragment rendering are wave
-// 8's job; this wave wires the connection lifecycle correctly so that wave
-// only has to fill in what gets rendered.
+// data-init="@get('/events', ...)" div in view.Page's body (both the
+// Facts and Rules views carry it, page-scoped rather than pane-scoped, so
+// a view with two Fact Browser panes still shares a single connection).
+// Ordering matters: subscribe to the bus BEFORE sending the initial
+// fragment, so a Transform-completed notification that lands mid-render is
+// queued rather than lost (the subscribe-before-render trap the design doc
+// calls out).
 func (wb *workbench) handleEvents(w http.ResponseWriter, r *http.Request) {
 	stream, err := datastar.RequestStream(w, r)
 	if err != nil {
@@ -342,13 +376,16 @@ func (wb *workbench) handleEvents(w http.ResponseWriter, r *http.Request) {
 	sub := wb.bus.Subscribe() // 1. attach to the bus FIRST
 	defer sub.Close()
 
-	// 2. then send current state — just the #predicates fragment, not the
-	// whole pane: re-emitting the pane's own data-init div here would
-	// re-trigger Datastar's subscribe-on-mount behavior.
+	// 2. then send current state — just the #predicates-{base,derived}
+	// fragments, not the whole pane: re-emitting the subscribe div itself
+	// here would re-trigger Datastar's subscribe-on-mount behavior. Both
+	// fragments go out regardless of which Fact Browser pane(s) the current
+	// view actually has on screen; Datastar morphs whichever id is present
+	// and no-ops on the other (view/page.go's doc comment).
 	wb.h.mu.Lock()
-	initial := renderPredicates(wb.h.sess)
+	base, derived := renderPredicates(wb.h.sess)
 	wb.h.mu.Unlock()
-	_ = stream.Emit(datastar.Elements(initial))
+	_ = stream.Emit(datastar.Batch(datastar.Elements(base), datastar.Elements(derived)))
 
 	for { // 3. drain anything that arrived between 1 and 2, plus all future events
 		select {

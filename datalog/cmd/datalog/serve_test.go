@@ -126,35 +126,63 @@ func TestHTTP_GoldenLoop(t *testing.T) {
 	srv := startTestServer(wb)
 	defer srv.Close()
 
-	// GET / contains the four pane ids and the preloaded schema/rules texts.
-	resp, err := http.Get(srv.URL + "/")
+	// GET / redirects to the Facts view.
+	resp, err := srv.Client().Get(srv.URL + "/")
 	if err != nil {
 		t.Fatalf("GET /: %v", err)
 	}
 	defer resp.Body.Close()
+	if got := resp.Request.URL.Path; got != "/facts" {
+		t.Errorf("GET /: expected redirect to /facts, landed on %s", got)
+	}
+
+	// The Facts view (Data Browser | jsonfacts Editor | Fact Browser base)
+	// carries the preloaded schema text; the Rules view (Fact Browser base |
+	// Datalog Editor | Fact Browser derived) carries the preloaded rules
+	// text.
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("reading GET / body: %v", err)
+		t.Fatalf("reading GET /facts body: %v", err)
 	}
-	page := string(body)
+	factsPage := string(body)
 
 	// html-go renders attribute values with single quotes (id='...'), not
 	// double quotes.
 	for _, id := range []string{
 		`id='pane-data-browser'`,
 		`id='pane-jsonfacts-editor'`,
-		`id='pane-rules-editor'`,
-		`id='pane-fact-browser'`,
+		`id='pane-fact-browser-base'`,
 	} {
-		if !strings.Contains(page, id) {
-			t.Errorf("GET /: missing pane %s", id)
+		if !strings.Contains(factsPage, id) {
+			t.Errorf("GET /facts: missing pane %s", id)
 		}
 	}
-	if !strings.Contains(page, "lateral_movement") {
-		t.Error("GET /: preloaded rules text not present in page (expected to contain \"lateral_movement\")")
+	if !strings.Contains(factsPage, "net_conn") {
+		t.Error("GET /facts: preloaded schema text not present in page (expected to contain \"net_conn\")")
 	}
-	if !strings.Contains(page, "net_conn") {
-		t.Error("GET /: preloaded schema text not present in page (expected to contain \"net_conn\")")
+
+	rulesResp, err := http.Get(srv.URL + "/rules")
+	if err != nil {
+		t.Fatalf("GET /rules: %v", err)
+	}
+	defer rulesResp.Body.Close()
+	rulesBody, err := io.ReadAll(rulesResp.Body)
+	if err != nil {
+		t.Fatalf("reading GET /rules body: %v", err)
+	}
+	rulesPage := string(rulesBody)
+
+	for _, id := range []string{
+		`id='pane-fact-browser-base'`,
+		`id='pane-rules-editor'`,
+		`id='pane-fact-browser-derived'`,
+	} {
+		if !strings.Contains(rulesPage, id) {
+			t.Errorf("GET /rules: missing pane %s", id)
+		}
+	}
+	if !strings.Contains(rulesPage, "lateral_movement") {
+		t.Error("GET /rules: preloaded rules text not present in page (expected to contain \"lateral_movement\")")
 	}
 
 	// POST /rules/run with the mordor rules plus the lateral_movement query

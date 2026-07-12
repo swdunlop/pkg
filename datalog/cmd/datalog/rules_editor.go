@@ -150,11 +150,47 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 		return // a newer Run superseded this one; discard our result
 	}
 
+	// Evaluate the applied ruleset once, unconditionally, and cache the
+	// result on the session (session.derivedDB) — this is what the Fact
+	// Browser's "derived" column reads (doc/features/web-ui.md design
+	// constraint 2). Previously nothing populated this: setRulesWithQueries
+	// only parses/compiles, and Transform only ever ran inside runQuery's
+	// per-query synthetic-rule evaluation, whose output was discarded after
+	// extracting that one query's rows — so the Fact Browser always showed
+	// derived predicates as empty regardless of what Run just computed. A
+	// failure here doesn't abort the request; queries below can still
+	// succeed or fail independently, exactly as before this change.
+	var evaluated datalog.Database
+	var evalErr error
+	evalErr = <-runRecovered(func() error {
+		wb.h.mu.Lock()
+		defer wb.h.mu.Unlock()
+		var err error
+		evaluated, err = wb.h.sess.evaluate(ctx)
+		if err == nil {
+			wb.h.sess.derivedDB = evaluated
+		}
+		return err
+	})
+	if ctx.Err() != nil {
+		_ = stream.Emit(datastar.Elements(statusFragment("evaluation timed out, results may be incomplete")))
+		return
+	}
+	if wb.gen.Stale(token) {
+		return
+	}
+
 	if len(queries) == 0 {
+		var blocks []queryResultBlock
+		if evalErr != nil {
+			blocks = append(blocks, queryResultBlock{Err: evalErr.Error()})
+		} else if capErr := checkFactCap(evaluated); capErr != nil {
+			blocks = append(blocks, queryResultBlock{Err: capErr.Error()})
+		}
 		wb.h.mu.Lock()
 		wb.publishSessionChanged()
 		wb.h.mu.Unlock()
-		_ = stream.Emit(datastar.Elements(statusFragment("")), datastar.Elements(resultsFragment(nil)))
+		_ = stream.Emit(datastar.Elements(statusFragment("")), datastar.Elements(resultsFragment(blocks)))
 		return
 	}
 
@@ -189,12 +225,12 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 		blocks = append(blocks, renderQueryResult(q.String(), vars, rows))
 	}
 
-	wb.h.mu.Lock()
-	if db, dbErr := wb.h.sess.buildDB(); dbErr == nil {
-		if capErr := checkFactCap(db); capErr != nil {
-			blocks = append(blocks, queryResultBlock{Err: capErr.Error()})
-		}
+	if evalErr != nil {
+		blocks = append(blocks, queryResultBlock{Err: evalErr.Error()})
+	} else if capErr := checkFactCap(evaluated); capErr != nil {
+		blocks = append(blocks, queryResultBlock{Err: capErr.Error()})
 	}
+	wb.h.mu.Lock()
 	wb.publishSessionChanged()
 	wb.h.mu.Unlock()
 

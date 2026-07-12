@@ -49,7 +49,7 @@ func (wb *workbench) handleFacts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	wb.h.mu.Lock()
-	db, dbErr := wb.h.sess.buildDB()
+	db, dbErr := wb.h.sess.evaluatedDB()
 	wb.h.mu.Unlock()
 	if dbErr != nil {
 		_ = stream.Emit(datastar.Elements(view.FactsTable(name, arity, nil, nil, offset, 0, false)))
@@ -128,20 +128,25 @@ func compositeDetail(c *datalog.Composite) html.Content {
 
 // publishSessionChanged is the one call every mutating handler (Apply, Run,
 // and — once mounted — agent set_schema/set_rules over /mcp) makes after a
-// Transform completes: it re-renders the Fact Browser's #predicates
-// fragment from current session state and fans it out over the bus, so
-// every open tab's subscription connection repaints (design constraint 3's
-// SSE patch-back). The fragment is rendered once here, at publish time, and
-// the same bytes go to every subscriber (doc/notes/datastar.md §8's
-// pre-rendered fan-out). Callers must hold wb.h.mu, since rendering reads
-// session state.
+// Transform completes: it re-renders both Fact Browser fragments
+// (#predicates-base and #predicates-derived) from current session state and
+// fans them out as one Batch over the bus, so every open tab's subscription
+// connection repaints whichever of the two panes it has on screen (design
+// constraint 3's SSE patch-back; page.go's body-level subscription div is
+// page-scoped, so a page with both panes — the Rules view — gets both
+// updates over its one connection). The fragments are rendered once here,
+// at publish time, and the same bytes go to every subscriber
+// (doc/notes/datastar.md §8's pre-rendered fan-out). Callers must hold
+// wb.h.mu, since rendering reads session state.
 func (wb *workbench) publishSessionChanged() {
-	wb.bus.Publish(datastar.Elements(renderPredicates(wb.h.sess)))
+	base, derived := renderPredicates(wb.h.sess)
+	wb.bus.Publish(datastar.Batch(datastar.Elements(base), datastar.Elements(derived)))
 }
 
-// renderPredicates builds the #predicates fragment from session state.
-// Callers must hold wb.h.mu (or otherwise ensure exclusive access to sess),
-// since it reads facts/rules/aggRules/dataDB directly.
+// renderPredicates builds the #predicates-base and #predicates-derived
+// fragments from session state. Callers must hold wb.h.mu (or otherwise
+// ensure exclusive access to sess), since it reads facts/rules/aggRules/
+// dataDB directly.
 //
 // EDB/IDB labeling rule: a predicate/arity pair is "derived" (IDB) if any
 // loaded rule or aggregate rule has it as a head; otherwise "base" (EDB). A
@@ -151,14 +156,14 @@ func (wb *workbench) publishSessionChanged() {
 // since the point of the label is "does a rule explain this data," and if a
 // rule exists for it the answer is yes regardless of what else populated
 // the same predicate/arity.
-func renderPredicates(sess *session) html.Content {
+func renderPredicates(sess *session) (base, derived html.Content) {
 	type key struct {
 		name  string
 		arity int
 	}
 	counts := map[key]int{}
 
-	db, err := sess.buildDB()
+	db, err := sess.evaluatedDB()
 	if err == nil {
 		for name, arity := range db.Predicates() {
 			k := key{name, arity}
@@ -170,37 +175,46 @@ func renderPredicates(sess *session) html.Content {
 		}
 	}
 
-	derived := map[key]bool{}
+	isDerived := map[key]bool{}
 	for _, rule := range sess.rules {
 		k := key{rule.Head.Pred, len(rule.Head.Terms)}
-		derived[k] = true
+		isDerived[k] = true
 		if _, ok := counts[k]; !ok {
 			counts[k] = 0
 		}
 	}
 	for _, ar := range sess.aggRules {
 		k := key{ar.Head.Pred, len(ar.Head.Terms)}
-		derived[k] = true
+		isDerived[k] = true
 		if _, ok := counts[k]; !ok {
 			counts[k] = 0
 		}
 	}
 
-	entries := make([]view.PredicateEntry, 0, len(counts))
+	var baseEntries, derivedEntries []view.PredicateEntry
 	for k, n := range counts {
-		entries = append(entries, view.PredicateEntry{
+		e := view.PredicateEntry{
 			Name:    k.name,
 			Arity:   k.arity,
 			Facts:   n,
-			Derived: derived[k],
+			Derived: isDerived[k],
+		}
+		if e.Derived {
+			derivedEntries = append(derivedEntries, e)
+		} else {
+			baseEntries = append(baseEntries, e)
+		}
+	}
+	byNameArity := func(entries []view.PredicateEntry) {
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i].Name != entries[j].Name {
+				return entries[i].Name < entries[j].Name
+			}
+			return entries[i].Arity < entries[j].Arity
 		})
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].Name != entries[j].Name {
-			return entries[i].Name < entries[j].Name
-		}
-		return entries[i].Arity < entries[j].Arity
-	})
+	byNameArity(baseEntries)
+	byNameArity(derivedEntries)
 
-	return view.Predicates(entries)
+	return view.Predicates("base", baseEntries), view.Predicates("derived", derivedEntries)
 }

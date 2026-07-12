@@ -7,26 +7,27 @@ import (
 	"github.com/swdunlop/html-go/tag"
 )
 
-// FactBrowser renders the Fact Browser pane shell: a predicate list (EDB/IDB
-// labeled) that expands into paged facts. This pane owns the page's one
-// long-lived subscription connection (doc/notes/datastar.md §8): the
-// data-init div opens /events on page load with openWhenHidden so agent-
-// triggered Transforms still patch the page when the tab is backgrounded,
-// and requestCancellation: 'disabled' so the subscription survives
-// Datastar's default abort-on-new-request behavior.
+// FactBrowser renders a Fact Browser pane shell: a predicate list (EDB or
+// IDB, per kind) that expands into paged facts. kind is "base" or
+// "derived", selecting which half of publishSessionChanged's fan-out this
+// pane's #predicates-{kind} div responds to (page.go's body-level div owns
+// the actual /events subscription connection now — a page can hold two
+// Fact Browser panes, e.g. the Rules view's base+derived pair, and they
+// share one connection rather than opening two).
 //
-//   - #predicates    — predicate list, patched by the /events subscription
-//     and by GET /facts/{predicate}/{arity} row expansion
-func FactBrowser() html.Content {
-	subscribe := tag.New("div").
-		Set("data-init", "@get('/events', {openWhenHidden: true, requestCancellation: 'disabled'})")
-
-	return PaneSection.Set("id", "pane-fact-browser").Add(
-		PaneHeading.Add(html.Text("Fact Browser")),
-		subscribe,
-		tag.New("div#predicates"),
+//   - #predicates-{kind}    — predicate list, patched by the /events
+//     subscription and by GET /facts/{predicate}/{arity} row expansion
+func FactBrowser(kind, heading string) html.Content {
+	return PaneSection.Set("id", "pane-fact-browser-"+kind).Add(
+		PaneHeading.Add(html.Text(heading)),
+		tag.New("div#"+predicatesID(kind)),
 	)
 }
+
+// predicatesID names the predicate-list div for a given kind ("base" or
+// "derived"), shared between FactBrowser and the handler's Predicates
+// fragment so both agree on the id without duplicating the naming scheme.
+func predicatesID(kind string) string { return "predicates-" + kind }
 
 // PredicateEntry is one row of the Fact Browser's predicate listing: a
 // predicate/arity pair, its fact count, and whether it is base (EDB, present
@@ -38,13 +39,13 @@ type PredicateEntry struct {
 	Derived bool // true = IDB (has rules deriving it); false = base (EDB)
 }
 
-// Predicates renders the #predicates fragment: one expandable entry per
-// predicate/arity pair, sorted by the caller. Clicking an entry loads its
-// facts via GET /facts/{name}/{arity} (design doc's literal wiring:
+// Predicates renders the #predicates-{kind} fragment: one expandable entry
+// per predicate/arity pair, sorted by the caller. Clicking an entry loads
+// its facts via GET /facts/{name}/{arity} (design doc's literal wiring:
 // data-on:click="@get('/facts/<name>/<arity>')"), which replaces the
 // entry's (initially empty) facts container with the first page.
-func Predicates(entries []PredicateEntry) html.Content {
-	return tag.New("div#predicates",
+func Predicates(kind string, entries []PredicateEntry) html.Content {
+	return tag.New("div#"+predicatesID(kind),
 		tag.New("h3", html.Text("Predicates")),
 		html.Map(entries, predicateEntry),
 	)
