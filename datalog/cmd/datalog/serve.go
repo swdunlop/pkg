@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 
+	"sync"
+
 	html "github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/datastar"
 	"github.com/swdunlop/html-go/tag"
@@ -90,6 +92,17 @@ type workbench struct {
 	bus  *bus
 	jobs *jobs
 	gen  generation
+
+	// selMu guards the jsonfacts Editor's evaluation-target selection below.
+	// This is a separate mutex from h.mu (the session mutex): selecting a
+	// row is not a session mutation, and holding h.mu across a Data Browser
+	// request would serialize pure reads against the mutation pipeline for
+	// no reason.
+	selMu     sync.Mutex
+	selFile   string // source file the selected row came from
+	selRow    int    // 0-based row (line) index within selFile
+	selRecord string // raw JSONL line of the selected record
+	selValid  bool   // whether a selection has been made yet
 }
 
 // routes registers the full route table on mux using Go 1.22+ method+
@@ -132,11 +145,18 @@ func (wb *workbench) routes(mux *http.ServeMux) {
 // <html> document (doc/notes/datastar.md §1: full renders happen only on
 // browser navigation).
 func (wb *workbench) handleIndex(w http.ResponseWriter, r *http.Request) {
+	wb.h.mu.Lock()
+	schemaText := wb.h.sess.schemaText
+	rulesText := wb.h.sess.rulesText
+	wb.h.mu.Unlock()
+
+	sel, output := wb.renderJSONFactsSelection()
+
 	page := view.Page{
 		Title:           "datalog workbench",
 		DataBrowser:     view.DataBrowser(),
-		JSONFactsEditor: view.JSONFactsEditor(),
-		RulesEditor:     view.RulesEditor(),
+		JSONFactsEditor: view.JSONFactsEditor(schemaText, sel, output),
+		RulesEditor:     view.RulesEditor(rulesText),
 		FactBrowser:     view.FactBrowser(),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -178,9 +198,11 @@ func (wb *workbench) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	// 2. then send current state — just the #predicates fragment, not the
 	// whole pane: re-emitting the pane's own data-init div here would
-	// re-trigger Datastar's subscribe-on-mount behavior. Wave 8 replaces
-	// this placeholder with the real predicate listing.
-	_ = stream.Emit(datastar.Elements(stubFragment("predicates")))
+	// re-trigger Datastar's subscribe-on-mount behavior.
+	wb.h.mu.Lock()
+	initial := renderPredicates(wb.h.sess)
+	wb.h.mu.Unlock()
+	_ = stream.Emit(datastar.Elements(initial))
 
 	for { // 3. drain anything that arrived between 1 and 2, plus all future events
 		select {

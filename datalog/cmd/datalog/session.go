@@ -224,6 +224,34 @@ func (s *session) setRules(source string) error {
 	return nil
 }
 
+// setRulesWithQueries replaces the session's Datalog program atomically,
+// exactly like setRules (trial Compile of the parsed rules; rules/aggRules/
+// rulesText are replaced wholesale only if that Compile succeeds, and
+// rulesText captures the full original source — including any embedded
+// queries — since the workbench editor's content is the canonical document),
+// but returns the embedded `?` queries to the caller instead of rejecting
+// them. The MCP set_rules tool keeps the stricter no-embedded-queries rule
+// (setRules above): a model is expected to use the query tool instead of
+// embedding one in a set_rules document. The workbench's Datalog Editor Run
+// action accepts embedded queries because the editor follows the REPL's
+// `.`/`?` convention, so a pasted `.dl` file with trailing queries should
+// just work. On any error, session state is unchanged.
+func (s *session) setRulesWithQueries(source string) ([]syntax.Query, error) {
+	ruleset, err := syntax.ParseAll(source)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := seminaive.New(s.engineOpts...).Compile(ruleset); err != nil {
+		return nil, err
+	}
+
+	s.rules = ruleset.Rules
+	s.aggRules = ruleset.AggRules
+	s.rulesText = source
+	return ruleset.Queries, nil
+}
+
 // loadProgram parses a Datalog source string containing multiple statements,
 // adding facts and rules to the session. Queries found in the source are
 // returned for the caller to execute and present.
