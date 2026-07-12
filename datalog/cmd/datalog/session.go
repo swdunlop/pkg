@@ -344,12 +344,56 @@ func (s *session) evaluatedDB() (datalog.Database, error) {
 	return s.buildDB()
 }
 
+// querySnapshot captures the session state one query needs, so the
+// expensive Compile+Transform can run without any lock held. All fields
+// are safe to read after the owning lock is released: rules/aggRules/
+// dataDB are only ever replaced wholesale by session mutators (loadProgram
+// appends, which never rewrites elements below the snapshotted length),
+// engineOpts is fixed at construction, and a built memory.Database is
+// never mutated in place (Extend returns a new one). A query therefore
+// sees the session as of snapshot time; mutations landing mid-query apply
+// to the next query, which is the only coherent ordering for the race
+// anyway.
+type querySnapshot struct {
+	rules      []syntax.Rule
+	aggRules   []syntax.AggregateRule
+	engineOpts []seminaive.Option
+	db         *memory.Database
+}
+
+// snapshotForQuery captures the state runQuery reads. Callers that share
+// the session across goroutines must hold their lock around this call
+// (and only this call); single-threaded callers may use session.runQuery
+// directly.
+func (s *session) snapshotForQuery() (querySnapshot, error) {
+	db, err := s.buildDB()
+	if err != nil {
+		return querySnapshot{}, err
+	}
+	return querySnapshot{
+		rules:      s.rules,
+		aggRules:   s.aggRules,
+		engineOpts: s.engineOpts,
+		db:         db,
+	}, nil
+}
+
 // runQuery compiles the session's rules plus a synthetic _q_ rule for q,
 // evaluates against the current database, and returns the result rows, the
 // query's variable names, and per-stratum evaluation stats. Sorting and
 // presentation are left to the caller. Stats are non-nil only when the
 // Transform ran to completion.
 func (s *session) runQuery(ctx context.Context, q *syntax.Query) (rows [][]datalog.Constant, vars []string, stats []seminaive.StratumStats, err error) {
+	snap, err := s.snapshotForQuery()
+	if err != nil {
+		return nil, extractNamedVars(q.Body), nil, err
+	}
+	return snap.runQuery(ctx, q)
+}
+
+// runQuery is runQuery's evaluation half: everything after the snapshot,
+// safe to run with no lock held.
+func (qs querySnapshot) runQuery(ctx context.Context, q *syntax.Query) (rows [][]datalog.Constant, vars []string, stats []seminaive.StratumStats, err error) {
 	vars = extractNamedVars(q.Body)
 
 	// Build synthetic rule: _q_(Var1, ..., VarN) :- body.
@@ -362,23 +406,19 @@ func (s *session) runQuery(ctx context.Context, q *syntax.Query) (rows [][]datal
 		Body: q.Body,
 	}
 
-	allRules := make([]syntax.Rule, len(s.rules)+1)
-	copy(allRules, s.rules)
-	allRules[len(s.rules)] = synth
+	allRules := make([]syntax.Rule, len(qs.rules)+1)
+	copy(allRules, qs.rules)
+	allRules[len(qs.rules)] = synth
 
-	ruleset := syntax.Ruleset{Rules: allRules, AggRules: s.aggRules}
-	opts := append(s.engineOpts[:len(s.engineOpts):len(s.engineOpts)],
+	ruleset := syntax.Ruleset{Rules: allRules, AggRules: qs.aggRules}
+	opts := append(qs.engineOpts[:len(qs.engineOpts):len(qs.engineOpts)],
 		seminaive.WithProfile(func(ss []seminaive.StratumStats) { stats = ss }))
 	t, err := seminaive.New(opts...).Compile(ruleset)
 	if err != nil {
 		return nil, vars, nil, err
 	}
 
-	db, err := s.buildDB()
-	if err != nil {
-		return nil, vars, nil, err
-	}
-	output, err := t.Transform(ctx, db)
+	output, err := t.Transform(ctx, qs.db)
 	if err != nil {
 		return nil, vars, stats, err
 	}

@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"iter"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"swdunlop.dev/pkg/datalog/seminaive"
 )
 
 // -- test helpers ---------------------------------------------------------
@@ -490,6 +494,64 @@ func TestQuery_CancelledContext(t *testing.T) {
 	}
 }
 
+// TestQuery_DoesNotHoldLockDuringTransform pins the snapshot narrowing:
+// query holds h.mu only while snapshotting session state, so a Transform
+// that runs for a long time must leave the lock free for other tools and
+// the workbench panes. A blocking external predicate parks a query mid-
+// Transform deterministically; the test then acquires h.mu (which would
+// deadlock under the old whole-call locking) before releasing the query.
+func TestQuery_DoesNotHoldLockDuringTransform(t *testing.T) {
+	h, done := newTestHandlers(t, t.TempDir())
+	defer done()
+
+	inTransform := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	h.sess.engineOpts = []seminaive.Option{
+		seminaive.WithExternal("slow", 1, func(ctx context.Context, _ seminaive.Bindings) iter.Seq[[]any] {
+			return func(yield func([]any) bool) {
+				once.Do(func() { close(inTransform) })
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+				yield([]any{"done"})
+			}
+		}),
+	}
+	if _, err := h.setRules(setRulesInput{Source: `r(X) :- slow(X).`}); err != nil {
+		t.Fatalf("set_rules: %v", err)
+	}
+
+	queryDone := make(chan error, 1)
+	go func() {
+		out, err := h.query(context.Background(), queryInput{Query: `r(X)?`})
+		if err == nil && out.Total != 1 {
+			err = fmt.Errorf("query: got %d rows, want 1", out.Total)
+		}
+		queryDone <- err
+	}()
+
+	<-inTransform // the query is now inside Transform
+
+	lockFree := make(chan struct{})
+	go func() {
+		h.mu.Lock()
+		h.mu.Unlock() //nolint:staticcheck // probe: acquire proves the lock is free
+		close(lockFree)
+	}()
+	select {
+	case <-lockFree:
+	case <-time.After(5 * time.Second):
+		t.Fatal("h.mu is held while the query's Transform runs: the snapshot narrowing has regressed")
+	}
+
+	close(release)
+	if err := <-queryDone; err != nil {
+		t.Fatalf("query: %v", err)
+	}
+}
+
 // -- list_predicates / sample_facts ----------------------------------------
 
 func TestSampleFacts_Limit(t *testing.T) {
@@ -694,8 +756,10 @@ func TestSampleInput_EscapeRejected(t *testing.T) {
 // -- concurrency smoke test -------------------------------------------------
 
 // TestConcurrentHandlerCalls drives several handler methods from goroutines
-// concurrently, serialized by the same mutex registerTools uses around every
-// call, to catch data races (run with -race) in session/database sharing.
+// concurrently, locked exactly as registerTools wires them — query manages
+// h.mu itself (snapshot-only) and so runs its Transform genuinely in
+// parallel with the locked tools — to catch data races (run with -race) in
+// session/database sharing.
 func TestConcurrentHandlerCalls(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 30)
@@ -720,9 +784,19 @@ func TestConcurrentHandlerCalls(t *testing.T) {
 		}
 	}
 
+	// query takes h.mu itself (only around its state snapshot), so it is
+	// called bare — wrapping it in call() would self-deadlock, just like
+	// double-locking in registerTools would.
+	callUnlocked := func(fn func() error) {
+		defer wg.Done()
+		if err := fn(); err != nil {
+			errs <- err
+		}
+	}
+
 	for i := 0; i < 8; i++ {
 		wg.Add(4)
-		go call(func() error {
+		go callUnlocked(func() error {
 			_, err := h.query(context.Background(), queryInput{Query: `foo(X)?`})
 			return err
 		})

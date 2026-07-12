@@ -211,10 +211,16 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 		var rows [][]datalog.Constant
 		var vars []string
 		qErr := <-runRecovered(func() error {
+			// Hold h.mu only for the snapshot; the Transform below can
+			// run up to the eval timeout and must not freeze the other
+			// panes or the MCP tools sharing this mutex.
 			wb.h.mu.Lock()
-			defer wb.h.mu.Unlock()
-			var err error
-			rows, vars, _, err = wb.h.sess.runQuery(ctx, &q)
+			snap, err := wb.h.sess.snapshotForQuery()
+			wb.h.mu.Unlock()
+			if err != nil {
+				return err
+			}
+			rows, vars, _, err = snap.runQuery(ctx, &q)
 			return err
 		})
 

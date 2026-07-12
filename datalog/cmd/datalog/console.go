@@ -202,9 +202,16 @@ func (wb *workbench) handleConsoleQuery(w http.ResponseWriter, r *http.Request) 
 		q := ruleset.Queries[i]
 		var blk queryResultBlock
 		qErr := <-runRecovered(func() error {
+			// Hold h.mu only for the snapshot; the Transform below can
+			// run up to evalTimeout and must not freeze the other panes
+			// or the MCP tools sharing this mutex.
 			wb.h.mu.Lock()
-			defer wb.h.mu.Unlock()
-			rs, vars, _, err := wb.h.sess.runQuery(ctx, &q)
+			snap, err := wb.h.sess.snapshotForQuery()
+			wb.h.mu.Unlock()
+			if err != nil {
+				return err
+			}
+			rs, vars, _, err := snap.runQuery(ctx, &q)
 			if err == nil {
 				blk = renderQueryResult(q.String(), vars, rs)
 			}

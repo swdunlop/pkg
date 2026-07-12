@@ -209,9 +209,10 @@ func (h *mcpHandlers) registerTools(srv *server.MCPServer) {
 			mcp.WithDescription(mcpQueryDescription),
 			mcp.WithInputSchema[queryInput](),
 		),
+		// No h.mu here: query manages the lock itself, holding it only for
+		// the state snapshot so a long-running Transform does not freeze
+		// the other tools or the workbench panes that share this mutex.
 		mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in queryInput) (queryOutput, error) {
-			h.mu.Lock()
-			defer h.mu.Unlock()
 			return h.query(ctx, in)
 		}),
 	)
@@ -397,7 +398,19 @@ func (h *mcpHandlers) query(ctx context.Context, in queryInput) (queryOutput, er
 	ctx, cancel := context.WithTimeout(ctx, h.timeout)
 	defer cancel()
 
-	rows, vars, stats, err := h.sess.runQuery(ctx, q)
+	// Snapshot under the lock, evaluate outside it: Compile+Transform can
+	// run up to h.timeout, and holding h.mu across it would block every
+	// other tool call and workbench pane for the duration. The query sees
+	// the session as of this point; a set_rules/set_schema landing
+	// mid-evaluation applies to the next query.
+	h.mu.Lock()
+	snap, err := h.sess.snapshotForQuery()
+	h.mu.Unlock()
+	if err != nil {
+		return queryOutput{}, err
+	}
+
+	rows, vars, stats, err := snap.runQuery(ctx, q)
 	if err != nil {
 		return queryOutput{}, err
 	}
