@@ -596,6 +596,7 @@ datalog mcp -d ./data [-c schema.yaml] [rules.dl ...]
 | `-c` | Optionally preload an operator-provided schema; the model may replace it with `set_schema`. |
 | positional `.dl` files | Preload rules, becoming the initial rules document, same as the REPL. |
 | `--timeout` | Per-query evaluation timeout (default 60s). |
+| `--proxy <url>` | Instead of serving a local session, bridge stdio to a remote `datalog serve`'s `/mcp` — see "`datalog mcp --proxy`: the stdio shim" under Web Workbench below. All other flags above are ignored when `--proxy` is given. |
 
 The server exposes six tools, meant to be driven in a loop:
 
@@ -640,13 +641,15 @@ queries, and inspect the fact database, all as one page kept in sync over
 SSE.
 
 ```
-datalog serve -d ./data [-c schema.yaml] [--listen 127.0.0.1:8080] [--mcp-token TOKEN] [rules.dl ...]
+datalog serve -d ./data [-c schema.yaml] [--listen 127.0.0.1:8080] [--mcp-token TOKEN] \
+    [--model anthropic/claude-sonnet-5] [--agent 'npx @agentclientprotocol/claude-agent-acp'] \
+    [rules.dl ...]
 ```
 
 Flags must come **before** the positional rules file(s) — stdlib's
 `flag` package stops parsing at the first non-flag argument, so
 `datalog serve rules.dl -d ./data` will try to parse `-d` as a second
-rules file. Put `-d`/`-c`/`--listen`/`--mcp-token` first.
+rules file. Put every flag first.
 
 | Flag | Description |
 |------|-------------|
@@ -655,6 +658,9 @@ rules file. Put `-d`/`-c`/`--listen`/`--mcp-token` first.
 | positional `.dl` files | Preload rules; the *first* one is also the Save target for the Datalog Editor pane. |
 | `--listen` | Address to listen on (default `127.0.0.1:8080` — loopback only). |
 | `--mcp-token` | Bearer token required on `/mcp`. Omit it and the server generates one and prints `datalog serve: /mcp bearer token: <token>` to stderr at startup. |
+| `--model` | Embedded agent model, kit-style (e.g. `anthropic/claude-sonnet-5`, `openai/<alias>`); empty defers to `KIT_MODEL` / `~/.kit.yml`. Ignored when `--agent` is given. |
+| `--provider-url` / `--provider-api-key` | Override the embedded agent's model provider base URL / API key; empty defers to the provider's usual environment variable (e.g. `ANTHROPIC_API_KEY`). Ignored when `--agent` is given. |
+| `--agent` | Replace the embedded agent with an external ACP agent command, split shell-style — see "Agent" below. |
 
 The four panes, one sentence each:
 
@@ -672,6 +678,51 @@ The four panes, one sentence each:
   counts, paginated facts, and one long-lived SSE subscription that
   repaints it whenever *anything* changes the session — a human's Apply/Run
   or an agent's `set_schema`/`set_rules` over `/mcp`.
+
+**Agent.** The console drawer's Agent tab holds a chat pane wired to the
+same session the other panes edit: it converses with an agent that manipulates
+schema, rules, and queries through the same six MCP tools a human or an
+external client would use, and every mutation lands live in the panes above.
+
+By default the agent is `mark3labs/kit`, embedded in-process: no
+subprocess, no socket, no token — kit registers the session's MCP tools
+directly and its own built-in coding tools (file edit, shell) are disabled,
+so its only lever on the workspace is the same tool surface `/mcp` exposes.
+Pick a model with `--model`, `KIT_MODEL`, or `~/.kit.yml`; provider API keys
+come from the provider's usual environment variable (`ANTHROPIC_API_KEY`,
+...). With no resolvable model, serve still runs — the chat pane just
+explains how to configure one.
+
+`--agent` swaps the embedded agent for an external one speaking the
+[Agent Client Protocol](https://agentclientprotocol.com): datalog spawns it
+as a subprocess and drives it exactly the way an ACP-hosting editor would.
+Claude Code's ACP adapter and Gemini CLI (which speaks ACP natively) both
+work:
+
+```
+datalog serve -d ./data --agent 'npx @agentclientprotocol/claude-agent-acp'
+datalog serve -d ./data --agent 'gemini --experimental-acp'
+```
+
+At `initialize`, datalog declines the client-side `fs` and `terminal`
+capabilities, so the agent has no direct file or shell access through the
+ACP connection — its only path to the workspace is the session's MCP tools,
+handed to it at `session/new` either over the `/mcp` HTTP mount (agents that
+advertise `mcpCapabilities.http`) or, for stdio-only agents, via the
+`datalog mcp --proxy` shim below, spawned automatically with the bearer
+token in its environment.
+
+**Capability refusal is not a sandbox.** Declining `fs`/`terminal` at
+`initialize` constrains what the *workbench* offers the agent over ACP — it
+does nothing to the *process*. An external agent subprocess (Claude Code,
+Gemini CLI, anything else you point `--agent` at) runs with your own user
+privileges and carries whatever built-in tools it ships with — file access,
+shell execution — unless *you* configure it otherwise, entirely outside
+datalog's control. If you would not run that agent unsupervised on this
+machine, `--agent` does not change that calculus; it only adds a chat pane
+in front of it. The embedded kit default does not have this gap: with its
+built-in tools disabled, its tool surface is exactly the session's MCP
+tools, nothing more.
 
 **Save/git.** Nothing touches disk until you click **Save** on the
 jsonfacts or Datalog Editor pane. Save writes the session's *canonical*
@@ -692,7 +743,26 @@ mode), sharing the exact same session and mutex the panes use — an agent's
 successful agent-side `set_schema`/`set_rules` repaints every open browser
 tab over its `/events` subscription. Requests need
 `Authorization: Bearer <token>`, checked with a constant-time comparison;
-anything else gets a 401.
+anything else gets a 401. This mount is not just for the embedded/`--agent`
+chat pane — **any** MCP client that speaks streamable HTTP can point at it
+(the token is printed at startup, or fixed with `--mcp-token`) and reach the
+live workbench session the same way.
+
+**`datalog mcp --proxy`: the stdio shim.** ACP only requires an agent to
+support stdio MCP servers; HTTP is an optional capability datalog's
+`--agent` handshake checks for and falls back from automatically (see
+"Agent" above). The same shim is useful standalone for any stdio-only MCP
+client that wants the live session:
+
+```
+DATALOG_MCP_TOKEN=<token> datalog mcp --proxy http://127.0.0.1:8080/mcp
+```
+
+It bridges stdio JSON-RPC to `/mcp`'s streamable HTTP one tool call at a
+time — `tools/list` and `tools/call` only; resources and prompts have no
+analog on `/mcp` today, so there is nothing else to proxy. The token is read
+from `DATALOG_MCP_TOKEN`, never a flag: flag values show up in `ps` and
+other process listings on the same host, which a bearer token should not.
 
 **Loopback/Tailscale posture.** `datalog serve` is single-user,
 single-tenant, and meant to stay that way: no auth beyond the `/mcp`
