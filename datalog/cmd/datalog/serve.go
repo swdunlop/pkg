@@ -251,6 +251,7 @@ type workbench struct {
 func (wb *workbench) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /{$}", wb.handleIndex)
 	mux.HandleFunc("GET /oat.css", wb.handleOatCSS)
+	mux.HandleFunc("GET /workbench.css", wb.handleWorkbenchCSS)
 	mux.HandleFunc("GET /events", wb.handleEvents)
 
 	// Data Browser (view/data_browser.go stubs; wave 5 fills in).
@@ -306,6 +307,13 @@ func (wb *workbench) handleIndex(w http.ResponseWriter, r *http.Request) {
 func (wb *workbench) handleOatCSS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/css; charset=utf-8")
 	_, _ = w.Write(view.OatCSS)
+}
+
+// handleWorkbenchCSS serves the workbench's own chrome layer, linked after
+// oat.css in the page head (see view/page.go's workbenchTag).
+func (wb *workbench) handleWorkbenchCSS(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	_, _ = w.Write(view.WorkbenchCSS)
 }
 
 // handleCancel is the Global Cancel emergency brake: fires every in-flight

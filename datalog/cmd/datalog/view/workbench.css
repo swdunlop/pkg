@@ -1,0 +1,193 @@
+/* Workbench chrome, layered on the oat.css base the way medea's style.css
+ * layers on the same file: oat provides theme tokens (--card, --border,
+ * --space-*, light/dark via color-scheme) and element defaults; this file
+ * provides the layout and pane styling oat deliberately doesn't. These rules
+ * are unlayered, so they win over oat's @layer rules at equal specificity.
+ * Only oat theme variables are used for color/spacing, so light and dark
+ * schemes both work without a second palette. */
+
+/* Header bar: title left, Global Cancel right. */
+header#chrome {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-2) var(--space-4);
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+}
+header#chrome h1 {
+  margin: 0;
+  font-size: var(--text-4);
+}
+
+/* Four panes in a responsive grid: two columns when the viewport allows,
+ * collapsing to one on narrow windows. align-items:start keeps a short pane
+ * from stretching to its row partner's height. */
+main#workbench {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(30rem, 1fr));
+  gap: var(--space-4);
+  align-items: start;
+  padding: var(--space-4);
+}
+
+section.pane {
+  background: var(--card);
+  color: var(--card-foreground);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-large);
+  padding: var(--space-4);
+  min-width: 0; /* let grid tracks shrink; wide tables scroll instead */
+}
+section.pane > h2 {
+  margin: 0 0 var(--space-3);
+  font-size: var(--text-5);
+  color: var(--muted-foreground);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* Editor textareas: real working height, monospace, resizable. */
+textarea.editor {
+  width: 100%;
+  min-height: 18rem;
+  font-family: var(--font-mono);
+  font-size: var(--text-7);
+  line-height: var(--leading-normal);
+  resize: vertical;
+  tab-size: 4;
+}
+
+/* Action rows (Apply/Save, Run/Save): spaced, not touching. */
+div.actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-block: var(--space-3);
+}
+
+/* In-form error lists (doc/notes/datastar.md §4). The :empty rule hiding
+ * these when clear lives inline in page.go. */
+ul.errors {
+  list-style: none;
+  padding: var(--space-2) var(--space-3);
+  margin-block: var(--space-3);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-medium);
+  color: var(--danger);
+  font-family: var(--font-mono);
+  font-size: var(--text-7);
+}
+
+/* Run's streamed progress line. */
+div.status {
+  margin-block: var(--space-3);
+  color: var(--muted-foreground);
+  font-size: var(--text-7);
+}
+
+/* Tables (Data Browser rows, query results, fact pages): full width, but
+ * scroll horizontally inside the pane rather than blowing out the grid. */
+section.pane table {
+  width: 100%;
+  display: block;
+  overflow-x: auto;
+  font-size: var(--text-7);
+  margin-block: var(--space-3);
+}
+section.pane td {
+  overflow-wrap: anywhere;
+}
+/* Raw JSONL previews in the Data Browser get long; keep rows readable. */
+#data-table td {
+  max-width: 40rem;
+  font-family: var(--font-mono);
+}
+
+/* Selected-row / extraction-output panels in the jsonfacts Editor. */
+#jsonfacts-row pre,
+#jsonfacts-output pre,
+section.pane details pre {
+  max-height: 14rem;
+  overflow: auto;
+  font-size: var(--text-7);
+  margin-block: var(--space-2);
+}
+
+/* Data Browser file list. */
+#data-files ul {
+  list-style: none;
+  padding: 0;
+  margin-block: var(--space-2);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* Fact Browser predicate rows: clickable, hover feedback, badge + count. */
+.predicate-row {
+  cursor: pointer;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-small);
+}
+.predicate-row:hover {
+  background: var(--accent);
+}
+.predicate-row .badge {
+  font-size: var(--text-7);
+  color: var(--muted-foreground);
+  background: var(--faint);
+  border-radius: var(--radius-full);
+  padding: 0 var(--space-2);
+  margin-inline-start: var(--space-1);
+}
+.predicate-row .count {
+  font-size: var(--text-7);
+  color: var(--muted-foreground);
+}
+.predicate-entry {
+  border-bottom: 1px solid var(--border);
+}
+.predicate-entry:last-child {
+  border-bottom: none;
+}
+
+/* Query result blocks in the Datalog Editor. */
+.result-block {
+  margin-block: var(--space-3);
+}
+.result-block p.query-text {
+  font-family: var(--font-mono);
+  font-size: var(--text-7);
+  color: var(--muted-foreground);
+  margin-block-end: var(--space-1);
+}
+.result-block p.truncated {
+  font-size: var(--text-7);
+  color: var(--muted-foreground);
+}
+
+/* Toast: system-level notices (Save outcomes), pinned bottom-right. The
+ * #toast:empty rule in page.go hides it between messages. */
+#toast {
+  position: fixed;
+  bottom: var(--space-4);
+  right: var(--space-4);
+  z-index: var(--z-modal);
+  max-width: 24rem;
+  padding: var(--space-3) var(--space-4);
+  background: var(--card);
+  color: var(--card-foreground);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-medium);
+  box-shadow: var(--shadow-large);
+}
+#toast.error {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+/* Muted placeholder text ("No row selected yet…"). */
+p.text-light {
+  color: var(--muted-foreground);
+}

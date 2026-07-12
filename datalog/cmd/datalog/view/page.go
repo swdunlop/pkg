@@ -49,6 +49,7 @@ func head(p Page) html.Content {
 		tag.New("meta[name=viewport][content=width=device-width, initial-scale=1]"),
 		tag.New("title", html.Text(title)),
 		oatTag,
+		workbenchTag,
 		tag.New("style", html.HTML(emptyCSS)),
 		datastarTag,
 	)
@@ -89,6 +90,11 @@ var (
 	// oatTag links the self-hosted oat.css base (view.OatCSS, served by
 	// serve.go's GET /oat.css handler).
 	oatTag = tag.New("link[rel=stylesheet][href=/oat.css]")
+
+	// workbenchTag links the workbench's chrome layer (view.WorkbenchCSS),
+	// linked AFTER oat so its unlayered rules also win the source-order
+	// tiebreak against any of oat's own unlayered rules.
+	workbenchTag = tag.New("link[rel=stylesheet][href=/workbench.css]")
 
 	// datastarTag loads Datastar pinned to a specific version with a
 	// Subresource Integrity hash, copied verbatim from

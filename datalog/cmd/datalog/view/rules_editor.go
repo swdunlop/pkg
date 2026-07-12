@@ -65,8 +65,7 @@ func RulesEditor(rulesText string) html.Content {
 		PaneHeading.Add(html.Text("Datalog Editor")),
 		ErrorList.Set("id", "rules-error"),
 		rulesTextarea,
-		runButton,
-		saveButton,
+		tag.New("div.actions", runButton, saveButton),
 		StatusDiv.Set("id", "status"),
 		tag.New("div#rules-results"),
 	)

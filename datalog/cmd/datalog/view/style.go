@@ -9,3 +9,11 @@ import _ "embed"
 //
 //go:embed oat.css
 var OatCSS []byte
+
+// WorkbenchCSS is the workbench's own chrome layer — layout, pane cards,
+// editor sizing — served at /workbench.css and linked after oat.css. It is
+// the analogue of medea's www/style.css: oat is a themed base, not a layout;
+// every page needs its own chrome on top of it.
+//
+//go:embed workbench.css
+var WorkbenchCSS []byte

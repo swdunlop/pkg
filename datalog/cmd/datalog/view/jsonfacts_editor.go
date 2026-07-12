@@ -53,8 +53,7 @@ func JSONFactsEditor(schemaText string, selectedRow html.Content, output html.Co
 		ErrorList.Set("id", "jsonfacts-error"),
 		selectedRow,
 		schemaTextarea,
-		applyButton,
-		saveButton,
+		tag.New("div.actions", applyButton, saveButton),
 		output,
 	)
 }
