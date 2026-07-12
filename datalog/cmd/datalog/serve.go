@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	stdflag "flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -38,6 +39,7 @@ func runServe(args []string) {
 	model := flags.String("model", "", "embedded agent model, kit-style (e.g. anthropic/claude-sonnet-5, openai/<alias>); empty defers to KIT_MODEL / ~/.kit.yml")
 	providerURL := flags.String("provider-url", "", "override the agent model provider's base URL (e.g. an OpenAI-compatible llama-swap endpoint)")
 	providerKey := flags.String("provider-api-key", "", "override the agent model provider's API key; empty defers to provider env vars")
+	agentCmd := flags.String("agent", "", "external ACP agent command, split shell-style (e.g. 'npx @agentclientprotocol/claude-agent-acp'); empty uses the embedded kit agent")
 	if err := flags.Parse(args); err != nil {
 		// flag.ExitOnError already printed usage and exited on real errors;
 		// this only returns for -h/-help.
@@ -58,7 +60,13 @@ func runServe(args []string) {
 	ruleFiles := flags.Args()
 
 	wb, closeFn, err := newWorkbench(*dataDir, *configPath, ruleFiles, *mcpToken,
-		agentConfig{Model: *model, ProviderURL: *providerURL, ProviderAPIKey: *providerKey})
+		agentConfig{
+			Model:          *model,
+			ProviderURL:    *providerURL,
+			ProviderAPIKey: *providerKey,
+			AgentCommand:   *agentCmd,
+			MCPURL:         mcpURL(*listen),
+		})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "datalog serve: %v\n", err)
 		os.Exit(1)
@@ -112,6 +120,10 @@ func newWorkbench(dataDir, configPath string, ruleFiles []string, tokenFlag stri
 			return nil, nil, fmt.Errorf("generating /mcp bearer token: %w", err)
 		}
 	}
+	// The token is only known once resolved above, but acpDriver needs it
+	// alongside MCPURL (set by runServe from --listen) to hand the agent at
+	// session/new — agentCfg is otherwise fully populated by the caller.
+	agentCfg.MCPToken = token
 
 	// One MCP server value serves both consumers: mounted at /mcp for
 	// external agents (mountMCP) and registered in-process with the
@@ -183,6 +195,27 @@ func firstOrEmpty(files []string) string {
 		return ""
 	}
 	return files[0]
+}
+
+// mcpURL derives the /mcp URL an acpDriver hands its agent from the
+// --listen flag's value. listen is frequently host-less (the default
+// "127.0.0.1:8080", or an operator-given ":8080") — net.SplitHostPort
+// handles both, and a host-less address becomes 127.0.0.1 (the ACP agent
+// is a local subprocess of this same host, per acp-integration.md's
+// loopback-only posture; there is no reason to prefer a wildcard or
+// externally-reachable host here even if --listen names one).
+func mcpURL(listen string) string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		// Not a valid host:port at all (shouldn't happen — ListenAndServe
+		// would fail the same way); fall back to treating the whole value
+		// as a port-less host, best-effort.
+		return "http://127.0.0.1:8080/mcp"
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return fmt.Sprintf("http://%s:%s/mcp", host, port)
 }
 
 // generateToken returns 32 hex characters (16 random bytes) from

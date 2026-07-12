@@ -204,6 +204,10 @@ func (d *fakeDriver) Prompt(ctx context.Context, text string, sink func(agentEve
 	return d.stopReason, d.err
 }
 
+func (d *fakeDriver) Answer(requestID, optionID string) error {
+	return errors.New("fakeDriver does not issue permission requests")
+}
+
 func (d *fakeDriver) Close() error { d.closed = true; return nil }
 
 func TestRunAgentTurnTranscript(t *testing.T) {
@@ -223,10 +227,10 @@ func TestRunAgentTurnTranscript(t *testing.T) {
 
 	log := renderLog(wb, "agent")
 	for _, want := range []string{
-		"let me look",     // thought accumulated
+		"let me look",           // thought accumulated
 		"query copied_to(F,H)?", // tool line: the query text, not its JSON envelope
-		"3 rows",          // tool result behind the disclosure
-		"Found 3 copies.", // message chunks accumulated into one entry
+		"3 rows",                // tool result behind the disclosure
+		"Found 3 copies.",       // message chunks accumulated into one entry
 	} {
 		if !strings.Contains(log, want) {
 			t.Fatalf("transcript missing %q: %s", want, log)
@@ -455,6 +459,10 @@ func (d *blockingDriver) Prompt(ctx context.Context, text string, sink func(agen
 	}
 	sink(agentEvent{Kind: "message", Text: "done"})
 	return "stop", nil
+}
+
+func (d *blockingDriver) Answer(requestID, optionID string) error {
+	return errors.New("blockingDriver does not issue permission requests")
 }
 
 func (d *blockingDriver) Close() error { d.closed = true; return nil }

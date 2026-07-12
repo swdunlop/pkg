@@ -19,9 +19,12 @@ import (
 // agentEvent is one streamed update from an agent turn, using ACP's update
 // vocabulary regardless of backend (doc/features/acp-integration.md
 // observation 4): kit's richer event stream projects into these shapes, and
-// a future acpDriver passes its updates through unchanged.
+// acpDriver passes its updates through nearly unchanged. Phase 2 adds
+// "permission" and "plan" — kit never emits either (observation: kit has no
+// approval flow to surface), so kitDriver simply never produces them; the
+// vocabulary is still ACP's superset, per observation 4's mandate.
 type agentEvent struct {
-	Kind string // "message" | "thought" | "tool-call" | "tool-result" | "error"
+	Kind string // "message" | "thought" | "tool-call" | "tool-result" | "error" | "permission" | "plan"
 
 	Text string // message/thought chunk, or error text
 
@@ -31,28 +34,76 @@ type agentEvent struct {
 	ToolArgs   string // JSON-encoded arguments
 	Result     string
 	IsError    bool
+
+	// Permission-request fields ("permission" kind). RequestID is the
+	// driver-generated key Answer(requestID, ...) resolves; it is distinct
+	// from ToolCallID because a single tool call could in principle be
+	// re-requested (ACP does not forbid it), and because kitDriver — which
+	// never emits "permission" — has no ToolCallID/RequestID pairing to
+	// keep consistent. The tool name/args ride along so the pane can render
+	// "agent wants to run X with {...}" without a second round-trip.
+	RequestID string
+	Options   []agentOption
+
+	// Plan fields ("plan" kind): the agent's full task list as of this
+	// update. ACP's plan/update replaces the whole list each time (no
+	// incremental diffing), so PlanEntries is always the complete plan.
+	PlanEntries []agentPlanEntry
+}
+
+// agentOption is one selectable response to a permission request — ACP's
+// PermissionOption trimmed to what the pane needs to render a button and
+// echo a choice back through Answer.
+type agentOption struct {
+	ID   string // Answer's optionID
+	Name string // button label
+	Kind string // "allow_once" | "allow_always" | "reject_once" | "reject_always" (ACP's PermissionOptionKind, passed through as a plain string so this package stays acp-agnostic)
+}
+
+// agentPlanEntry is one task in the agent's plan — ACP's PlanEntry trimmed
+// to content and status, which is all the phase-2 checklist rendering
+// (agent.go's runAgentTurn) needs; priority is dropped as unused for now.
+type agentPlanEntry struct {
+	Content string
+	Status  string // "pending" | "in_progress" | "completed" (ACP's PlanEntryStatus)
 }
 
 // agentDriver abstracts one conversational agent behind the chat pane
-// (doc/features/acp-integration.md). Phase 1 needs only Prompt and Close;
-// Answer (permission requests) arrives with the acpDriver in phase 2.
+// (doc/features/acp-integration.md). kitDriver's Answer always errors — kit
+// issues no permission requests to answer.
 type agentDriver interface {
 	// Prompt starts one turn; events stream to sink until the turn ends.
 	// One turn at a time — the workbench's jobs set enforces it, so a
 	// driver may assume no concurrent Prompt calls.
 	Prompt(ctx context.Context, text string, sink func(agentEvent)) (stopReason string, err error)
+	// Answer resolves a pending permission request (a "permission"
+	// agentEvent's RequestID) by option ID, unblocking the driver's
+	// in-flight session/request_permission RPC. Unknown requestID is an
+	// error.
+	Answer(requestID, optionID string) error
 	Close() error
 }
 
-// agentConfig carries the operator's model choice from serve's flags into
-// the lazily-constructed driver. Zero values defer to kit's own precedence
-// chain (KIT_MODEL and friends, then ~/.kit.yml) — the flags exist so the
-// operator can point one serve instance somewhere specific without
-// touching their global kit config.
+// agentConfig carries the operator's model/agent choice from serve's flags
+// into the lazily-constructed driver. Zero values for Model/ProviderURL/
+// ProviderAPIKey defer to kit's own precedence chain (KIT_MODEL and
+// friends, then ~/.kit.yml) — the flags exist so the operator can point one
+// serve instance somewhere specific without touching their global kit
+// config.
+//
+// AgentCommand switches the driver: empty selects the default embedded
+// kitDriver; non-empty is a shell-style command line for an external ACP
+// agent (acp-integration.md's --agent flag), and MCPURL/MCPToken are the
+// workbench's own /mcp endpoint and bearer token that acpDriver hands the
+// agent at session/new so it reaches the live session's tools.
 type agentConfig struct {
 	Model          string
 	ProviderURL    string
 	ProviderAPIKey string
+
+	AgentCommand string
+	MCPURL       string
+	MCPToken     string
 }
 
 // kitDriver embeds mark3labs/kit in-process (doc/features/acp-integration.md
@@ -148,6 +199,14 @@ func (d *kitDriver) Prompt(ctx context.Context, text string, sink func(agentEven
 	return res.StopReason, nil
 }
 
+// Answer always fails: kit has no permission/approval flow to surface (see
+// the agentDriver interface doc and acp-integration.md's kit risk note), so
+// it never emits a "permission" agentEvent for a pane Answer click to
+// target.
+func (d *kitDriver) Answer(requestID, optionID string) error {
+	return fmt.Errorf("the embedded agent does not issue permission requests")
+}
+
 func (d *kitDriver) Close() error { return d.k.Close() }
 
 // agentTurnJobKey gates the Agent tab on the jobs set: one turn at a time,
@@ -216,6 +275,14 @@ func (wb *workbench) agentDriver() (agentDriver, error) {
 	if wb.agent != nil {
 		return wb.agent, nil
 	}
+	if wb.agentCfg.AgentCommand != "" {
+		d, err := newACPDriver(wb.agentCfg)
+		if err != nil {
+			return nil, err
+		}
+		wb.agent = d
+		return d, nil
+	}
 	d, err := newKitDriver(context.Background(), wb.agentCfg, wb.mcpSrv)
 	if err != nil {
 		return nil, err
@@ -253,6 +320,7 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 		thoughtID  uint64
 		thoughtBuf strings.Builder
 		toolIDs    = map[string]uint64{} // ToolCallID → console entry id
+		planID     uint64                // "plan" entry, updated in place per acp-integration.md phase 2
 	)
 
 	sink := func(ev agentEvent) {
@@ -285,6 +353,21 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 			}
 		case "error":
 			wb.consoleAppend("agent", "error", html.Text(ev.Text))
+		case "permission":
+			// Minimal phase-2 rendering: the request and its options as
+			// plain text, one entry per request — interactive buttons that
+			// call Answer are a separate task (acp-integration.md work item
+			// 9). Until that lands, a turn parked on a permission request
+			// has no way to proceed from the pane; the driver's own kill
+			// timer / cancellation is the only recourse.
+			wb.consoleAppend("agent", "permission", html.Text(permissionText(ev)))
+		case "plan":
+			body := planEntry(ev.PlanEntries)
+			if planID == 0 {
+				planID = wb.consoleAppend("agent", "plan", body)
+			} else {
+				wb.consoleUpdate(planID, "plan", body)
+			}
 		}
 	}
 
@@ -311,6 +394,54 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 	case stopReason != "" && stopReason != "stop" && stopReason != "end_turn" && stopReason != "tool_calls":
 		wb.consoleAppend("agent", "note", html.Text("turn ended: "+stopReason))
 	}
+}
+
+// permissionText renders one permission request as plain text: the tool
+// call it gates and the options the agent offered. Plain text is
+// deliberate — interactive option buttons (posting back through Answer)
+// are chat-pane work item 9, out of scope here; this is only enough to
+// keep the operator informed that the turn is waiting on a decision they
+// cannot yet make from the UI.
+func permissionText(ev agentEvent) string {
+	var b strings.Builder
+	b.WriteString("permission requested for ")
+	b.WriteString(strings.TrimPrefix(ev.ToolName, "datalog__"))
+	if ev.ToolArgs != "" {
+		b.WriteString(" ")
+		b.WriteString(strings.TrimSpace(ev.ToolArgs))
+	}
+	b.WriteString(" — options: ")
+	names := make([]string, len(ev.Options))
+	for i, opt := range ev.Options {
+		names[i] = opt.Name
+	}
+	b.WriteString(strings.Join(names, ", "))
+	b.WriteString(" (interactive buttons coming soon; the operator cannot yet respond from this pane)")
+	return b.String()
+}
+
+// planEntry renders the agent's plan as a plain-text checklist, updated in
+// place each time the agent replaces the plan (ACP's plan/update always
+// carries the complete list — see agentPlanEntry's doc comment). A real
+// checklist widget is chat-pane work item 9.
+func planEntry(entries []agentPlanEntry) html.Content {
+	var b strings.Builder
+	for i, e := range entries {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		mark := "[ ]"
+		switch e.Status {
+		case "completed":
+			mark = "[x]"
+		case "in_progress":
+			mark = "[~]"
+		}
+		b.WriteString(mark)
+		b.WriteString(" ")
+		b.WriteString(e.Content)
+	}
+	return tag.New("pre", html.Text(b.String()))
 }
 
 // thoughtEntry renders accumulated reasoning as a collapsed disclosure —
