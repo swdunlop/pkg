@@ -75,6 +75,17 @@ type mcpHandlers struct {
 	fsys    fs.FS      // confined data filesystem: dataRoot.FS() or a *zip.Reader
 	confine confineRef // validates a ref against the data root; nil-safe (treated as "no restriction") only in tests
 	timeout time.Duration
+
+	// onChange, if set, is invoked after a SUCCESSFUL setSchema or setRules
+	// call, while h.mu is STILL HELD (matching publishSessionChanged's
+	// documented contract in fact_browser.go: rendering the patch-back
+	// fragment reads session state, so the caller must hold h.mu across the
+	// read). runServe sets this to wb.publishSessionChanged so an agent
+	// mutating over /mcp repaints the human's browser (doc/features/web-ui.md
+	// deployment section, design constraint 3's "updated by agent" flow).
+	// runMCP (stdio `datalog mcp`) leaves this nil, so stdio behavior is
+	// byte-identical to before this field existed.
+	onChange func()
 }
 
 // newMCPHandlers opens the data source named by dataDir and constructs the
@@ -255,6 +266,9 @@ func (h *mcpHandlers) setSchema(in setSchemaInput) (setSchemaOutput, error) {
 	if err != nil {
 		return setSchemaOutput{}, err
 	}
+	if h.onChange != nil {
+		h.onChange()
+	}
 	return setSchemaOutput{Predicates: countPredicates(db)}, nil
 }
 
@@ -314,6 +328,9 @@ func (h *mcpHandlers) setRules(in setRulesInput) (setRulesOutput, error) {
 		}
 	}
 	sort.Strings(preds)
+	if h.onChange != nil {
+		h.onChange()
+	}
 	return setRulesOutput{Predicates: preds}, nil
 }
 

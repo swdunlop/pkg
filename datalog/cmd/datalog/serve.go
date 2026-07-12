@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	stdflag "flag"
 	"fmt"
 	"net/http"
@@ -12,9 +14,9 @@ import (
 
 	"sync"
 
+	"github.com/mark3labs/mcp-go/server"
 	html "github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/datastar"
-	"github.com/swdunlop/html-go/tag"
 	"swdunlop.dev/pkg/datalog/cmd/datalog/view"
 )
 
@@ -32,6 +34,7 @@ func runServe(args []string) {
 	dataDir := flags.String("d", "", "data directory or .zip file (required; the security boundary for all file access)")
 	configPath := flags.String("c", "", "path to a JSON or YAML jsonfacts config file to preload")
 	listen := flags.String("listen", "127.0.0.1:8080", "address to listen on")
+	mcpToken := flags.String("mcp-token", "", "bearer token required on /mcp (default: generate one and print it to stderr)")
 	if err := flags.Parse(args); err != nil {
 		// flag.ExitOnError already printed usage and exited on real errors;
 		// this only returns for -h/-help.
@@ -43,21 +46,26 @@ func runServe(args []string) {
 		os.Exit(1)
 	}
 
-	h, closeFn, err := newMCPHandlers(*dataDir, *configPath, flags.Args(), evalTimeout)
+	// Flags are parsed before positionals (stdlib flag.FlagSet stops at the
+	// first non-flag argument), so flags.Args() here is exactly the rules
+	// files given on the command line, in order. The first one (if any) is
+	// the Save target for the Datalog Editor's rules document, per the
+	// design's "Session state and persistence" section — see handleSave's
+	// doc comment for the full path-resolution policy.
+	ruleFiles := flags.Args()
+
+	wb, closeFn, err := newWorkbench(*dataDir, *configPath, ruleFiles, *mcpToken)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "datalog serve: %v\n", err)
 		os.Exit(1)
 	}
 	defer closeFn()
 
-	wb := &workbench{
-		h:    h,
-		bus:  newBus(),
-		jobs: newJobs(),
-	}
+	fmt.Fprintf(os.Stderr, "datalog serve: /mcp bearer token: %s\n", wb.mcpToken)
 
 	mux := http.NewServeMux()
 	wb.routes(mux)
+	wb.mountMCP(mux)
 
 	srv := &http.Server{Addr: *listen, Handler: mux}
 
@@ -78,6 +86,122 @@ func runServe(args []string) {
 	}
 }
 
+// newWorkbench builds a *workbench wired exactly like runServe does: it
+// opens the data source, preloads schema/rules, generates (or accepts) the
+// /mcp bearer token, and wires the onChange patch-back seam — everything
+// runServe needs except the flag parsing and the HTTP listener itself.
+// Factored out so tests can build a workbench against a temp directory or
+// the mordor example without going through flag parsing or os.Exit calls.
+// tokenFlag is the --mcp-token flag's value; empty means "generate one".
+func newWorkbench(dataDir, configPath string, ruleFiles []string, tokenFlag string) (*workbench, func() error, error) {
+	h, closeFn, err := newMCPHandlers(dataDir, configPath, ruleFiles, evalTimeout)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	token := tokenFlag
+	if token == "" {
+		token, err = generateToken()
+		if err != nil {
+			closeFn()
+			return nil, nil, fmt.Errorf("generating /mcp bearer token: %w", err)
+		}
+	}
+
+	wb := &workbench{
+		h:          h,
+		bus:        newBus(),
+		jobs:       newJobs(),
+		schemaPath: configPath,
+		rulesPath:  firstOrEmpty(ruleFiles),
+		mcpToken:   token,
+	}
+
+	// The patch-back seam (doc/features/web-ui.md Deployment section): an
+	// agent mutating via /mcp must repaint the human's browser. onChange
+	// fires from inside setSchema/setRules while h.mu is still held, matching
+	// publishSessionChanged's documented contract (fact_browser.go).
+	// runMCP (stdio `datalog mcp`) never sets this field, so stdio behavior
+	// is unchanged.
+	h.onChange = wb.publishSessionChanged
+
+	return wb, closeFn, nil
+}
+
+// firstOrEmpty returns files[0], or "" if files is empty — the rules Save
+// target resolution needs "no rules file given at startup" to be
+// distinguishable from "given but empty".
+func firstOrEmpty(files []string) string {
+	if len(files) == 0 {
+		return ""
+	}
+	return files[0]
+}
+
+// generateToken returns 32 hex characters (16 random bytes) from
+// crypto/rand, used as the /mcp bearer token when --mcp-token is not given.
+func generateToken() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	const hexDigits = "0123456789abcdef"
+	out := make([]byte, len(buf)*2)
+	for i, b := range buf {
+		out[i*2] = hexDigits[b>>4]
+		out[i*2+1] = hexDigits[b&0xf]
+	}
+	return string(out), nil
+}
+
+// mountMCP mounts the same six-tool MCP surface the stdio `datalog mcp`
+// subcommand exposes at /mcp, using mcp-go's streamable HTTP server
+// (doc/features/web-ui.md Deployment section). It shares the exact same
+// *mcpHandlers (and thus mutex + session) the panes use, via
+// h.registerTools — an agent calling set_rules over /mcp and a human
+// clicking Run in the browser are the same operation on the same session.
+//
+// mcp-go's server.NewStreamableHTTPServer implements http.Handler directly
+// (ServeHTTP), so mounting it is a plain mux.Handle call; no adapter shim was
+// needed. Bearer-token enforcement wraps that handler: Authorization: Bearer
+// <token> or 401, checked with crypto/subtle.ConstantTimeCompare so token
+// comparison isn't timing-observable.
+func (wb *workbench) mountMCP(mux *http.ServeMux) {
+	srv := server.NewMCPServer("datalog", "0.1.0",
+		server.WithInstructions(mcpServerInstructions),
+	)
+	wb.h.registerTools(srv)
+
+	// WithStateLess: the workbench is single-user/single-session (design
+	// constraint 3), so there is no benefit to the streamable transport's
+	// stateful session bookkeeping (an Mcp-Session-Id the client must carry
+	// across calls) — every request already shares the one *mcpHandlers/
+	// session this server was built around, regardless of transport-level
+	// session identity.
+	streamable := server.NewStreamableHTTPServer(srv, server.WithStateLess(true))
+	mux.Handle("/mcp", wb.requireBearerToken(streamable))
+}
+
+// requireBearerToken wraps next, rejecting any request whose
+// Authorization header isn't exactly "Bearer <wb.mcpToken>" with 401.
+// Comparison is constant-time (crypto/subtle) to avoid leaking the token
+// through response-time side channels.
+func (wb *workbench) requireBearerToken(next http.Handler) http.Handler {
+	const prefix = "Bearer "
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		ok := len(auth) == len(prefix)+len(wb.mcpToken) &&
+			subtle.ConstantTimeCompare([]byte(auth[:len(prefix)]), []byte(prefix)) == 1 &&
+			subtle.ConstantTimeCompare([]byte(auth[len(prefix):]), []byte(wb.mcpToken)) == 1
+		if !ok {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="datalog serve /mcp"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // workbench holds the shared state behind every HTTP handler: the same
 // mcpHandlers the MCP tool surface calls (so a human's Apply/Run and an
 // agent's set_schema/set_rules/query are the same operation), the SSE bus
@@ -92,6 +216,20 @@ type workbench struct {
 	bus  *bus
 	jobs *jobs
 	gen  generation
+
+	// schemaPath and rulesPath are the operator-given startup paths for the
+	// schema (-c) and rules (first positional .dl file) documents,
+	// respectively — the Save targets (doc/features/web-ui.md "Session state
+	// and persistence"). Empty means "not given at startup"; see
+	// handleSave's doc comment for the resulting no-path policy. These are
+	// operator-trusted (flag/argv values), never model or browser input.
+	schemaPath string
+	rulesPath  string
+
+	// mcpToken is the bearer token required on /mcp (doc/features/web-ui.md
+	// Deployment section). Generated at startup if --mcp-token was not
+	// given; see generateToken.
+	mcpToken string
 
 	// selMu guards the jsonfacts Editor's evaluation-target selection below.
 	// This is a separate mutex from h.mu (the session mutex): selecting a
@@ -135,7 +273,7 @@ func (wb *workbench) routes(mux *http.ServeMux) {
 	// "Execution sandbox").
 	mux.HandleFunc("POST /cancel", wb.handleCancel)
 
-	// Save/git (wave 9 fills in).
+	// Save/git (save.go).
 	mux.HandleFunc("POST /save/{doc}", wb.handleSave)
 }
 
@@ -214,26 +352,4 @@ func (wb *workbench) handleEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-}
-
-// stubFragment renders a minimal Datastar patch target for a pane endpoint
-// not yet implemented by a later wave: a div with the given id (matching a
-// stable id declared in view/<pane>.go) containing a "not implemented yet"
-// message. Every pane stub handler (data_browser.go, jsonfacts_editor.go,
-// rules_editor.go, fact_browser.go) uses this so their responses are valid
-// Datastar SSE patches from day one, before the real rendering exists.
-func stubFragment(id string) html.Content {
-	return tag.New("div").Set("id", id).Add(html.Text("not implemented yet"))
-}
-
-// handleSave is the Save stub (POST /save/{doc}, doc = schema|rules). Not
-// pane-owned — wave 9 fills this in: writes the file and, if the project
-// directory is a git repo, runs git add + git commit -m "ui: save
-// <filename>".
-func (wb *workbench) handleSave(w http.ResponseWriter, r *http.Request) {
-	stream, err := datastar.RequestStream(w, r)
-	if err != nil {
-		return
-	}
-	_ = stream.Emit(datastar.Elements(stubFragment("toast")))
 }

@@ -40,6 +40,17 @@ func RulesEditor(rulesText string) html.Content {
 		Set("data-on:click", "@post('/rules/run')").
 		Add(html.Text("Run"))
 
+	// Save writes the SESSION's canonical rulesText to disk — whatever was
+	// last Run, not any un-Run draft still sitting in the textarea above.
+	// The title attribute calls this out explicitly, since it's an easy
+	// trap: type, forget to click Run, click Save, and get the old document
+	// on disk.
+	saveButton := ActionButton.
+		Set("id", "rules-save").
+		Set("title", "writes the applied rules document to disk (not any unapplied draft)").
+		Set("data-on:click", "@post('/save/rules')").
+		Add(html.Text("Save"))
+
 	// Cursor-position indicator: the design mentions one to aid navigating
 	// line:col errors. A live line:col readout needs the textarea's
 	// selectionStart translated into a line/column pair, which requires a
@@ -55,6 +66,7 @@ func RulesEditor(rulesText string) html.Content {
 		ErrorList.Set("id", "rules-error"),
 		rulesTextarea,
 		runButton,
+		saveButton,
 		StatusDiv.Set("id", "status"),
 		tag.New("div#rules-results"),
 	)

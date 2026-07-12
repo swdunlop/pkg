@@ -70,6 +70,21 @@ func body(p Page) html.Content {
 	)
 }
 
+// Toast renders the #toast fragment: a system-level surface per
+// doc/notes/datastar.md §4 (toast vs in-form errors) — used for conditions
+// that aren't the user's fault to fix in a form (Save's write/git outcome,
+// currently the only Toast caller). isError adds an "error" class so the
+// two states can be styled differently; rendered with no whitespace between
+// the outer div's tags so page.go's `#toast:empty` CSS rule still applies
+// once a subsequent empty Toast (if ever needed) clears it.
+func Toast(msg string, isError bool) html.Content {
+	t := tag.New("div#toast")
+	if isError {
+		t = t.Class("error")
+	}
+	return t.Add(html.Text(msg))
+}
+
 var (
 	// oatTag links the self-hosted oat.css base (view.OatCSS, served by
 	// serve.go's GET /oat.css handler).

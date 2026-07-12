@@ -264,10 +264,10 @@ func runApplySchema(wb *workbench, schemaText string) <-chan applySchemaResult {
 		wb.h.mu.Lock()
 		defer wb.h.mu.Unlock()
 		var err error
+		// setSchema fires h.onChange (wired to publishSessionChanged by
+		// newWorkbench) on success, so no explicit publish here — a second
+		// one would fan out the same #predicates fragment twice per Apply.
 		result, err = wb.h.setSchema(setSchemaInput{Schema: schemaText, Format: "yaml"})
-		if err == nil {
-			wb.publishSessionChanged()
-		}
 		return err
 	})
 	go func() {

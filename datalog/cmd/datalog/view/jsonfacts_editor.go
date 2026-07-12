@@ -37,12 +37,24 @@ func JSONFactsEditor(schemaText string, selectedRow html.Content, output html.Co
 		Set("data-on:click", "@post('/jsonfacts/apply')").
 		Add(html.Text("Apply"))
 
+	// Save writes the SESSION's canonical schemaText to disk — whatever was
+	// last Applied, not any unApplied draft still sitting in the textarea
+	// above. The title attribute calls this out explicitly per the task's
+	// instruction, since it's an easy trap: type, forget to click Apply,
+	// click Save, and get the old document on disk.
+	saveButton := ActionButton.
+		Set("id", "jsonfacts-save").
+		Set("title", "writes the applied schema document to disk (not any unapplied draft)").
+		Set("data-on:click", "@post('/save/schema')").
+		Add(html.Text("Save"))
+
 	return PaneSection.Set("id", "pane-jsonfacts-editor").Add(
 		PaneHeading.Add(html.Text("jsonfacts Editor")),
 		ErrorList.Set("id", "jsonfacts-error"),
 		selectedRow,
 		schemaTextarea,
 		applyButton,
+		saveButton,
 		output,
 	)
 }

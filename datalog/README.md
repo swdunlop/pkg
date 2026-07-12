@@ -631,6 +631,75 @@ Example MCP client configuration:
 }
 ```
 
+## Web Workbench
+
+`datalog serve` is a local hypermedia IDE over the same session `datalog
+mcp` and the REPL share: browse raw JSONL, edit the jsonfacts schema
+against live extraction, author rules with live error feedback, run
+queries, and inspect the fact database, all as one page kept in sync over
+SSE.
+
+```
+datalog serve -d ./data [-c schema.yaml] [--listen 127.0.0.1:8080] [--mcp-token TOKEN] [rules.dl ...]
+```
+
+Flags must come **before** the positional rules file(s) — stdlib's
+`flag` package stops parsing at the first non-flag argument, so
+`datalog serve rules.dl -d ./data` will try to parse `-d` as a second
+rules file. Put `-d`/`-c`/`--listen`/`--mcp-token` first.
+
+| Flag | Description |
+|------|-------------|
+| `-d` | Data directory or `.zip` file (**required**), same security boundary as `mcp`. |
+| `-c` | Optionally preload a schema; also the Save target for the jsonfacts Editor pane (see below). |
+| positional `.dl` files | Preload rules; the *first* one is also the Save target for the Datalog Editor pane. |
+| `--listen` | Address to listen on (default `127.0.0.1:8080` — loopback only). |
+| `--mcp-token` | Bearer token required on `/mcp`. Omit it and the server generates one and prints `datalog serve: /mcp bearer token: <token>` to stderr at startup. |
+
+The four panes, one sentence each:
+
+- **Data Browser** — paginated raw JSONL records per source file, with a
+  "Test" button that sends a row to the jsonfacts Editor for live
+  extraction.
+- **jsonfacts Editor** — the schema as a raw YAML textarea, live single-row
+  extraction as you type, and an **Apply** button that runs the full
+  Transform against the whole dataset.
+- **Datalog Editor** — one textarea using the REPL's `.`/`?` convention (a
+  `.dl` file pastes directly), live parse/compile error feedback, and a
+  **Run** button that applies the ruleset and executes its queries under a
+  5s timeout.
+- **Fact Browser** — every predicate (base or rule-derived) with fact
+  counts, paginated facts, and one long-lived SSE subscription that
+  repaints it whenever *anything* changes the session — a human's Apply/Run
+  or an agent's `set_schema`/`set_rules` over `/mcp`.
+
+**Save/git.** Nothing touches disk until you click **Save** on the
+jsonfacts or Datalog Editor pane. Save writes the session's *canonical*
+document — whatever was last Applied/Run, not an unapplied draft still
+sitting in the textarea — to the startup path given via `-c` (schema) or
+the first positional `.dl` file (rules). If no such path was given at
+startup, Save refuses with a clear toast rather than guessing a default
+path; restart with `-c` and/or a rules file argument to enable it. When the
+target's directory is a git work tree, Save also runs `git add` +
+`git commit -m "ui: save <filename>"` for that one file (via `os/exec`,
+never a shell); outside a repo it skips git silently. One click, one
+commit — squashing and rewording stay in the terminal.
+
+**`/mcp` mount.** The same six-tool MCP surface `datalog mcp` exposes over
+stdio is also mounted at `/mcp` (mcp-go's streamable HTTP server, stateless
+mode), sharing the exact same session and mutex the panes use — an agent's
+`set_rules` call and a human's Run click are the same operation, and a
+successful agent-side `set_schema`/`set_rules` repaints every open browser
+tab over its `/events` subscription. Requests need
+`Authorization: Bearer <token>`, checked with a constant-time comparison;
+anything else gets a 401.
+
+**Loopback/Tailscale posture.** `datalog serve` is single-user,
+single-tenant, and meant to stay that way: no auth beyond the `/mcp`
+bearer token, no per-tab isolation, default bind to `127.0.0.1`. For
+remote access, reach it over Tailscale rather than binding a public
+address or exposing it through a reverse proxy.
+
 ## How It Works
 
 ### Architecture
