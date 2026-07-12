@@ -879,9 +879,13 @@ func (p *parser) parseIsAtom() (Atom, error) {
 	if err != nil {
 		return Atom{}, err
 	}
+	lhs := datalog.Variable(varTok.val)
+	if varTok.val == "_" {
+		lhs = p.freshVar() // "_ is Expr" evaluates and discards, as in Prolog
+	}
 	return Atom{
 		Pred:  "is",
-		Terms: []datalog.Term{datalog.Variable(varTok.val)},
+		Terms: []datalog.Term{lhs},
 		Expr:  expr,
 	}, nil
 }
@@ -957,6 +961,12 @@ func (p *parser) parseTerm() (datalog.Term, error) {
 	switch p.current.kind {
 	case tokIdent:
 		name := p.advance().val
+		// A bare "_" is anonymous per occurrence, as in Prolog — writing
+		// foo(_, _) must not unify the two positions. It cannot be handled
+		// in the lexer because tokAnon doubles as the query terminator.
+		if name == "_" {
+			return p.freshVar(), nil
+		}
 		return datalog.Variable(name), nil
 	case tokAnon:
 		p.advance()

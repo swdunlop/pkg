@@ -139,11 +139,12 @@ const mcpDatalogSyntaxSummary = `Datalog syntax summary:
                (also: min, max)
   Builtins:    @contains(Str, "needle")   - constraint form (in the body, must hold)
                @time_diff(T2, T1, D)      - binding form (D is the output)
-  Comments start with "%". "?" alone is the anonymous variable (matches
-  anything, binds nothing) - legal in rule bodies, but rejected in the
-  query tool's arguments, where every position should be a named variable
-  or an underscore-prefixed one. A statement ends with "." (fact or rule)
-  or "?" (query).`
+  Comments start with "%". "?" alone and a bare "_" are anonymous
+  variables (each occurrence is distinct, matches anything, binds
+  nothing) - legal in rule bodies, but rejected in the query tool's
+  arguments, where every position should be a named variable or an
+  underscore-prefixed one (_Ignored). A statement ends with "." (fact or
+  rule) or "?" (query).`
 
 // mcpSetRulesDescription documents set_rules: whole-document replacement,
 // the syntax summary, and the embedded-query rejection.
@@ -179,8 +180,8 @@ and stats, then go back and adjust schema/rules as needed).
 
 The "query" argument is a single query statement. Name every variable you
 want returned as a column, and use an underscore-prefixed variable for
-positions you don't care about - the anonymous variable '?' is rejected
-in query arguments (it is only for aggregate rule bodies, via set_rules):
+positions you don't care about - the anonymous variables '?' and bare '_'
+are rejected in query arguments (they are for rule bodies, via set_rules):
   suspicious(Host, Pid, Cmd)?
   exe_drop(Host, User, _Share, Path, _Ip)?
 

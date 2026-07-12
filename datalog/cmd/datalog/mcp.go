@@ -427,16 +427,16 @@ func (h *mcpHandlers) query(ctx context.Context, in queryInput) (queryOutput, er
 	}, nil
 }
 
-// rejectAnonQueryVars refuses the anonymous variable '?' in a query tool
-// call's body atoms. '?' is legal in the language (aggregate rule bodies
-// use it idiomatically), but in a query it produces parser-generated
-// columns (?0, ?1, ...) a model didn't ask for and can't correlate — and a
-// weak model that writes pred(?, ?)? is usually pattern-matching SQL, not
-// choosing anonymity. The error text teaches the two forms it should have
-// used, since tool errors are the model's only corrective feedback
-// (doc/features/mcp-server.md's atomic-feedback posture). The parser
-// renames each '?' to ?N before we see it, so detection matches the
-// generated prefix rather than the literal.
+// rejectAnonQueryVars refuses anonymous variables ('?' or a bare '_') in a
+// query tool call's body atoms. Both are legal in the language (aggregate
+// rule bodies use '?' idiomatically, '_' is Prolog's don't-care), but in a
+// query they produce parser-generated columns (?0, ?1, ...) a model didn't
+// ask for and can't correlate — and a weak model that writes pred(?, ?)?
+// is usually pattern-matching SQL, not choosing anonymity. The error text
+// teaches the two forms it should have used, since tool errors are the
+// model's only corrective feedback (doc/features/mcp-server.md's
+// atomic-feedback posture). The parser renames both literals to ?N before
+// we see them, so detection matches the generated prefix.
 func rejectAnonQueryVars(q *syntax.Query) error {
 	for _, atom := range q.Body {
 		for _, term := range atom.Terms {
@@ -444,7 +444,7 @@ func rejectAnonQueryVars(q *syntax.Query) error {
 			if !ok || !strings.HasPrefix(string(v), "?") {
 				continue
 			}
-			return fmt.Errorf("query: anonymous variable '?' is not allowed in query arguments: "+
+			return fmt.Errorf("query: anonymous variables ('?' or bare '_') are not allowed in query arguments: "+
 				"name every column you want returned (e.g. %s), or use an underscore-prefixed "+
 				"variable (e.g. _Ignored) for positions you don't care about", exampleNamedQuery(q))
 		}

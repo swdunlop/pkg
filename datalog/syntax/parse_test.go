@@ -79,6 +79,63 @@ func TestParseNegation(t *testing.T) {
 	}
 }
 
+func TestParseBareUnderscoreAnonymous(t *testing.T) {
+	// Each bare "_" is a distinct anonymous variable, as in Prolog —
+	// p(_, _) must not unify its two positions.
+	result, err := syntax.ParseStatement(`p(_, _)?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := result.(*syntax.Query)
+	a, aok := q.Body[0].Terms[0].(datalog.Variable)
+	b, bok := q.Body[0].Terms[1].(datalog.Variable)
+	if !aok || !bok {
+		t.Fatalf("expected two variables, got %v", q.Body[0].Terms)
+	}
+	if a == b {
+		t.Fatalf("bare underscores unified into one variable %q", a)
+	}
+	if !strings.HasPrefix(string(a), "?") || !strings.HasPrefix(string(b), "?") {
+		t.Fatalf("expected parser-generated anonymous names, got %q, %q", a, b)
+	}
+
+	// A named underscore-prefixed variable is NOT anonymous: it joins.
+	result, err = syntax.ParseStatement(`q(_Same, _Same)?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q = result.(*syntax.Query)
+	if q.Body[0].Terms[0] != q.Body[0].Terms[1] {
+		t.Fatalf("_Same occurrences should be one variable: %v", q.Body[0].Terms)
+	}
+
+	// "_ is Expr" evaluates and discards.
+	result, err = syntax.ParseStatement(`r(X) :- val(X), _ is X * 2.`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := result.(*syntax.Rule)
+	lhs := r.Body[1].Terms[0].(datalog.Variable)
+	if !strings.HasPrefix(string(lhs), "?") {
+		t.Fatalf("expected anonymous lhs for '_ is', got %q", lhs)
+	}
+
+	// "_" and "?" draw from the same fresh-name counter, so mixing them
+	// in one statement still yields all-distinct variables.
+	result, err = syntax.ParseStatement(`s(_, ?, _)?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q = result.(*syntax.Query)
+	seen := map[datalog.Term]bool{}
+	for _, term := range q.Body[0].Terms {
+		if seen[term] {
+			t.Fatalf("mixed anonymous terms collided: %v", q.Body[0].Terms)
+		}
+		seen[term] = true
+	}
+}
+
 func TestParseIs(t *testing.T) {
 	result, err := syntax.ParseStatement(`double(X, Y) :- val(X), Y is X * 2.`)
 	if err != nil {

@@ -45,7 +45,10 @@
 //	no_parent(X) :- person(X), not parent(X, ?).
 //
 // The '?' character introduces an anonymous variable (the parser generates unique
-// names like ?0, ?1, etc.).
+// names like ?0, ?1, etc.). A bare '_' is anonymous the same way, as in Prolog:
+// each occurrence is a distinct variable, so parent(_, _) does not unify its
+// two positions. Longer '_'-prefixed names (_Ignored) are ordinary named
+// variables.
 //
 // # Constraints
 //
