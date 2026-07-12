@@ -578,6 +578,59 @@ Pipe mode (non-interactive) reads statements from stdin:
 echo 'ancestor("tom", X)?' | datalog -c schema.yaml -d ./data rules.dl
 ```
 
+## MCP Server
+
+`datalog mcp` exposes the same session the REPL uses, over the [Model
+Context Protocol](https://modelcontextprotocol.io), so a model can author
+a jsonfacts schema and Datalog rules the way a human does in the REPL:
+look at raw data, propose mappings, check what matched, write rules,
+inspect results, refine.
+
+```
+datalog mcp -d ./data [-c schema.yaml] [rules.dl ...]
+```
+
+| Flag | Description |
+|------|-------------|
+| `-d` | Data directory or `.zip` file (**required**) — the security boundary. Every file reference the model submits (schema `sources[].file`, `*_from` pattern files, `sample_input`'s `file` argument) is confined to this root; escapes (absolute paths, `..`, symlinks out) are rejected. |
+| `-c` | Optionally preload an operator-provided schema; the model may replace it with `set_schema`. |
+| positional `.dl` files | Preload rules, becoming the initial rules document, same as the REPL. |
+| `--timeout` | Per-query evaluation timeout (default 60s). |
+
+The server exposes six tools, meant to be driven in a loop:
+
+| Tool | Purpose |
+|------|---------|
+| `sample_input` | Peek at raw JSONL lines from the data directory (or list available files) to learn field names. |
+| `set_schema` | Replace the session's jsonfacts config; returns per-predicate fact counts as feedback on whether the mapping matched anything. |
+| `set_rules` | Replace the session's Datalog program (whole document, no append); returns the defined head predicates or a parse/compile error with line:col. |
+| `query` | Evaluate one query and return rows, variable names, and per-stratum profile stats. |
+| `list_predicates` | Names, arities, fact counts, and declaration docs for every loaded and rule-defined predicate. |
+| `sample_facts` | Up to N sample facts for one predicate/arity. |
+
+The intended loop: `sample_input` → `set_schema` (iterate on counts) →
+`set_rules` (iterate on errors) → `query` (iterate on results/stats).
+Each of `set_schema` and `set_rules` is whole-document replacement, not
+incremental editing — the model submits the complete schema or ruleset
+text every time, the same way a human saves a file.
+
+The session is entirely in-memory: nothing is written back to disk.
+Persisting the final schema/rules is the client's job — ask the model
+for the document text and save it yourself.
+
+Example MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "datalog": {
+      "command": "datalog",
+      "args": ["mcp", "-d", "./data"]
+    }
+  }
+}
+```
+
 ## How It Works
 
 ### Architecture
