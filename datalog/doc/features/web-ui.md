@@ -164,8 +164,9 @@ event parses the YAML, compiles the expr mappings, and extracts from
 the **single selected row only** — fast feedback against a
 representative sample, cheap enough to skip the long-running-action
 machinery below. **Apply** follows the streaming-progress shape from
-doc/notes/datastar.md §9: `data-indicator:_applying` +
-`data-attr:disabled="$_applying"` on the button, `@post('/jsonfacts/apply')`
+doc/notes/datastar.md §9, gated by the server-published `$busy` mutex
+(see the Datalog Editor's Run below for the shared Stop-morph shape);
+`@post('/jsonfacts/apply')`
 re-extracts everything and runs a full Transform via the `set_schema`
 handler (in-memory only), gated through the sandbox's per-resource
 `Jobs.Begin` so a second Apply click while one is in flight is a no-op
@@ -180,13 +181,17 @@ convention, so `.dl` files paste directly. Debounced 500ms
 runs parse + compile only (observation 5), refreshing the error list —
 `line:col` prefixes, verbatim from the parser/compiler — with a
 cursor-position indicator to aid navigation; no inline highlighting,
-no rich editor. A "Run" button (`data-indicator:_running`,
-`data-attr:disabled="$_running"`) applies the document via `set_rules`
+no rich editor. A "Run" button applies the document via `set_rules`
 and executes its queries through the `query` handler under the 5s
 timeout, streaming a `#status` fragment per doc/notes/datastar.md §9 so
 the button doesn't just freeze; a timeout reports "evaluation timed
-out, results may be incomplete" in that same `#status` div. The
-sandbox's Global Cancel button (below) targets the same job key.
+out, results may be incomplete" in that same `#status` div. Run
+participates in the server-published `$busy` mutex (`'run'`, `'apply'`,
+`'agent'` or empty): while its own job runs it morphs into a
+spinner-ringed Stop posting the sandbox's Global Cancel (below), and
+while another job holds the mutex it greys out — the same shape Apply
+and the agent Send control follow, so there is no standalone Stop
+button.
 
 **Fact Browser.** Predicates with fact counts (the REPL's `.list`), each
 labeled **base** (EDB) or **derived** (IDB) from the ruleset — but each

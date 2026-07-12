@@ -13,8 +13,9 @@ import (
 // genuinely observed keystroke-by-keystroke — with a 500ms-debounced
 // keydown posting to /jsonfacts/preview (extracts the single selected row
 // only, per the design's "fast feedback against a representative sample").
-// Apply follows the streaming-progress shape (§9): data-indicator:_applying
-// + data-attr:disabled="$_applying" on the button.
+// Apply follows the streaming-progress shape (§9), gated by the
+// server-patched $busy mutex which also morphs it into Stop while its own
+// job runs (see BusyActionButton).
 //
 // schemaText is the session's CURRENT canonical document (design constraint
 // 1: the editor content IS the document), rendered as the textarea's
@@ -35,12 +36,7 @@ func JSONFactsEditor(schemaText string, output html.Content) html.Content {
 		Set("data-on:keydown__debounce.500ms", "@post('/jsonfacts/preview')").
 		Add(html.Text(schemaText))
 
-	applyButton := ActionButton.
-		Set("id", "jsonfacts-apply").
-		Set("data-indicator:_applying").
-		Set("data-attr:disabled", "$_applying").
-		Set("data-on:click", "@post('/jsonfacts/apply')").
-		Add(html.Text("Apply"))
+	applyButton := BusyActionButton("jsonfacts-apply", "apply", "Apply", "/jsonfacts/apply")
 
 	// Save writes the SESSION's canonical schemaText to disk — whatever was
 	// last Applied, not any unApplied draft still sitting in the textarea
@@ -63,7 +59,7 @@ func JSONFactsEditor(schemaText string, output html.Content) html.Content {
 		// growing error list pushes the buttons down instead of the
 		// content above it out from under the cursor.
 		ErrorList.Set("id", "jsonfacts-error"),
-		tag.New("div.actions", applyButton, saveButton, StopButton),
+		tag.New("div.actions", applyButton, saveButton),
 	)
 }
 

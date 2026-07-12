@@ -424,10 +424,23 @@ func (wb *workbench) handleWorkbenchCSS(w http.ResponseWriter, r *http.Request) 
 
 // handleCancel is the Global Cancel emergency brake: fires every in-flight
 // job's CancelFunc. Single-user makes the blunt instrument acceptable —
-// see jobs.CancelAll's doc.
+// see jobs.CancelAll's doc. There is no dedicated Stop button anymore:
+// whichever action button started the work (Run/Apply/Send) morphs into
+// Stop while its job holds the $busy mutex and posts here.
 func (wb *workbench) handleCancel(w http.ResponseWriter, r *http.Request) {
 	wb.jobs.CancelAll()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// publishBusy fans the page-wide $busy mutex signal out to every open page:
+// key is "run", "apply" or "agent" while that job runs, "" when it ends.
+// The UI greys out the other action buttons and morphs the holder's own
+// button into Stop (view.BusyActionButton, view/console.go's send button).
+// Job keys are distinct, so this is a UI-level mutex, not a server-side
+// one — direct POSTs can still overlap jobs; the signal just reflects the
+// most recent transition, which is fine for the single-user workbench.
+func (wb *workbench) publishBusy(key string) {
+	wb.bus.Publish(datastar.Signal(map[string]any{"busy": key}))
 }
 
 // handleEvents is the page's one long-lived subscription connection

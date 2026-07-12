@@ -37,14 +37,12 @@ var (
 	// the :empty CSS rule in page.go can hide it when there are no errors.
 	ErrorList = tag.New("ul.errors")
 
-	// ActionButton is a long-running-action button per doc/notes/datastar.md
-	// §9: data-indicator sets a local busy signal while the request is in
-	// flight, data-attr:disabled prevents double-submission. Callers derive
-	// with .Set("data-indicator:_name", ...) style suffixes are not
-	// supported by html-go's Set signature directly on the attribute name,
-	// so the indicator/disabled attributes are threaded through the
-	// selector string at the call site (e.g.
-	// tag.New("button[data-indicator:_running][data-attr:disabled=$_running]")).
+	// ActionButton is the base shape for action buttons. Long-running
+	// actions (Run/Apply) derive via page.go's BusyActionButton, which
+	// wires the server-published $busy mutex (Stop morph, cross-action
+	// disable, spinner) instead of the per-request data-indicator idiom —
+	// the busy state must be visible to every open page, not just the one
+	// whose request is in flight (doc/notes/datastar.md §9).
 	ActionButton = tag.New("button.action")
 
 	// Textarea is the shared shape for the jsonfacts/rules editors' raw

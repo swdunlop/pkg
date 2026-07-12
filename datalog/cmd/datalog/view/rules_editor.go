@@ -12,9 +12,9 @@ import (
 // 500ms keydown posts to /rules/check (parse+compile only, refreshing the
 // error list — observation 5 keeps keystroke Transforms off the pipeline).
 // Run applies via setRulesWithQueries + runQuery under the 5s timeout,
-// streaming a #status fragment (§9) so the button doesn't freeze;
-// data-indicator:_running + data-attr:disabled="$_running" gates concurrent
-// Run clicks.
+// streaming a #status fragment (§9) so the button doesn't freeze; the
+// server-patched $busy mutex (view/console.go) gates concurrent clicks and
+// morphs Run into Stop while its own job runs (see BusyActionButton).
 //
 // rulesText is the session's current canonical document, rendered into the
 // textarea at page load (and whenever an agent-side set_rules patches this
@@ -35,12 +35,7 @@ func RulesEditor(rulesText string) html.Content {
 		Set("data-on:keydown__debounce.500ms", "@post('/rules/check')").
 		Add(html.Text(rulesText))
 
-	runButton := ActionButton.
-		Set("id", "rules-run").
-		Set("data-indicator:_running").
-		Set("data-attr:disabled", "$_running").
-		Set("data-on:click", "@post('/rules/run')").
-		Add(html.Text("Run"))
+	runButton := BusyActionButton("rules-run", "run", "Run", "/rules/run")
 
 	// Save writes the SESSION's canonical rulesText to disk — whatever was
 	// last Run, not any un-Run draft still sitting in the textarea above.
@@ -70,7 +65,7 @@ func RulesEditor(rulesText string) html.Content {
 		// growing error list pushes the buttons down instead of the
 		// textarea above it out from under the cursor.
 		ErrorList.Set("id", "rules-error"),
-		tag.New("div.actions", runButton, saveButton, StopButton),
+		tag.New("div.actions", runButton, saveButton),
 		StatusDiv.Set("id", "status"),
 		tag.New("div#rules-results"),
 	)

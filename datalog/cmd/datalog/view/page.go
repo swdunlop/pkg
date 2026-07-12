@@ -152,11 +152,21 @@ var (
 	datastarTag = tag.New("script[type=module][crossorigin=anonymous]").
 			Set("src", "https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.1/bundles/datastar.js").
 			Set("integrity", "sha384-dWn5jta+MrFAhwrzi4llarDQkaQE0zW2lreXrV0yK15W0A7TrtfGyIyji04PLUY7")
-
-	// StopButton is the Global Cancel emergency brake (doc/features/web-ui.md
-	// "Execution sandbox"): fires every in-flight job's CancelFunc. Lives in
-	// each editor's action bar, pushed to the row's right edge (workbench.css),
-	// rather than the old header#chrome — labeled "Stop" there since it now
-	// sits alongside Run/Apply/Save instead of standing alone as page chrome.
-	StopButton = tag.New("button#stop.action[data-on:click=@post('/cancel')]", html.Text("Stop"))
 )
+
+// BusyActionButton derives an ActionButton participating in the page-wide
+// run/apply/agent mutex ($busy, see view/console.go): while $busy holds this
+// button's own key it morphs into a spinner-ringed Stop posting /cancel
+// (there is no standalone Stop button anymore — Global Cancel lives on
+// whichever button started the work), and while $busy holds a DIFFERENT key
+// it greys out, making the mutex visible at every action row.
+func BusyActionButton(id, key, label, action string) tag.Interface {
+	return ActionButton.
+		Set("id", id).
+		Set("data-spinner", "small").
+		Set("data-attr:aria-busy", "$busy === '"+key+"' ? 'true' : false").
+		Set("data-attr:disabled", "$busy && $busy !== '"+key+"'").
+		Set("data-text", "$busy === '"+key+"' ? 'Stop' : '"+label+"'").
+		Set("data-on:click", "$busy === '"+key+"' ? @post('/cancel') : @post('"+action+"')").
+		Add(html.Text(label))
+}

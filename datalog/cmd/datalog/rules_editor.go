@@ -114,6 +114,10 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer done()
+	// rulesRunJobKey ("run") doubles as the UI's $busy vocabulary here —
+	// see publishBusy's doc; jsonfacts passes "apply" explicitly instead.
+	wb.publishBusy(rulesRunJobKey)
+	defer wb.publishBusy("")
 
 	token := wb.gen.Next()
 

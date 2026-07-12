@@ -141,16 +141,18 @@ textarea.editor {
   tab-size: 4;
 }
 
-/* Action rows (Apply/Save/Stop, Run/Save/Stop): spaced, not touching.
- * Stop is the Global Cancel emergency brake, pushed to the row's right
- * edge (away from Apply/Run/Save) so it doesn't get fat-fingered. */
+/* Action rows (Apply/Save, Run/Save): spaced, not touching. There is no
+ * standalone Stop button — Run/Apply morph into Stop while their own job
+ * runs (view.BusyActionButton), carrying oat's [aria-busy] spinner as the
+ * activity tell; the spinner needs breathing room before the label. */
 div.actions {
   display: flex;
   gap: var(--space-2);
   margin-block: var(--space-3);
 }
-div.actions #stop {
-  margin-inline-start: auto;
+div.actions button.action[aria-busy='true']::before {
+  margin-inline-end: var(--space-2);
+  vertical-align: text-bottom;
 }
 
 /* In-form error lists (doc/notes/datastar.md §4). The :empty rule hiding
@@ -326,10 +328,36 @@ section#console {
   background: var(--primary);
   color: var(--primary-foreground);
 }
+/* Agent-activity tell on the tab button itself (oat's [aria-busy] spinner,
+ * shrunk to sit inline with the tab label) so a collapsed drawer still
+ * shows a turn is running. */
+#console-bar button.console-tab[aria-busy='true']::before {
+  width: 0.75rem;
+  height: 0.75rem;
+  margin-inline-end: var(--space-1);
+  vertical-align: -1px;
+}
+/* Busy status text and Clear ride the bar's right edge, away from the
+ * tabs. */
 #console-status {
   margin-inline-start: auto;
   color: var(--muted-foreground);
   font-size: var(--text-7);
+}
+/* Clear is a destructive-ish action, so it reads as a bordered ghost
+ * button rather than borrowing the tab styling next to it. */
+#console-clear {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-medium);
+  padding: var(--space-1) var(--space-3);
+  color: var(--muted-foreground);
+  font-size: var(--text-7);
+  cursor: pointer;
+}
+#console-clear:hover {
+  background: var(--accent);
+  color: var(--foreground);
 }
 
 /* Open drawer body: capped height, scrollback scrolls, input row pinned
@@ -405,9 +433,12 @@ section#console {
   color: var(--danger);
 }
 
-/* Console input rows: input grows, button hugs the right. */
+/* Console input rows: input grows; any sibling button (the Query tab's
+ * Run) keeps its natural one-line height at the row's bottom edge instead
+ * of stretching to match a taller input. */
 .console-input {
   display: flex;
+  align-items: flex-end;
   gap: var(--space-2);
   margin-top: var(--space-2);
   flex: none;
@@ -419,4 +450,52 @@ section#console {
   font-size: var(--text-7);
   background-color: light-dark(#ffffff, #1a1e26); /* md-input-bg */
   resize: none;
+}
+.console-input button {
+  flex: none;
+}
+
+/* Agent composer: chat-style — the round send/stop button sits inside the
+ * textarea's bottom-right corner, and the textarea reserves padding so
+ * text never runs underneath it. */
+.prompt-box {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+}
+.prompt-box textarea {
+  padding-inline-end: calc(2rem + var(--space-3));
+}
+#console-send {
+  position: absolute;
+  right: var(--space-2);
+  bottom: var(--space-2);
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-full);
+  background: var(--primary);
+  color: var(--primary-foreground);
+  font-size: var(--text-6);
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+#console-send:hover:not(:disabled) {
+  background: rgb(from var(--primary) r g b / 0.85);
+}
+#console-send:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+/* While a turn runs the button shows ■ (stop) with oat's overlay spinner
+ * ring drawn around it; the ring inherits --primary for its moving edge,
+ * which would vanish on the primary-filled button, so recolor the track
+ * and edge for the on-primary context. */
+#console-send[aria-busy='true']::before {
+  border-color: rgb(from var(--primary-foreground) r g b / 0.35);
+  border-top-color: var(--primary-foreground);
 }

@@ -205,6 +205,10 @@ func (wb *workbench) handleJSONFactsApply(w http.ResponseWriter, r *http.Request
 		return
 	}
 	defer done()
+	// "apply", not jsonfactsApplyJobKey: publishBusy speaks the UI's $busy
+	// vocabulary (view.BusyActionButton's key), not the jobs-map key.
+	wb.publishBusy("apply")
+	defer wb.publishBusy("")
 
 	ctx, cancel := context.WithTimeout(ctx, evalTimeout)
 	defer cancel()

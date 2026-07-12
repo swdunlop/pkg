@@ -195,11 +195,11 @@ func (wb *workbench) handleConsolePrompt(w http.ResponseWriter, r *http.Request)
 
 	_ = stream.Emit(datastar.Signal(map[string]any{"consolePrompt": ""}))
 	wb.consoleAppend("agent", "user", html.Text(text))
-	wb.bus.Publish(datastar.Signal(map[string]any{"agentBusy": true}))
+	wb.publishBusy("agent")
 
 	go func() {
 		defer done()
-		defer wb.bus.Publish(datastar.Signal(map[string]any{"agentBusy": false}))
+		defer wb.publishBusy("")
 		wb.runAgentTurn(jobCtx, driver, text)
 	}()
 }

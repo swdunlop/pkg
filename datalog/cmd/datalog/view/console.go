@@ -19,12 +19,13 @@ import (
 //
 // Drawer chrome state is client-local Datastar signals (underscore-prefixed
 // so they never travel in POST signal payloads): $_consoleOpen toggles the
-// body, $_consoleTab picks the visible tab. agentBusy is NOT local — the
-// server flips it over SSE at turn start/end so the send button disables
-// for every open page, not just the one that clicked.
+// body, $_consoleTab picks the visible tab. busy is NOT local — it is the
+// page-wide run/apply/agent mutex signal ('', 'run', 'apply' or 'agent'),
+// flipped over SSE by whichever handler starts/ends a job so every action
+// button on every open page reflects it, not just the one that clicked.
 func Console(queryLog, agentLog []html.Content) html.Content {
 	return tag.New("section#console").
-		Set("data-signals", `{_consoleOpen: false, _consoleTab: 'query', agentBusy: false, consoleQuery: '', consolePrompt: ''}`).
+		Set("data-signals", `{_consoleOpen: false, _consoleTab: 'query', busy: '', consoleQuery: '', consolePrompt: ''}`).
 		Add(
 			consoleBar(),
 			tag.New("div#console-body").Set("data-show", "$_consoleOpen").Add(
@@ -36,8 +37,10 @@ func Console(queryLog, agentLog []html.Content) html.Content {
 
 // consoleBar is the drawer's always-visible one-line bar: a disclosure
 // toggle, the two tab buttons (which also open the drawer, so a collapsed
-// console is one click from either tab), and a status span the agent turn
-// runner patches (#console-status).
+// console is one click from either tab), and — pushed to the right edge —
+// the busy-status span plus the Clear button. The Agent tab button carries
+// oat's [aria-busy] spinner while a turn runs, so even a collapsed drawer
+// telegraphs agent activity.
 func consoleBar() html.Content {
 	return tag.New("div#console-bar",
 		tag.New("button#console-toggle.console-tab").
@@ -45,13 +48,20 @@ func consoleBar() html.Content {
 			Set("data-text", "$_consoleOpen ? '▾ Console' : '▸ Console'").
 			Add(html.Text("▸ Console")),
 		consoleTabButton("query", "Query"),
-		consoleTabButton("agent", "Agent"),
+		consoleTabButton("agent", "Agent").
+			Set("data-spinner", "small").
+			Set("data-attr:aria-busy", "$busy === 'agent' ? 'true' : false"),
+		tag.New("span#console-status").Set("data-text", busyStatusExpr),
 		clearButton(),
-		tag.New("span#console-status").Set("data-text", "$agentBusy ? 'agent turn running…' : ''"),
 	)
 }
 
-func consoleTabButton(tab, label string) html.Content {
+// busyStatusExpr renders the busy mutex as words: which of run/apply/agent
+// holds it, or nothing. This is the one place the whole mutex is spelled
+// out, complementing the per-button Stop morphs.
+const busyStatusExpr = `$busy === 'agent' ? 'agent turn running…' : $busy === 'run' ? 'run in flight…' : $busy === 'apply' ? 'apply in flight…' : ''`
+
+func consoleTabButton(tab, label string) tag.Interface {
 	return tag.New("button.console-tab").
 		Set("data-on:click", "$_consoleTab = '"+tab+"'; $_consoleOpen = true").
 		Set("data-class:active", "$_consoleTab === '"+tab+"' && $_consoleOpen").
@@ -61,9 +71,11 @@ func consoleTabButton(tab, label string) html.Content {
 // clearButton wipes the visible tab's scrollback (POST /console/clear).
 // $_consoleTab is client-local and never travels in signal payloads, so the
 // tab rides in the URL instead. Hidden while the drawer is collapsed —
-// clearing a log you cannot see would be a surprise.
+// clearing a log you cannot see would be a surprise. Styled as a bordered
+// ghost button on the bar's right edge, NOT as .console-tab: it is a
+// destructive action and should not read as navigation.
 func clearButton() html.Content {
-	return tag.New("button#console-clear.console-tab").
+	return tag.New("button#console-clear").
 		Set("data-show", "$_consoleOpen").
 		Set("data-on:click", "@post('/console/clear?tab=' + $_consoleTab)").
 		Add(html.Text("Clear"))
@@ -103,19 +115,36 @@ func queryInputRow() html.Content {
 	)
 }
 
-// promptInputRow is the Agent tab's input. Send disables while a turn runs
-// ($agentBusy is server-patched); Enter sends, Shift+Enter inserts a
-// newline via the browser's default textarea behavior.
+// promptInputRow is the Agent tab's input: a chat-style composer — the send
+// control is a round icon button sitting inside the textarea's bottom-right
+// corner (.prompt-box positions it; the textarea reserves padding so text
+// never runs under it). The button is one control with three faces off the
+// shared $busy mutex:
+//
+//   - idle:       ↑ posts the prompt
+//   - agent busy: ■ posts /cancel, ringed by oat's [aria-busy] spinner
+//     (data-spinner "small overlay" draws the ring over the ■ rather than
+//     beside it — overlay mode positions the spinner absolutely)
+//   - run/apply busy: disabled, making the mutex visible from this side too
+//
+// Enter sends (guarded on !$busy so it cannot double-fire mid-turn),
+// Shift+Enter inserts a newline via the browser's default behavior.
 func promptInputRow() html.Content {
 	return tag.New("div.console-input",
-		tag.New("textarea#console-prompt[rows=2][placeholder=Ask the agent…]").
-			Set("spellcheck", "false").
-			Set("data-bind:console-prompt").
-			Set("data-on:keydown", "evt.key === 'Enter' && !evt.shiftKey && (evt.preventDefault(), @post('/console/prompt'))"),
-		ActionButton.
-			Set("data-attr:disabled", "$agentBusy").
-			Set("data-on:click", "@post('/console/prompt')").
-			Add(html.Text("Send")),
+		tag.New("div.prompt-box",
+			tag.New("textarea#console-prompt[rows=3][placeholder=Ask the agent…]").
+				Set("spellcheck", "false").
+				Set("data-bind:console-prompt").
+				Set("data-on:keydown", "evt.key === 'Enter' && !evt.shiftKey && (evt.preventDefault(), !$busy && @post('/console/prompt'))"),
+			tag.New("button#console-send").
+				Set("data-spinner", "small overlay").
+				Set("data-attr:aria-busy", "$busy === 'agent' ? 'true' : false").
+				Set("data-attr:disabled", "$busy === 'run' || $busy === 'apply'").
+				Set("data-attr:title", "$busy === 'agent' ? 'stop the running turn' : 'send'").
+				Set("data-text", "$busy === 'agent' ? '■' : '↑'").
+				Set("data-on:click", "$busy === 'agent' ? @post('/cancel') : @post('/console/prompt')").
+				Add(html.Text("↑")),
+		),
 	)
 }
 
