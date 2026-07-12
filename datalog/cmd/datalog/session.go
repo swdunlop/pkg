@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -94,7 +95,21 @@ func loadFromZip(cfg jsonfacts.Config, path string) (*memory.Database, error) {
 // used only to detect YAML by extension.
 func parseConfig(data []byte, path string) (jsonfacts.Config, error) {
 	ext := filepath.Ext(path)
+	format := "json"
 	if ext == ".yaml" || ext == ".yml" {
+		format = "yaml"
+	}
+	return parseConfigFormat(data, format)
+}
+
+// parseConfigFormat decodes a jsonfacts.Config from raw bytes given an
+// explicit format hint ("json" or "yaml"), rather than sniffing a file
+// extension. This is the variant set_schema uses: an MCP submission is a
+// string in memory with no path to sniff. An empty format defaults to
+// "yaml", matching the schema's typical authoring format.
+func parseConfigFormat(data []byte, format string) (jsonfacts.Config, error) {
+	switch format {
+	case "", "yaml":
 		var raw any
 		if err := yaml.Unmarshal(data, &raw); err != nil {
 			return jsonfacts.Config{}, fmt.Errorf("parsing YAML: %w", err)
@@ -104,6 +119,10 @@ func parseConfig(data []byte, path string) (jsonfacts.Config, error) {
 		if err != nil {
 			return jsonfacts.Config{}, fmt.Errorf("converting YAML to JSON: %w", err)
 		}
+	case "json":
+		// no conversion needed
+	default:
+		return jsonfacts.Config{}, fmt.Errorf("unknown config format %q (want %q or %q)", format, "yaml", "json")
 	}
 
 	var cfg jsonfacts.Config
@@ -111,6 +130,98 @@ func parseConfig(data []byte, path string) (jsonfacts.Config, error) {
 		return jsonfacts.Config{}, fmt.Errorf("parsing config: %w", err)
 	}
 	return cfg, nil
+}
+
+// confineRef validates a single file reference against a session's
+// confinement boundary. MCP wires this to dataRoot.Confine (directory data
+// source) or a zip-based fs.ValidPath check (zip data source); the REPL
+// never sets it, so setSchema outside MCP behaves as before (no
+// confinement, since the operator authors the config themselves).
+type confineRef func(ref string) (string, error)
+
+// setSchema replaces the session's jsonfacts configuration atomically: it
+// parses the config from raw text plus a format hint ("yaml" or "json",
+// empty defaults to yaml), validates every file reference the config makes
+// (each source's file and every matcher's *_from pattern file) through
+// confine, resolves *_from pattern files itself (LoadFS does not do this;
+// only LoadSchemaFS does, and set_schema submissions are not schema-dir
+// files), loads the data via fsys, and only then mutates session state. On
+// any error, the session is left exactly as it was before the call — the
+// model's replacement schema either fully replaces the old one or not at
+// all, per the design's atomic-replacement requirement (mcp-server.md).
+func (s *session) setSchema(text string, format string, fsys fs.FS, confine confineRef) error {
+	cfg, err := parseConfigFormat([]byte(text), format)
+	if err != nil {
+		return err
+	}
+
+	if confine != nil {
+		for i, src := range cfg.Sources {
+			if _, err := confine(src.File); err != nil {
+				return fmt.Errorf("source %d: file %q: %w", i, src.File, err)
+			}
+		}
+		for i := range cfg.Matchers {
+			m := &cfg.Matchers[i]
+			for _, ref := range []string{
+				m.ContainsFrom, m.StartsWithFrom, m.EndsWithFrom,
+				m.RegexMatchFrom, m.Base64From, m.Base64UTF16From, m.CIDRFrom,
+			} {
+				if ref == "" {
+					continue
+				}
+				if _, err := confine(ref); err != nil {
+					return fmt.Errorf("matcher %d: file %q: %w", i, ref, err)
+				}
+			}
+		}
+	}
+
+	// Resolve *_from pattern files ourselves: LoadFS (unlike LoadSchemaFS)
+	// does not do this, and an MCP-submitted config is not a schema-dir
+	// file, so nothing else will resolve them before matching runs.
+	if err := cfg.ResolveFromFS(fsys); err != nil {
+		return err
+	}
+
+	db, err := cfg.LoadFS(fsys)
+	if err != nil {
+		return fmt.Errorf("loading data: %w", err)
+	}
+
+	s.cfg = cfg
+	s.schemaText = text
+	s.dataDB = db
+	return nil
+}
+
+// setRules replaces the session's Datalog program atomically: it parses
+// source, rejects embedded `?` queries (the model should use the query
+// tool instead of embedding one in the document), runs a trial Compile so
+// stratification/arity errors attach to this submission rather than to a
+// later, innocent query, and only then replaces s.rules/s.aggRules/
+// s.rulesText wholesale. Unlike loadProgram (which appends, for the REPL's
+// .load), setRules always replaces the whole document — the editing model
+// mcp-server.md specifies for the MCP tool surface. On any error, session
+// state is unchanged.
+func (s *session) setRules(source string) error {
+	ruleset, err := syntax.ParseAll(source)
+	if err != nil {
+		return err
+	}
+	if len(ruleset.Queries) > 0 {
+		return fmt.Errorf("set_rules: source contains %d embedded query statement(s) ('?'); "+
+			"remove them and use the query tool to run queries", len(ruleset.Queries))
+	}
+
+	if _, err := seminaive.New(s.engineOpts...).Compile(ruleset); err != nil {
+		return err
+	}
+
+	s.rules = ruleset.Rules
+	s.aggRules = ruleset.AggRules
+	s.rulesText = source
+	return nil
 }
 
 // loadProgram parses a Datalog source string containing multiple statements,

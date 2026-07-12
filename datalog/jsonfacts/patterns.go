@@ -31,6 +31,24 @@ func loadPatternFileFS(fsys fs.FS, path string) ([]string, error) {
 	return patterns, nil
 }
 
+// ResolveFromFS reads every matcher's _from pattern files from fsys and
+// merges their contents into the corresponding inline pattern lists,
+// clearing the _from fields so the Config becomes self-contained. This is
+// the same resolution LoadSchemaFS performs automatically for schema files
+// loaded via LoadSchemaDir/LoadSchemaFS; callers that build or receive a
+// Config some other way (for example, a Config parsed from a
+// caller-submitted document rather than read from a schema file) call
+// ResolveFromFS themselves before LoadFS, since LoadFS does not resolve
+// _from fields on its own.
+func (cfg *Config) ResolveFromFS(fsys fs.FS) error {
+	for i := range cfg.Matchers {
+		if err := cfg.Matchers[i].resolveFromFS(fsys); err != nil {
+			return fmt.Errorf("matcher %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
 // resolveFromFS reads each _from file from fsys and appends the loaded
 // patterns to the corresponding inline slice. The _from fields are cleared
 // after resolution so the Matcher is self-contained.

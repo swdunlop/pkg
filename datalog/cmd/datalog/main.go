@@ -19,6 +19,16 @@ var (
 )
 
 func main() {
+	// datalog mcp dispatches to the MCP server before pflag.Parse touches
+	// any global state: mcp owns its own flag.FlagSet (see runMCP) so that
+	// registering its flags never interferes with bare mode's pflag
+	// registrations above, and vice versa. Checking os.Args directly (not
+	// flag.Args() after Parse) is required for that separation to hold.
+	if len(os.Args) > 1 && os.Args[1] == "mcp" {
+		runMCP(os.Args[2:])
+		return
+	}
+
 	flag.Parse()
 
 	if *cpuProfile != "" {
