@@ -428,23 +428,28 @@ func (h *mcpHandlers) query(ctx context.Context, in queryInput) (queryOutput, er
 }
 
 // rejectAnonQueryVars refuses anonymous variables ('?' or a bare '_') in a
-// query tool call's body atoms. Both are legal in the language (aggregate
-// rule bodies use '?' idiomatically, '_' is Prolog's don't-care), but in a
-// query they produce parser-generated columns (?0, ?1, ...) a model didn't
-// ask for and can't correlate — and a weak model that writes pred(?, ?)?
-// is usually pattern-matching SQL, not choosing anonymity. The error text
+// query tool call's POSITIVE body atoms. Both are legal in the language,
+// but in a positive query atom a weak model that writes pred(?, ?)? is
+// usually pattern-matching SQL, not choosing anonymity — the error text
 // teaches the two forms it should have used, since tool errors are the
 // model's only corrective feedback (doc/features/mcp-server.md's
-// atomic-feedback posture). The parser renames both literals to ?N before
-// we see them, so detection matches the generated prefix.
+// atomic-feedback posture). Negated atoms are exempt: there, anonymity is
+// the REQUIRED don't-care form — the engine's safety check skips anonymous
+// variables in negated atoms but rejects unbound named ones, so
+// `not remote_logon(H, ?, ?, ?)` is the only way to write not-exists. The
+// parser renames both literals to ?N before we see them, so detection
+// matches the generated prefix.
 func rejectAnonQueryVars(q *syntax.Query) error {
 	for _, atom := range q.Body {
+		if atom.Negated {
+			continue
+		}
 		for _, term := range atom.Terms {
 			v, ok := term.(datalog.Variable)
 			if !ok || !strings.HasPrefix(string(v), "?") {
 				continue
 			}
-			return fmt.Errorf("query: anonymous variables ('?' or bare '_') are not allowed in query arguments: "+
+			return fmt.Errorf("query: anonymous variables ('?' or bare '_') are not allowed outside negated atoms: "+
 				"name every column you want returned (e.g. %s), or use an underscore-prefixed "+
 				"variable (e.g. _Ignored) for positions you don't care about", exampleNamedQuery(q))
 		}

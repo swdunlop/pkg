@@ -34,7 +34,51 @@ Workflow loop (repeat as needed):
 
 Each of set_schema and set_rules replaces the whole document; there is no
 incremental edit API. Submit the complete schema or ruleset text every
-time, the same way a human would save a file.`
+time, the same way a human would save a file.
+
+` + mcpDialectPrimer
+
+// mcpDialectPrimer explains Datalog itself and this dialect's deltas for a
+// model that has never seen the project. It rides in the server
+// instructions (so agents read it before any tool call) and is written to
+// preempt the failure modes observed in live sessions: hand-joining query
+// results, bare contains vs @contains, counting rows by eye, and treating
+// 0 rows as an error.
+const mcpDialectPrimer = `Datalog primer:
+
+Datalog is a logic query language. A program is facts (ground tuples,
+e.g. parent("tom", "bob").) plus rules that derive new facts from old
+ones (head :- body). Evaluation is bottom-up to a fixpoint: every
+derivable fact gets derived, so recursion (ancestors, reachability) is
+natural and always terminates. There are no function symbols and no
+control flow - a rule is a statement of logic, not a procedure, and rule
+order does not matter.
+
+The engine is the reasoner. A query body is a conjunction: shared
+variables between atoms ARE the join, comparisons and @builtins filter,
+'not' expresses absence. State what must hold and read the bindings
+back; never fetch two predicates and correlate their rows yourself, and
+never count rows by eye when an aggregate rule can count exactly.
+
+This dialect, beyond textbook Datalog:
+  - Constants: "strings", integers, floats, and composite JSON values
+    (a mapped object/array is one atomic term - it joins as a whole).
+  - Variables are capitalized (Host, X). _Name is a named don't-care,
+    excluded from query result columns. '?' and a bare '_' are anonymous:
+    each occurrence is a fresh variable, as in Prolog.
+  - Negation must be stratified (no recursion through 'not'), and
+    variables in a negated atom must be positively bound or anonymous.
+  - Arithmetic binds through 'is': Total is P * (1 + Rate).
+  - Aggregates (count, sum, min, max) are rule bodies, not query
+    expressions: alert_count(Sev, N) :- N = count : alert(?, Sev, ?).
+  - @-sigil builtins (@contains, @starts_with, @ends_with, @time_diff,
+    ...) are evaluated by the engine. The same names WITHOUT the sigil
+    are ordinary fact predicates emitted by schema matchers, holding
+    only the patterns the schema declared - do not confuse them.
+  - A query against an undefined predicate returns 0 rows, not an
+    error; verify names and arities with list_predicates.
+  - Statements end with "." (facts, rules) or "?" (queries); comments
+    start with "%".`
 
 // mcpSetSchemaDescription documents the jsonfacts config format for
 // set_schema: sources, matchers, and declarations, condensed from
@@ -131,20 +175,31 @@ const mcpDatalogSyntaxSummary = `Datalog syntax summary:
   Fact:        parent("tom", "bob").
   Rule:        ancestor(X, Y) :- parent(X, Z), ancestor(Z, Y).
   Query:       ancestor("tom", X)?
+               remote_logon(H, User, _A, _B), smb_conn(H, _C, _D)?
+               (comma-separated atoms are ONE conjunctive query, joined on
+                shared variables; comparisons, @builtins, and negation may
+                appear in the body too)
   Negation:    orphan(X) :- person(X), not parent(?, X).
+               (variables in a negated atom must be bound by a positive
+                atom or anonymous)
   Comparison:  X != Y   |   Amt > 1000   |   X <= Y
   Arithmetic:  cost(Item, Total) :- price(Item, P), tax_rate(Rate), Total is P * (1 + Rate).
   Aggregate:   alert_count(Sev, N) :- N = count : alert(?, Sev, ?).
                total_bytes(Host, T) :- T = sum(Bytes) : traffic(Host, Bytes).
-               (also: min, max)
+               (also: min, max; aggregates are RULES - to answer "how
+                many", set_rules an aggregate, then query its head)
   Builtins:    @contains(Str, "needle")   - constraint form (in the body, must hold)
                @time_diff(T2, T1, D)      - binding form (D is the output)
+               The @ sigil is required: contains(X, P) WITHOUT it names a
+               matcher-emitted fact predicate that holds only the patterns
+               declared in the schema - silently 0 rows for anything else.
   Comments start with "%". "?" alone and a bare "_" are anonymous
   variables (each occurrence is distinct, matches anything, binds
-  nothing) - legal in rule bodies, but rejected in the query tool's
-  arguments, where every position should be a named variable or an
-  underscore-prefixed one (_Ignored). A statement ends with "." (fact or
-  rule) or "?" (query).`
+  nothing) - legal anywhere in rule bodies; in the query tool's arguments
+  they are allowed only inside negated atoms (where they are the required
+  don't-care form), and every other position should be a named variable
+  or an underscore-prefixed one (_Ignored). A statement ends with "."
+  (fact or rule) or "?" (query).`
 
 // mcpSetRulesDescription documents set_rules: whole-document replacement,
 // the syntax summary, and the embedded-query rejection.
@@ -178,12 +233,29 @@ and stats, then go back and adjust schema/rules as needed).
 
 ` + mcpDatalogSyntaxSummary + `
 
-The "query" argument is a single query statement. Name every variable you
-want returned as a column, and use an underscore-prefixed variable for
-positions you don't care about - the anonymous variables '?' and bare '_'
-are rejected in query arguments (they are for rule bodies, via set_rules):
+The "query" argument is a single query statement, and its body is a
+conjunction: comma-separated atoms evaluated together, joined on shared
+variables, with comparisons, @builtins, and negation allowed. Let the
+engine do the joining - to relate two predicates, share a variable
+between their atoms:
+  remote_logon(Host, User, _A, _B), smb_conn(Host, _C, _D)?
+Do NOT query each predicate separately and correlate the rows yourself:
+the engine's join is exact and complete, while hand-matching two
+truncated row lists is neither, and one conjunctive query is cheaper
+than two queries plus reasoning.
+
+Name every variable you want returned as a column, and use an
+underscore-prefixed variable for positions you don't care about - the
+anonymous variables '?' and bare '_' are rejected in positive query
+atoms:
   suspicious(Host, Pid, Cmd)?
   exe_drop(Host, User, _Share, Path, _Ip)?
+Inside a NEGATED atom, anonymous variables are instead the required
+don't-care form ("SMB sources nobody logged into"):
+  smb_conn(H, _S, _D), not remote_logon(H, ?, ?, ?)?
+
+To answer "how many ..." questions, do not count rows by eye: define an
+aggregate rule via set_rules (N = count : ...) and query its head.
 
 A query over a predicate that no loaded data or rule defines is not an
 error - it just returns 0 rows. If a count is unexpectedly zero, check

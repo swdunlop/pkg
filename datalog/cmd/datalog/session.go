@@ -415,8 +415,13 @@ func (s *session) allPredicateNames() []string {
 	return names
 }
 
-// extractNamedVars collects unique non-underscore variables from query body atoms,
-// preserving order of first occurrence.
+// extractNamedVars collects unique named variables from query body atoms,
+// preserving order of first occurrence. Underscore-prefixed variables and
+// parser-generated anonymous ones (?N, from '?' and bare '_') are excluded:
+// they are don't-cares, not requested columns — and excluding them from the
+// synthetic head is what lets a negated query atom use anonymous variables
+// (the engine's safety check skips anonymous vars in negated atoms, but a
+// head variable must always be bound).
 func extractNamedVars(body []syntax.Atom) []string {
 	var vars []string
 	seen := map[string]bool{}
@@ -424,7 +429,7 @@ func extractNamedVars(body []syntax.Atom) []string {
 		for _, t := range atom.Terms {
 			if v, ok := t.(datalog.Variable); ok {
 				name := string(v)
-				if !seen[name] && !strings.HasPrefix(name, "_") {
+				if !seen[name] && !strings.HasPrefix(name, "_") && !strings.HasPrefix(name, "?") {
 					vars = append(vars, name)
 					seen[name] = true
 				}
@@ -442,7 +447,7 @@ func extractExprVars(expr syntax.Expr, vars *[]string, seen map[string]bool) {
 	case syntax.TermExpr:
 		if v, ok := e.Term.(datalog.Variable); ok {
 			name := string(v)
-			if !seen[name] && !strings.HasPrefix(name, "_") {
+			if !seen[name] && !strings.HasPrefix(name, "_") && !strings.HasPrefix(name, "?") {
 				*vars = append(*vars, name)
 				seen[name] = true
 			}

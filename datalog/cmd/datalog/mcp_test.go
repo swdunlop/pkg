@@ -395,6 +395,23 @@ func TestQuery_RejectsAnonymousVariables(t *testing.T) {
 	if out.Total != 5 {
 		t.Fatalf("query: total = %d, want 5", out.Total)
 	}
+
+	// Inside a negated atom, anonymous variables are exempt from the
+	// rejection — there they are the only safe don't-care form (the engine
+	// requires negated-atom variables to be positively bound or anonymous).
+	out, err = h.query(context.Background(), queryInput{Query: `event(Host, Pid, Cmd), not event(Host, 999999, ?)?`})
+	if err != nil {
+		t.Fatalf("query with anonymous var in negated atom: %v", err)
+	}
+	if out.Total != 5 {
+		t.Fatalf("negated query: total = %d, want 5", out.Total)
+	}
+	// And the anonymous variable must not leak into the result columns.
+	for _, v := range out.Vars {
+		if strings.HasPrefix(v, "?") {
+			t.Fatalf("anonymous variable leaked into result columns: %v", out.Vars)
+		}
+	}
 }
 
 func TestQuery_HardCap(t *testing.T) {

@@ -74,7 +74,10 @@ already loaded. Orient with list_predicates, then answer questions with query
 and sample_facts against what is there. set_schema and set_rules REPLACE the
 human's working documents - call them only when the human explicitly asks you
 to change the schema or rules, never to answer a question; sample_input is for
-authoring too, not for lookups. Prefer counts and samples over dumps. Every
+authoring too, not for lookups. Datalog is the reasoner: express joins and
+filters in a single conjunctive query and let the engine unify, rather than
+fetching predicates one at a time and correlating results yourself. Prefer
+counts and samples over dumps. Every
 change you make appears immediately in the panes the human is watching; keep
 them informed of what you changed and why.`
 
