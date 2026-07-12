@@ -101,6 +101,33 @@ func (d *Dict) InternConstant(c datalog.Constant) uint64 {
 	panic("unknown constant type")
 }
 
+// ConstantToAny extracts the Go primitive from a typed datalog.Constant,
+// without normalizing numeric types. Callers that feed the result into
+// Dict.Intern or Dict.Has don't need to normalize first -- both already
+// call NormalizeNumeric internally. Callers doing their own comparisons or
+// arithmetic on the result (e.g. seminaive's compareValues/applyBinOp) must
+// handle int64/float64 mixing explicitly rather than relying on this
+// function to collapse them.
+func ConstantToAny(c datalog.Constant) any {
+	switch v := c.(type) {
+	case datalog.Float:
+		return float64(v)
+	case datalog.Integer:
+		return int64(v)
+	case datalog.String:
+		return string(v)
+	case datalog.ID:
+		return v
+	case datalog.Bool:
+		return v
+	case datalog.Null:
+		return v
+	case *datalog.Composite:
+		return v
+	}
+	panic("unknown constant type")
+}
+
 // NormalizeNumeric converts float64 values that represent exact integers
 // to int64, ensuring JSON numbers and Datalog integer literals intern identically.
 func NormalizeNumeric(v any) any {

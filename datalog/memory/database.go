@@ -86,7 +86,7 @@ func (db *Database) Query(pred string, terms ...datalog.Term) iter.Seq[[]datalog
 	var bs interned.BoundSet
 	for i, t := range terms {
 		if c, ok := t.(datalog.Constant); ok {
-			cID, has := db.dict.Has(constantToAny(c))
+			cID, has := db.dict.Has(interned.ConstantToAny(c))
 			if !has {
 				// Constant not in dict means no facts can match.
 				return func(yield func([]datalog.Constant) bool) {}
@@ -101,7 +101,7 @@ func (db *Database) Query(pred string, terms ...datalog.Term) iter.Seq[[]datalog
 		db.scanMu.Unlock()
 		for i := range scan.Len() {
 			fact := scan.Fact(i)
-			if !matchFact(fact, &bs) {
+			if !interned.MatchesBound(&bs, fact) {
 				continue
 			}
 			row := make([]datalog.Constant, arity)
@@ -113,45 +113,6 @@ func (db *Database) Query(pred string, terms ...datalog.Term) iter.Seq[[]datalog
 			}
 		}
 	}
-}
-
-// matchFact checks whether an InternedFact matches a query pattern.
-// Scan may have filtered on one bound column via an index, but the
-// remaining constant positions still need manual checking.
-func matchFact(fact *interned.InternedFact, bs *interned.BoundSet) bool {
-	for i := range fact.Arity {
-		if val, ok := bs.Get(i); ok {
-			if fact.Values[i] != val {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-// constantToAny extracts the Go primitive from a typed datalog.Constant.
-func constantToAny(c datalog.Constant) any {
-	switch v := c.(type) {
-	case datalog.Float:
-		f := float64(v)
-		if i := int64(f); float64(i) == f {
-			return i
-		}
-		return f
-	case datalog.Integer:
-		return int64(v)
-	case datalog.String:
-		return string(v)
-	case datalog.ID:
-		return v
-	case datalog.Bool:
-		return v
-	case datalog.Null:
-		return v
-	case *datalog.Composite:
-		return v
-	}
-	panic("unknown constant type")
 }
 
 // Predicates returns all predicate name/arity pairs that have at least one fact.

@@ -1,0 +1,178 @@
+package syntax_test
+
+import (
+	"testing"
+
+	"swdunlop.dev/pkg/datalog/syntax"
+)
+
+// renderRuleset re-renders every statement in a parsed Ruleset back to its
+// canonical textual form, in the same relative order the parser encountered
+// them (rules and aggregate rules interleave in rs.Rules/rs.AggRules by
+// parse order isn't preserved separately -- we simply render each bucket in
+// its own slice order, which is enough to check parse->print->parse
+// round-tripping without depending on cross-bucket interleaving).
+func renderRuleset(rs syntax.Ruleset) []string {
+	var out []string
+	for _, r := range rs.Rules {
+		out = append(out, r.String())
+	}
+	for _, ar := range rs.AggRules {
+		out = append(out, ar.String())
+	}
+	for _, q := range rs.Queries {
+		out = append(out, q.String())
+	}
+	return out
+}
+
+// FuzzParseAll checks that syntax.ParseAll never panics on arbitrary input,
+// and that whenever it succeeds, every re-printed statement (Rule.String,
+// AggregateRule.String, Query.String) is itself valid Datalog that
+// re-parses without error -- a parse -> print -> parse round trip. We only
+// assert re-parseability (not byte-for-byte equality of the two parses'
+// re-prints) because printing normalizes whitespace and desugars patterns
+// into fresh ?N variables/getter atoms, so two syntactically different but
+// semantically equivalent inputs need not print identically.
+func FuzzParseAll(f *testing.F) {
+	seeds := []string{
+		// facts
+		`parent("tom", "bob").`,
+		`val(42, -5).`,
+		`val(3.14).`,
+		`color(red).`,
+		`p(-5).`,
+		`p(_, _).`,
+
+		// rules
+		`ancestor(X, Y) :- parent(X, Y).`,
+		`ancestor(X, Y) :- parent(X, Z), ancestor(Z, Y).`,
+		`grandparent(X, Z) :- parent(X, Y), parent(Y, Z).`,
+
+		// negation
+		`lonely(X) :- person(X), not friend(X, ?).`,
+		`h(X) :- not p(X).`,
+
+		// is / arithmetic
+		`double(X, Y) :- val(X), Y is X * 2.`,
+		`diff(Y) :- val(X), Y is 1-2.`,
+		`diff(Y) :- val(X), Y is 1 - 2.`,
+		`diff(Y) :- val(X), Y is X-1.`,
+		`val(X) :- X is -5.`,
+		`r(X) :- val(X), _ is X * 2.`,
+		`m(X, Y) :- val(X, Y), Y is (X + 1) * 2 / 3.`,
+		`m(X, Y) :- val(X, Y), Y is X mod 2.`,
+
+		// aggregates
+		`total(P, T) :- T = sum(S) : score(P, S).`,
+		`total(S, T) :- T = sum(V) : val(V).`,
+		`c(X, N) :- N = count : d(X).`,
+		`mx(X, N) :- N = max(V) : d(X, V).`,
+		`mn(X, N) :- N = min(V) : d(X, V).`,
+
+		// builtins
+		`has(X) :- msg(X), @contains(X, "hello").`,
+
+		// comparisons
+		`bigger(X, Y) :- val(X, A), val(Y, B), A > B.`,
+		`q(X) :- val(X), X != 0, not excluded(X).`,
+
+		// strings with escapes
+		`s("a\nb\tc\\d\"e").`,
+
+		// queries
+		`parent(X, "bob")?`,
+		`p(_, ?0)?`,
+		`p(_, _)?`,
+		`s(_, ?, _)?`,
+		`ancestor("tom", X)?`,
+		`a(X), b(X)?`,
+
+		// patterns / destructuring
+		`suspicious(P) :- process(P, {name: Name, pid: Pid}), Pid > 1000.`,
+		`active(P) :- process(P, {"status": "active", name: N}).`,
+		`x(P) :- ev(P, {proc: {name: N}}).`,
+		`loop(P) :- conn(P, {src: X, dst: X}).`,
+		`arr(P) :- xs(P, [A, B, C]).`,
+		`arr(P) :- xs(P, [A, B | Rest]).`,
+		`g(X) :- obj(O), X is O.`,
+
+		// combined program
+		`
+			parent("tom", "bob").
+			parent("bob", "ann").
+			ancestor(X, Y) :- parent(X, Y).
+			ancestor(X, Y) :- parent(X, Z), ancestor(Z, Y).
+			ancestor("tom", X)?
+		`,
+		`
+			parent("tom", "bob").
+			ancestor(X, Y) :- parent(X, Y).
+			has(X) :- msg(X), @contains(X, "hello").
+			total(S, T) :- T = sum(V) : val(V).
+			q(X) :- val(X), X != 0, not excluded(X).
+			ancestor("tom", X)?
+		`,
+
+		// known-nasty seeds from recent parser fixes
+		`a(1). ; b(2).`,
+		`#junk`,
+		`not p(1).`,
+		`1 < 2.`,
+		`p(").`,
+		"p(\"\n",
+		`X is 1-2`,
+		`p(-5)`,
+		`p(_, ?0)?`,
+		`a(1) ! b(2).`,
+		`a(1) @ b(2).`,
+		"a(1).\nb(2).\nc(3,   ].\n",
+		"p(\").\np(\").\n",
+		`X is 1 + 2.`,
+		`X is Y + 1 :- val(Y).`,
+		`@contains(X, "hello").`,
+		`not h(X) :- p(X).`,
+		`A > B :- val(A), val(B).`,
+
+		// misc edge cases
+		``,
+		` `,
+		`.`,
+		`?`,
+		`(`,
+		`)`,
+		`"`,
+		`p(`,
+		`p()`,
+		`p(,)`,
+		`p(1,).`,
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, input string) {
+		rs, err := syntax.ParseAll(input)
+		if err != nil {
+			return
+		}
+
+		// Every re-printed statement must itself be valid, re-parseable
+		// Datalog: parse -> print -> parse must not fail.
+		for _, src := range renderRuleset(rs) {
+			rs2, err := syntax.ParseAll(src)
+			if err != nil {
+				t.Fatalf("re-parse of printed statement failed: %q: %v\noriginal input: %q", src, err, input)
+			}
+			// Re-printing again should not itself fail to reprint or panic,
+			// and should produce a re-parseable form as well (checks
+			// stability of the desugared/normalized form under repeated
+			// print/parse cycles).
+			for _, src2 := range renderRuleset(rs2) {
+				if _, err := syntax.ParseAll(src2); err != nil {
+					t.Fatalf("second re-parse failed: %q: %v\nfirst reprint: %q\noriginal input: %q", src2, err, src, input)
+				}
+			}
+		}
+	})
+}

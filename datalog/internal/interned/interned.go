@@ -270,20 +270,6 @@ func InternedFactHash(f InternedFact) uint64 {
 	return h
 }
 
-// AllTermsBound reports whether every term in a compiled atom is resolved
-// under the given substitution.
-func AllTermsBound(ca CompiledAtom, sub InternedSub) bool {
-	for i := range ca.Arity {
-		t := ca.Terms[i]
-		if t.VarName != "" {
-			if _, ok := sub.Get(t.VarName); !ok {
-				return false
-			}
-		}
-	}
-	return true
-}
-
 // GroundCompiled resolves a compiled atom under an InternedSub.
 func GroundCompiled(ca CompiledAtom, sub InternedSub) (InternedFact, bool) {
 	var f InternedFact
@@ -301,63 +287,6 @@ func GroundCompiled(ca CompiledAtom, sub InternedSub) (InternedFact, bool) {
 		}
 	}
 	return f, true
-}
-
-// UnifyCompiled unifies a compiled atom against an InternedFact.
-// No dict lookups needed -- constants are pre-interned.
-func UnifyCompiled(ca CompiledAtom, fact InternedFact, sub InternedSub) (InternedSub, bool) {
-	if ca.Pred != fact.Pred || ca.Arity != fact.Arity {
-		return nil, false
-	}
-
-	// Pass 1: check compatibility without allocating.
-	newBindings := 0
-	for i := range ca.Arity {
-		val := fact.Values[i]
-		t := ca.Terms[i]
-		if t.VarName == "" {
-			if t.ConstID != val {
-				return nil, false
-			}
-		} else {
-			if existing, ok := sub.Get(t.VarName); ok {
-				if existing != val {
-					return nil, false
-				}
-			} else {
-				newBindings++
-			}
-		}
-	}
-
-	// Pass 2: extend using append (DFS-safe backing array reuse).
-	if newBindings == 0 {
-		return sub, true
-	}
-	result := sub
-	for i := range ca.Arity {
-		t := ca.Terms[i]
-		if t.VarName != "" {
-			if _, bound := result.Get(t.VarName); !bound {
-				result = append(result, InternedSubEntry{t.VarName, fact.Values[i]})
-			}
-		}
-	}
-	return result, true
-}
-
-// BoundArgsCompiled computes bound argument positions from a compiled atom.
-func BoundArgsCompiled(ca CompiledAtom, sub InternedSub) BoundSet {
-	var bs BoundSet
-	for i := range ca.Arity {
-		t := ca.Terms[i]
-		if t.VarName == "" {
-			bs.Set(i, t.ConstID)
-		} else if val, ok := sub.Get(t.VarName); ok {
-			bs.Set(i, val)
-		}
-	}
-	return bs
 }
 
 // --- VarSub-based variants (indexed, zero-alloc hot path) ---

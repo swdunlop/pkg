@@ -218,30 +218,38 @@ func checkConstraintV(pred string, terms []interned.CompiledTerm, sub *interned.
 	return false
 }
 
-// evalBindBuiltin evaluates a binding builtin and returns the interned result ID.
+// evalBindBuiltinV evaluates a binding builtin and returns the interned
+// result ID. It resolves the builtin's input terms directly from a VarSub
+// via pre-compiled term slots, without allocating an InternedSub or doing
+// string-keyed lookups -- mirrors evalBindMulti's use of
+// resolveCompiledTermValue.
 //
 // A BuiltinFunc that returns a value normalizeUserValue rejects (e.g. a bare
 // Go int or bool, or an unsupported type) is a programming error in the
 // builtin, not a data miss -- unlike an (nil, false) return, which just
 // means "no result for these inputs" and is handled by the ok=false path
-// here. evalBindBuiltin has no error return (it is called from
+// here. evalBindBuiltinV has no error return (it is called from
 // evalBodyRecursiveV's hot recursive loop, which threads no error out
 // either), so a bad type panics with builtinValueError; the panic is
 // recovered at the two callers that do have an error return, evalRules and
 // queryInternedFacts, mirroring the existing queryCancelled sentinel
 // pattern used for ctx-cancellation unwinding.
-func evalBindBuiltin(a syntax.Atom, sub interned.InternedSub, dict *interned.Dict, builtins map[string]BuiltinFunc) (uint64, bool) {
-	fn, ok := builtins[a.Pred]
+func evalBindBuiltinV(item bodyItem, sub *interned.VarSub, dict *interned.Dict, builtins map[string]BuiltinFunc) (uint64, bool) {
+	fn, ok := builtins[item.atom.Pred]
 	if !ok {
 		return 0, false
 	}
-	inputs := make([]any, len(a.Terms)-1)
-	for i, t := range a.Terms[:len(a.Terms)-1] {
-		id, ok := resolveTermID(t, sub, dict)
+	nIn := item.ca.Arity - 1
+	if nIn < 0 {
+		return 0, false
+	}
+	inputs := make([]any, nIn)
+	for i := range nIn {
+		v, ok := resolveCompiledTermValue(item.ca.Terms[i], sub, dict)
 		if !ok {
 			return 0, false
 		}
-		inputs[i] = dict.Resolve(id)
+		inputs[i] = v
 	}
 	result, ok := fn(inputs)
 	if !ok {
@@ -249,7 +257,7 @@ func evalBindBuiltin(a syntax.Atom, sub interned.InternedSub, dict *interned.Dic
 	}
 	nv, err := normalizeUserValue(result)
 	if err != nil {
-		panic(builtinValueError{pred: a.Pred, err: err})
+		panic(builtinValueError{pred: item.atom.Pred, err: err})
 	}
 	return dict.Intern(nv), true
 }
@@ -352,30 +360,9 @@ func resolveTermValue(t datalog.Term, sub interned.InternedSub, dict *interned.D
 		}
 		return dict.Resolve(id), true
 	case datalog.Constant:
-		return constantToAny(v), true
+		return interned.ConstantToAny(v), true
 	}
 	return nil, false
-}
-
-// constantToAny extracts the Go primitive from a typed datalog.Constant.
-func constantToAny(c datalog.Constant) any {
-	switch v := c.(type) {
-	case datalog.Float:
-		return float64(v)
-	case datalog.Integer:
-		return int64(v)
-	case datalog.String:
-		return string(v)
-	case datalog.ID:
-		return v
-	case datalog.Bool:
-		return v
-	case datalog.Null:
-		return v
-	case *datalog.Composite:
-		return v
-	}
-	panic("unknown constant type")
 }
 
 // evalExpr evaluates an arithmetic expression under an interned substitution.
@@ -684,6 +671,7 @@ func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existin
 		body         []bodyItem
 		negativeBody []interned.CompiledAtom
 		joinCount    int
+		joinAtoms    []interned.CompiledAtom // joinIdx -> compiled atom, precomputed once (was a per-iteration linear scan of body)
 		varNames     []string
 	}
 	compiled := make([]compiledRule, 0, len(rules))
@@ -706,6 +694,17 @@ func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existin
 		cr.varNames = make([]string, len(varMap))
 		for name, idx := range varMap {
 			cr.varNames[idx] = name
+		}
+		// Precompute joinIdx -> CompiledAtom once; reorderBody permutes body
+		// order but joinIdx values are stable, so this map is fixed for the
+		// life of the rule and doesn't need to be rebuilt per iteration.
+		if joinCount > 0 {
+			cr.joinAtoms = make([]interned.CompiledAtom, joinCount)
+			for _, item := range cr.body {
+				if item.kind == bodyItemJoin {
+					cr.joinAtoms[item.joinIdx] = item.ca
+				}
+			}
 		}
 		compiled = append(compiled, cr)
 	}
@@ -748,13 +747,7 @@ func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existin
 				// re-derive nothing new while wasting a full body scan every
 				// iteration. Skip them entirely once iteration 0 has run.
 				for deltaJoinIdx := range cr.joinCount {
-					var deltaCA interned.CompiledAtom
-					for _, item := range cr.body {
-						if item.kind == bodyItemJoin && item.joinIdx == deltaJoinIdx {
-							deltaCA = item.ca
-							break
-						}
-					}
+					deltaCA := cr.joinAtoms[deltaJoinIdx]
 					if len(delta.Get(deltaCA.Pred, deltaCA.Arity)) == 0 {
 						continue
 					}
@@ -942,8 +935,7 @@ func (ev *evaluator) evalBodyRecursiveV(
 		}
 
 	case bodyItemBind:
-		isub := varSubToInternedSub(sub, varNames)
-		valID, ok := evalBindBuiltin(item.atom, isub, ev.dict, ev.builtins)
+		valID, ok := evalBindBuiltinV(item, sub, ev.dict, ev.builtins)
 		if !ok {
 			return
 		}

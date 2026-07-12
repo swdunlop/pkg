@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"swdunlop.dev/pkg/datalog"
 )
@@ -261,7 +260,11 @@ func (l *lexer) nextRaw() token {
 		return token{kind: tokMinus, val: "-", pos: startPos}
 	case b >= '0' && b <= '9':
 		return l.readNumber()
-	case b == '_' || unicode.IsUpper(rune(b)) || unicode.IsLower(rune(b)):
+	case b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z'):
+		// ASCII-only on purpose: bytes >= 0x80 must not be widened to a
+		// rune here (0xC5 would pass unicode.IsUpper as 'Å') because
+		// readIdent only consumes isIdentChar bytes -- a non-ASCII byte
+		// would yield a zero-length token that never advances the lexer.
 		return l.readIdent()
 	case b == '@':
 		// Sigil for engine builtins: @contains, @starts_with, etc.
