@@ -195,7 +195,7 @@ section.pane td {
 }
 #data-table-body li {
   overflow-wrap: anywhere;
-  max-width: 40rem;
+  width: 100%;
   font-family: var(--font-mono);
   padding: var(--space-1) var(--space-2);
 }
