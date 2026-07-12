@@ -261,6 +261,131 @@ func TestRunAgentTurnTranscript(t *testing.T) {
 	}
 }
 
+// TestRunAgentTurnMessageInterleavedWithToolBreaksAccumulator is the
+// regression test for the transcript-ordering bug observed live against a
+// real Claude Code ACP agent: text, then a tool call, then more text. Before
+// the fix, every "message" chunk for the whole turn morphed the SAME entry
+// created by the first chunk, so the tool call ended up sandwiched
+// underneath one giant pooled reply instead of between two separate ones.
+// runAgentTurn's sink now resets msgID/msgText whenever a DIFFERENT kind
+// appends a new entry (breakStreaming in agent.go), so the tool-call here
+// must end the first message entry and the post-tool chunks must start a
+// second, separate one — asserted both by entry COUNT/ORDER (entryKinds)
+// and by the second entry's text containing only the post-tool content, no
+// duplication of the first.
+func TestRunAgentTurnMessageInterleavedWithToolBreaksAccumulator(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	driver := &fakeDriver{
+		events: []agentEvent{
+			{Kind: "message", Text: "let me check"},
+			{Kind: "tool-call", ToolCallID: "t1", ToolName: "datalog__query", ToolArgs: `{"query":"copied_to(F,H)?"}`},
+			{Kind: "tool-result", ToolCallID: "t1", ToolName: "datalog__query", ToolArgs: `{"query":"copied_to(F,H)?"}`, Result: "3 rows"},
+			{Kind: "message", Text: "here's what I "},
+			{Kind: "message", Text: "found."},
+		},
+		stopReason: "stop",
+	}
+
+	wb.runAgentTurn(context.Background(), driver, "how many copies?")
+
+	kinds := entryKinds(t, wb, "agent")
+	want := []string{"agent", "tool", "agent"}
+	if len(kinds) != len(want) {
+		t.Fatalf("entry kinds = %v, want %v (transcript must read message, tool, message in order)", kinds, want)
+	}
+	for i, k := range want {
+		if kinds[i] != k {
+			t.Fatalf("entry kinds = %v, want %v", kinds, want)
+		}
+	}
+
+	entries := wb.console.Render("agent")
+	first := renderContent(entries[0])
+	second := renderContent(entries[2])
+	if !strings.Contains(first, "let me check") {
+		t.Fatalf("first message entry missing its text: %s", first)
+	}
+	if strings.Contains(first, "found.") {
+		t.Fatalf("first message entry absorbed post-tool text: %s", first)
+	}
+	if !strings.Contains(second, "found.") {
+		t.Fatalf("second message entry missing the post-tool text: %s", second)
+	}
+	if strings.Contains(second, "let me check") {
+		t.Fatalf("second message entry duplicated the first entry's text: %s", second)
+	}
+}
+
+// TestRunAgentTurnThoughtInterleavedWithMessageBreaksAccumulator covers the
+// cheaper interleaving shape breakStreaming's doc comment calls out
+// explicitly: a thought interrupting a message must end the message entry,
+// and the message that follows the thought must start its own new entry —
+// three entries in chronological order (message, thought, message), not two
+// pooled ones.
+func TestRunAgentTurnThoughtInterleavedWithMessageBreaksAccumulator(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	driver := &fakeDriver{
+		events: []agentEvent{
+			{Kind: "message", Text: "first reply"},
+			{Kind: "thought", Text: "reconsidering"},
+			{Kind: "message", Text: "second reply"},
+		},
+		stopReason: "stop",
+	}
+
+	wb.runAgentTurn(context.Background(), driver, "hi")
+
+	kinds := entryKinds(t, wb, "agent")
+	want := []string{"agent", "thought", "agent"}
+	if len(kinds) != len(want) {
+		t.Fatalf("entry kinds = %v, want %v (message, thought, message in order)", kinds, want)
+	}
+	for i, k := range want {
+		if kinds[i] != k {
+			t.Fatalf("entry kinds = %v, want %v", kinds, want)
+		}
+	}
+
+	entries := wb.console.Render("agent")
+	if !strings.Contains(renderContent(entries[0]), "first reply") {
+		t.Fatalf("first entry missing its text: %s", renderContent(entries[0]))
+	}
+	if !strings.Contains(renderContent(entries[2]), "second reply") {
+		t.Fatalf("third entry missing its text: %s", renderContent(entries[2]))
+	}
+	if strings.Contains(renderContent(entries[2]), "first reply") {
+		t.Fatalf("third entry duplicated the first message's text: %s", renderContent(entries[2]))
+	}
+}
+
+// entryKinds renders tab's scrollback and extracts each entry's "kind"
+// class, one per rendered html.Content, in transcript order — view.
+// ConsoleEntry always sets class='console-entry <kind>' as the SECOND class
+// token, so a simple split suffices without parsing the markup. This is the
+// tool the interleaving-order tests use to assert entries land message,
+// tool, message rather than pooling all the message chunks into one entry
+// near the top (the bug this file's TestRunAgentTurn* interleaving tests
+// guard against).
+func entryKinds(t *testing.T, wb *workbench, tab string) []string {
+	t.Helper()
+	var kinds []string
+	for _, c := range wb.console.Render(tab) {
+		rendered := renderContent(c)
+		const marker = "class='console-entry "
+		i := strings.Index(rendered, marker)
+		if i < 0 {
+			t.Fatalf("entry missing console-entry class: %s", rendered)
+		}
+		rest := rendered[i+len(marker):]
+		j := strings.IndexByte(rest, '\'')
+		if j < 0 {
+			t.Fatalf("entry class attribute not closed: %s", rendered)
+		}
+		kinds = append(kinds, rest[:j])
+	}
+	return kinds
+}
+
 func renderContent(c html.Content) string {
 	return string(html.Append(nil, c))
 }

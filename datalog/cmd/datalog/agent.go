@@ -490,20 +490,59 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 		thoughtBuf strings.Builder
 		toolIDs    = map[string]uint64{} // ToolCallID → console entry id
 		planID     uint64                // "plan" entry, updated in place per acp-integration.md phase 2
+
+		// gotReply records whether any message chunk arrived this turn,
+		// independent of msgID: msgID resets to 0 whenever a tool call,
+		// permission, or other appended entry interrupts the streaming
+		// message (breakStreaming), so "msgID != 0" can no longer stand in
+		// for "the model composed a reply" the way it once could when a
+		// turn's whole message text accumulated into a single entry that
+		// never reset.
+		gotReply bool
 	)
+
+	// breakStreaming ends whatever message/thought entry is currently
+	// accumulating so the NEXT chunk of either kind starts a fresh entry at
+	// the bottom of the transcript, rather than morphing something that is
+	// no longer adjacent to it. This is the fix for the interleaving bug
+	// observed live against a real Claude Code ACP agent
+	// (doc/features/acp-integration.md): without it, every "message" chunk
+	// for the whole turn morphs the SAME entry created by the first chunk,
+	// so an agent that emits text, then a tool call, then more text renders
+	// with all the text pooled at the top and the tool call stuck
+	// underneath — reading out of chronological order. The rule: any event
+	// that APPENDS a new entry (tool-call, permission — including the
+	// auto-allowed note, the plan's first append, error) ends the current
+	// streaming message/thought; events that morph an existing entry in
+	// place (tool-result, a plan UPDATE) do not, since nothing new was
+	// inserted between the streaming entry and wherever the next chunk
+	// would land. A thought interrupting a message ends the message entry,
+	// and vice versa — each kind's accumulator resets when a DIFFERENT kind
+	// appends, not just any non-matching kind.
+	breakStreaming := func() {
+		msgID = 0
+		msgText.Reset()
+		thoughtID = 0
+		thoughtBuf.Reset()
+	}
 
 	sink := func(ev agentEvent) {
 		mu.Lock()
 		defer mu.Unlock()
 		switch ev.Kind {
 		case "message":
+			thoughtID = 0
+			thoughtBuf.Reset()
 			msgText.WriteString(ev.Text)
 			if msgID == 0 {
+				gotReply = true
 				msgID = wb.consoleAppend("agent", "agent", html.Text(msgText.String()))
 			} else {
 				wb.consoleUpdate(msgID, "agent", html.Text(msgText.String()))
 			}
 		case "thought":
+			msgID = 0
+			msgText.Reset()
 			thoughtBuf.WriteString(ev.Text)
 			body := thoughtEntry(thoughtBuf.String())
 			if thoughtID == 0 {
@@ -512,15 +551,22 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 				wb.consoleUpdate(thoughtID, "thought", body)
 			}
 		case "tool-call":
+			breakStreaming()
 			id := wb.consoleAppend("agent", "tool", toolEntry(ev, false))
 			toolIDs[ev.ToolCallID] = id
 		case "tool-result":
+			// A morph in place, never an append — does not break the
+			// streaming accumulators (see breakStreaming's doc comment). The
+			// "unknown tool call" fallback below DOES append, so it breaks
+			// them like any other append.
 			if id, ok := toolIDs[ev.ToolCallID]; ok {
 				wb.consoleUpdate(id, "tool", toolEntry(ev, true))
 			} else {
+				breakStreaming()
 				wb.consoleAppend("agent", "tool", toolEntry(ev, true))
 			}
 		case "error":
+			breakStreaming()
 			wb.consoleAppend("agent", "error", html.Text(ev.Text))
 		case "permission":
 			// Auto-allow policy (doc/features/acp-integration.md's
@@ -541,6 +587,11 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 			// error (a raced turn teardown — e.g. the turn ended between
 			// the event firing and this call) falls through to the normal
 			// buttons path so the request is never silently dropped.
+			//
+			// Both branches below append a new entry — the auto-allowed note,
+			// or the interactive buttons — never a morph, so the streaming
+			// accumulators break once here regardless of which branch is taken.
+			breakStreaming()
 			if _, ok := readOnlyToolName(ev.ToolName); ok {
 				if opt, ok := autoAllowOption(ev.Options); ok {
 					if err := driver.Answer(ev.RequestID, opt.ID); err == nil {
@@ -566,6 +617,13 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 		case "plan":
 			body := planEntry(ev.PlanEntries)
 			if planID == 0 {
+				// The plan's FIRST update is an append (a new entry lands in
+				// the transcript), so — like any other append — it breaks
+				// the streaming accumulators. Every later plan update morphs
+				// that same entry in place (ACP's plan/update always
+				// carries the complete list, per agentPlanEntry's doc
+				// comment) and must NOT break them.
+				breakStreaming()
 				planID = wb.consoleAppend("agent", "plan", body)
 			} else {
 				wb.consoleUpdate(planID, "plan", body)
@@ -575,7 +633,7 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 
 	stopReason, err := driver.Prompt(ctx, text, sink)
 	mu.Lock()
-	gotReply := msgID != 0
+	reply := gotReply
 	mu.Unlock()
 	switch {
 	case ctx.Err() != nil:
@@ -583,7 +641,7 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 	case err != nil:
 		wb.consoleAppend("agent", "error", html.Text(fmt.Sprintf("turn failed: %v", err)))
 		wb.dropAgentDriver(driver)
-	case !gotReply:
+	case !reply:
 		// A model may end its turn on a tool round without composing any
 		// reply (small models do this routinely). Rendering nothing would
 		// read as a hang — say so instead (acp-integration.md: an ended

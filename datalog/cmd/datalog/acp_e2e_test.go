@@ -693,12 +693,20 @@ func TestACPDriver_PermissionViaConsoleHTTP(t *testing.T) {
 	answerResp.Body.Close()
 
 	// The turn should finish shortly after the answer unblocks it; poll for
-	// the resolved rendering and the final message.
-	waitFor(t, func() bool { return strings.Contains(renderLog(wb, "agent"), "answered: Allow") })
+	// the resolved rendering and the final message. "permission answered:
+	// allow_once" is the fake agent's own final SessionUpdate, sent only
+	// AFTER its RequestPermission call returns — waiting for it (not just
+	// the resolved permission morph, which handleConsoleAnswer renders
+	// first) ensures the turn has fully finished before the order assertion
+	// below inspects the last transcript entry.
+	waitFor(t, func() bool { return strings.Contains(renderLog(wb, "agent"), "permission answered: allow_once") })
 
 	log = renderLog(wb, "agent")
 	if strings.Contains(log, "permission-option") {
 		t.Fatalf("resolved permission entry still carries live buttons: %s", log)
+	}
+	if !strings.Contains(log, "answered: Allow") {
+		t.Fatalf("resolved permission entry does not name the chosen option: %s", log)
 	}
 	if !strings.Contains(log, "smb_conn") {
 		t.Fatalf("transcript missing the real tool-result content: %s", log)
@@ -709,6 +717,58 @@ func TestACPDriver_PermissionViaConsoleHTTP(t *testing.T) {
 	wb.permMu.Unlock()
 	if n != 0 {
 		t.Fatalf("pendingPerm not cleared after the turn ended: %d entries remain", n)
+	}
+
+	// Transcript ORDER, not just presence: promptFullScript's sequence is
+	// message chunks, then a plan, then a tool call, then (in either order)
+	// the tool result and the permission request, then a final message —
+	// the same interleaving shape (text, tool call, more text) that the
+	// live-observed bug (agent.go's runAgentTurn, breakStreaming) pooled all
+	// the reply text into one entry at the TOP with the tool/plan/permission
+	// entries appended below it, instead of reading top-to-bottom in the
+	// order the agent actually produced them. Assert the first entry is the
+	// streamed opening message (one entry, not two — the two chunks
+	// "looking at the session"/" now" must have morphed together), the
+	// message entries are the first and last entries in the log, and a tool
+	// entry lands strictly between them.
+	// handleConsolePrompt appends a "user" entry for the prompt itself
+	// before the turn even starts, so the transcript's own message/tool
+	// ordering begins at kinds[1:].
+	kinds := entryKinds(t, wb, "agent")
+	if len(kinds) < 1 || kinds[0] != "user" {
+		t.Fatalf("first transcript entry = %v, want the user's prompt (\"user\") leading the log: %v", kinds, kinds)
+	}
+	turnKinds := kinds[1:]
+	if len(turnKinds) < 3 {
+		t.Fatalf("too few transcript entries to check order: %v", turnKinds)
+	}
+	if turnKinds[0] != "agent" {
+		t.Fatalf("first turn entry = %q, want the opening message (\"agent\"): %v", turnKinds[0], turnKinds)
+	}
+	if turnKinds[len(turnKinds)-1] != "agent" {
+		t.Fatalf("last turn entry = %q, want the final message (\"agent\"): %v", turnKinds[len(turnKinds)-1], turnKinds)
+	}
+	toolIdx := -1
+	for i, k := range turnKinds {
+		if k == "tool" {
+			toolIdx = i
+			break
+		}
+	}
+	if toolIdx <= 0 || toolIdx >= len(turnKinds)-1 {
+		t.Fatalf("tool entry not strictly between the opening and final message entries: kinds=%v", turnKinds)
+	}
+	entries := wb.console.Render("agent")
+	opening := renderContent(entries[1]) // entries[0] is the "user" entry
+	if !strings.Contains(opening, "looking at the session now") {
+		t.Fatalf("opening message entry did not accumulate both streamed chunks into one entry: %s", opening)
+	}
+	if strings.Contains(opening, "permission answered") {
+		t.Fatalf("opening message entry absorbed the final message's text — the pooling regression: %s", opening)
+	}
+	last := renderContent(entries[len(entries)-1])
+	if !strings.Contains(last, "permission answered: allow_once") {
+		t.Fatalf("final transcript entry is not the final message: %s", last)
 	}
 }
 
