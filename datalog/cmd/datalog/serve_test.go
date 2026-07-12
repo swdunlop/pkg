@@ -52,6 +52,26 @@ func newMordorWorkbench(t *testing.T) *workbench {
 	return wb
 }
 
+// TestStartupEvaluatesRules: a preloaded ruleset is evaluated during
+// newWorkbench, so derived predicates are browsable (and agent-visible)
+// immediately — nobody has to remember to press Run after starting serve.
+func TestStartupEvaluatesRules(t *testing.T) {
+	wb := newMordorWorkbench(t)
+
+	wb.h.mu.Lock()
+	defer wb.h.mu.Unlock()
+	if wb.h.sess.derivedDB == nil {
+		t.Fatalf("derivedDB not populated at startup")
+	}
+	n := 0
+	for range wb.h.sess.derivedDB.Facts("smb_conn", 3) {
+		n++
+	}
+	if n == 0 {
+		t.Fatalf("derived predicate smb_conn empty after startup evaluation")
+	}
+}
+
 // startTestServer wraps wb's routes (and /mcp mount) in an httptest.Server.
 func startTestServer(wb *workbench) *httptest.Server {
 	mux := http.NewServeMux()

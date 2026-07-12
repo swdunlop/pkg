@@ -142,6 +142,36 @@ func newWorkbench(dataDir, configPath string, ruleFiles []string, tokenFlag stri
 	// is unchanged.
 	h.onChange = wb.publishSessionChanged
 
+	// Evaluate the preloaded ruleset once at startup, mirroring what Run
+	// does (rules_editor.go handleRulesRun): the -c schema is already
+	// applied by newMCPHandlers (setSchema loads the data), but nothing
+	// populates session.derivedDB until someone presses Run — and the
+	// agent has no Run button, so without this it would see every derived
+	// predicate as 0 facts until the human remembered to click. Errors
+	// are non-fatal: parse errors were already fatal in newMCPHandlers,
+	// and a compile/timeout problem here is fixable in the running
+	// editor, so warn and serve rather than refuse to start.
+	if len(h.sess.rules)+len(h.sess.aggRules) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), evalTimeout)
+		evalErr := <-runRecovered(func() error {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			db, err := h.sess.evaluate(ctx)
+			if err != nil {
+				return err
+			}
+			if err := checkFactCap(db); err != nil {
+				return err
+			}
+			h.sess.derivedDB = db
+			return nil
+		})
+		cancel()
+		if evalErr != nil {
+			fmt.Fprintf(os.Stderr, "datalog serve: initial rule evaluation: %v\n", evalErr)
+		}
+	}
+
 	return wb, closeFn, nil
 }
 
