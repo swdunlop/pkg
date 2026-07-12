@@ -219,6 +219,42 @@ func (d *acpDriver) Prompt(ctx context.Context, text string, sink func(agentEven
 
 	select {
 	case r := <-promptDone:
+		// The SDK's own SendRequest also watches ctx and can return its own
+		// "Request cancelled" RPC error the instant ctx is done — racing
+		// this select's <-ctx.Done() case directly, since both channels
+		// become ready around the same moment. If that race lands here
+		// instead of on the ctx.Done() case below, ctx.Err() is still
+		// non-nil, and treating it as an ordinary RPC error would skip
+		// cancelTurn entirely: no session/cancel is sent, no pending
+		// permission requests are resolved Cancelled (ACP's cancellation
+		// contract requires this), and the kill timer never arms. Checking
+		// ctx.Err() here — not just relying on which case the select
+		// happened to pick — routes every cancellation through cancelTurn
+		// regardless of which goroutine noticed first.
+		if ctx.Err() != nil {
+			return d.cancelTurn(sessionID, alreadyDone(r))
+		}
+		// Symmetric race: a dying subprocess breaks the stdio pipe, which the
+		// SDK's own read/write loop observes independently of d.exited (the
+		// single monitor goroutine's cmd.Wait — see newACPDriver) — so
+		// d.conn.Prompt can return its own transport error ("peer
+		// disconnected before response") through promptDone before cmd.Wait
+		// has actually reaped the process and closed d.exited (a broken pipe
+		// is detectable slightly before wait(2) returns the exit status, so
+		// a bare non-blocking peek at d.exited loses this race almost every
+		// time). Giving d.exited a brief grace window — the process is
+		// already gone or dying, so this never meaningfully delays a normal
+		// turn — keeps the error message the design promises
+		// (acp-integration.md: "an agent crash renders an explicit 'agent
+		// exited (code N)' terminal state") regardless of which channel the
+		// runtime happened to service first.
+		if r.err != nil {
+			select {
+			case <-d.exited:
+				return "", d.exitError()
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
 		if r.err != nil {
 			return "", r.err
 		}
@@ -228,6 +264,18 @@ func (d *acpDriver) Prompt(ctx context.Context, text string, sink func(agentEven
 	case <-ctx.Done():
 		return d.cancelTurn(sessionID, promptDone)
 	}
+}
+
+// alreadyDone wraps a promptResult that has already been received off
+// promptDone into a channel of the same shape, pre-loaded with that one
+// value — so cancelTurn's own select-on-promptDone (which normally waits for
+// the RPC goroutine to finish) can be reused verbatim for the race window
+// documented in Prompt above, where the result arrived before ctx.Done() was
+// observed rather than after.
+func alreadyDone(r promptResult) <-chan promptResult {
+	ch := make(chan promptResult, 1)
+	ch <- r
+	return ch
 }
 
 // exitError formats the subprocess's recorded exit outcome (set once, by
@@ -249,6 +297,16 @@ type promptResult struct {
 	err  error
 }
 
+// requestCancelledErrorCode is the JSON-RPC error code acp-go-sdk's
+// NewRequestCancelled uses (-32800) — the SDK's own SendRequest returns an
+// error built with this constructor when the caller's ctx is done before a
+// response arrives, distinct from any error the AGENT itself might
+// legitimately return with the same shape by coincidence, but since a real
+// agent has no reason to hand back exactly this code, checking it is enough
+// to recognize "this is the transport echoing our own cancellation back",
+// not a genuine turn failure (see Prompt and cancelTurn's use).
+const requestCancelledErrorCode = -32800
+
 // cancelTurn implements the design's cancellation sequence: send
 // session/cancel and give the agent 5 seconds to end the turn with stop
 // reason "cancelled"; if it wedges, kill the subprocess (the doc's "kill
@@ -268,6 +326,20 @@ func (d *acpDriver) cancelTurn(sessionID acp.SessionId, promptDone <-chan prompt
 	select {
 	case r := <-promptDone:
 		if r.err != nil {
+			// The SDK's own request machinery also watches the ORIGINAL
+			// Prompt ctx (see Prompt's doc comment on the race this guards
+			// against) and, on cancellation, can return its own "Request
+			// cancelled" JSON-RPC error rather than letting the agent finish
+			// with stopReason cancelled. That is not a genuine agent-side
+			// failure — it is the transport echoing back the very
+			// cancellation this method exists to handle — so once
+			// session/cancel has been sent, report it the same way the kill
+			// timer branch below does (plain context.Canceled) instead of
+			// surfacing the SDK's internal error text as if the turn had
+			// failed.
+			if reqErr, ok := r.err.(*acp.RequestError); ok && reqErr.Code == requestCancelledErrorCode {
+				return "", context.Canceled
+			}
 			return "", r.err
 		}
 		return string(r.resp.StopReason), nil
