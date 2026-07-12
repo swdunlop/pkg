@@ -313,6 +313,7 @@ func (wb *workbench) routes(mux *http.ServeMux) {
 	// and the Agent tab's prompt (doc/features/web-ui.md "Console drawer").
 	mux.HandleFunc("POST /console/query", wb.handleConsoleQuery)
 	mux.HandleFunc("POST /console/prompt", wb.handleConsolePrompt)
+	mux.HandleFunc("POST /console/clear", wb.handleConsoleClear)
 
 	// Global Cancel — implemented fully now (doc/features/web-ui.md
 	// "Execution sandbox").

@@ -101,6 +101,85 @@ func TestConsoleLogCapAndUpdate(t *testing.T) {
 	}
 }
 
+// -- console clear ------------------------------------------------------------
+
+func TestConsoleClearQueryTab(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	srv := startTestServer(wb)
+	defer srv.Close()
+
+	wb.console.Append("query", "note", html.Text("probe"))
+	wb.console.Append("agent", "agent", html.Text("kept"))
+
+	resp := postSignals(t, srv, "/console/clear?tab=query", map[string]any{})
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+
+	if got := len(wb.console.Render("query")); got != 0 {
+		t.Fatalf("query scrollback not cleared: %d entries", got)
+	}
+	if !strings.Contains(renderLog(wb, "agent"), "kept") {
+		t.Fatalf("clearing query tab touched the agent scrollback")
+	}
+}
+
+func TestConsoleClearAgentResetsDriver(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	srv := startTestServer(wb)
+	defer srv.Close()
+
+	driver := &fakeDriver{}
+	wb.agent = driver
+	wb.console.Append("agent", "agent", html.Text("old conversation"))
+
+	resp := postSignals(t, srv, "/console/clear?tab=agent", map[string]any{})
+	defer resp.Body.Close()
+	_, _ = io.ReadAll(resp.Body)
+
+	if got := len(wb.console.Render("agent")); got != 0 {
+		t.Fatalf("agent scrollback not cleared: %d entries", got)
+	}
+	wb.agentMu.Lock()
+	live := wb.agent
+	wb.agentMu.Unlock()
+	if live != nil {
+		t.Fatalf("driver not dropped; the model would keep its conversation memory")
+	}
+	if !driver.closed {
+		t.Fatalf("dropped driver was not closed")
+	}
+}
+
+func TestConsoleClearAgentRefusedMidTurn(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	srv := startTestServer(wb)
+	defer srv.Close()
+
+	release := make(chan struct{})
+	wb.agent = &blockingDriver{release: release}
+	resp1 := postSignals(t, srv, "/console/prompt", map[string]any{"consolePrompt": "hi"})
+	_, _ = io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+
+	resp2 := postSignals(t, srv, "/console/clear?tab=agent", map[string]any{})
+	_, _ = io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+
+	log := renderLog(wb, "agent")
+	if !strings.Contains(log, "stop it before clearing") {
+		t.Fatalf("mid-turn clear was not refused: %s", log)
+	}
+	wb.agentMu.Lock()
+	live := wb.agent
+	wb.agentMu.Unlock()
+	if live == nil {
+		t.Fatalf("mid-turn clear dropped the running driver")
+	}
+
+	close(release)
+	waitFor(t, func() bool { return strings.Contains(renderLog(wb, "agent"), "done") })
+}
+
 // -- agent turn runner --------------------------------------------------------
 
 // fakeDriver scripts one turn's event sequence, standing in for kitDriver so

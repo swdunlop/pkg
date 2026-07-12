@@ -46,6 +46,7 @@ func consoleBar() html.Content {
 			Add(html.Text("▸ Console")),
 		consoleTabButton("query", "Query"),
 		consoleTabButton("agent", "Agent"),
+		clearButton(),
 		tag.New("span#console-status").Set("data-text", "$agentBusy ? 'agent turn running…' : ''"),
 	)
 }
@@ -57,6 +58,17 @@ func consoleTabButton(tab, label string) html.Content {
 		Add(html.Text(label))
 }
 
+// clearButton wipes the visible tab's scrollback (POST /console/clear).
+// $_consoleTab is client-local and never travels in signal payloads, so the
+// tab rides in the URL instead. Hidden while the drawer is collapsed —
+// clearing a log you cannot see would be a surprise.
+func clearButton() html.Content {
+	return tag.New("button#console-clear.console-tab").
+		Set("data-show", "$_consoleOpen").
+		Set("data-on:click", "@post('/console/clear?tab=' + $_consoleTab)").
+		Add(html.Text("Clear"))
+}
+
 // consoleTabPanel wraps one tab's scrollback and input row. The scrollback
 // div's id (#console-query-log / #console-agent-log) is the append target
 // for new entries; entries carry their own ids (#c<seq>) so streamed
@@ -65,9 +77,16 @@ func consoleTabPanel(tab string, log []html.Content, input html.Content) html.Co
 	return tag.New("div.console-panel").
 		Set("data-show", "$_consoleTab === '"+tab+"'").
 		Add(
-			tag.New("div.console-log#console-"+tab+"-log").Add(log...),
+			ConsoleLog(tab, log...),
 			input,
 		)
+}
+
+// ConsoleLog renders one tab's scrollback div (#console-query-log /
+// #console-agent-log). Besides page load, it is the morph target a clear
+// publishes: an empty ConsoleLog morphs every entry away on open pages.
+func ConsoleLog(tab string, entries ...html.Content) html.Content {
+	return tag.New("div.console-log#console-" + tab + "-log").Add(entries...)
 }
 
 // queryInputRow is the Query tab's input: Enter (or the Run button) posts

@@ -221,6 +221,10 @@ owns the transcript, the drawer re-renders it on page load, and new
 entries patch in over SSE (the same page-scoped subscription pattern
 as the Fact Browser). Switching views mid-turn or mid-query therefore
 loses nothing — the drawer on the next page picks the stream back up.
+A **Clear** button on the bar wipes the visible tab's scrollback on
+every open page; clearing the Agent tab also drops the embedded
+driver, so it is a conversation reset (the model forgets too), and is
+refused while a turn is running — Stop first.
 A drawer rather than a fourth column because the three-column rhythm
 was hard-won; the ultrawide case is an open question below.
 

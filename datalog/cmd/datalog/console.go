@@ -73,6 +73,20 @@ func (c *consoleLog) Update(id uint64, kind string, content ...html.Content) htm
 	return nil
 }
 
+// Clear drops every entry belonging to tab, leaving the other tab's
+// scrollback (and the id sequence) alone.
+func (c *consoleLog) Clear(tab string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	kept := c.entries[:0]
+	for _, e := range c.entries {
+		if e.tab != tab {
+			kept = append(kept, e)
+		}
+	}
+	c.entries = kept
+}
+
 // Render returns tab's full scrollback for page-load rendering.
 func (c *consoleLog) Render(tab string) []html.Content {
 	c.mu.Lock()
@@ -205,6 +219,43 @@ func (wb *workbench) handleConsoleQuery(w http.ResponseWriter, r *http.Request) 
 		}
 		wb.consoleAppend("query", "query", resultBlock(blk))
 	}
+}
+
+// handleConsoleClear (POST /console/clear?tab=query|agent) wipes one tab's
+// scrollback and morphs the emptied log div onto every open page. Clearing
+// the Agent tab is a conversation reset, not just a display wipe: the kit
+// driver carries the model's memory across turns, so it is dropped too and
+// the next prompt starts a fresh conversation. That reset is refused while
+// a turn is running — closing a driver mid-turn is undefined; Stop first.
+func (wb *workbench) handleConsoleClear(w http.ResponseWriter, r *http.Request) {
+	tab := r.URL.Query().Get("tab")
+	if tab != "query" && tab != "agent" {
+		http.Error(w, "unknown console tab", http.StatusBadRequest)
+		return
+	}
+	if _, err := datastar.RequestStream(w, r); err != nil {
+		return
+	}
+
+	if tab == "agent" {
+		jobCtx, done := wb.jobs.Begin(context.Background(), agentTurnJobKey)
+		if jobCtx == nil {
+			wb.consoleAppend("agent", "error",
+				html.Text("a turn is running — stop it before clearing"))
+			return
+		}
+		defer done()
+		wb.agentMu.Lock()
+		d := wb.agent
+		wb.agent = nil
+		wb.agentMu.Unlock()
+		if d != nil {
+			_ = d.Close()
+		}
+	}
+
+	wb.console.Clear(tab)
+	wb.bus.Publish(datastar.Elements(view.ConsoleLog(tab)))
 }
 
 // queryEcho renders the query text an entry responds to, so the scrollback
