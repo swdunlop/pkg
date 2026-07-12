@@ -344,3 +344,230 @@ func TestParseAllValidProgramsStillParse(t *testing.T) {
 		t.Errorf("expected 1 query, got %d", len(rs.Queries))
 	}
 }
+
+// --- Bug 1: negated atoms must be rejected in head/fact position. ---
+
+func TestParseRejectsNegatedFactHead(t *testing.T) {
+	_, err := syntax.ParseStatement("not p(1).")
+	if err == nil {
+		t.Fatal("expected an error for a negated fact head, got nil")
+	}
+	if !strings.Contains(err.Error(), "negated atoms are not allowed") {
+		t.Errorf("expected a 'negated atoms' error, got: %v", err)
+	}
+}
+
+func TestParseRejectsNegatedRuleHead(t *testing.T) {
+	_, err := syntax.ParseStatement("h(X) :- not p(X).")
+	if err != nil {
+		t.Fatalf("negation in the body should still be legal, got: %v", err)
+	}
+
+	_, err = syntax.ParseStatement("not h(X) :- p(X).")
+	if err == nil {
+		t.Fatal("expected an error for a negated rule head, got nil")
+	}
+	if !strings.Contains(err.Error(), "negated atoms are not allowed") {
+		t.Errorf("expected a 'negated atoms' error, got: %v", err)
+	}
+}
+
+// --- Bug 2: comparisons, is-expressions, and @builtins must be rejected
+// as heads, tightening head position to a plain predicate atom. ---
+
+func TestParseRejectsComparisonHead(t *testing.T) {
+	for _, src := range []string{"1 < 2.", "A > B :- val(A), val(B)."} {
+		_, err := syntax.ParseStatement(src)
+		if err == nil {
+			t.Fatalf("expected an error for comparison head %q, got nil", src)
+		}
+		if !strings.Contains(err.Error(), "comparisons are not allowed") {
+			t.Errorf("%q: expected a 'comparisons are not allowed' error, got: %v", src, err)
+		}
+	}
+	// Comparisons remain legal in body position.
+	_, err := syntax.ParseStatement("bigger(X, Y) :- val(X, A), val(Y, B), A > B.")
+	if err != nil {
+		t.Fatalf("comparison in the body should still be legal, got: %v", err)
+	}
+}
+
+func TestParseRejectsIsHead(t *testing.T) {
+	_, err := syntax.ParseStatement("X is 1 + 2.")
+	if err == nil {
+		t.Fatal("expected an error for an 'is' fact head, got nil")
+	}
+	if !strings.Contains(err.Error(), "'is' expressions are not allowed") {
+		t.Errorf("expected an \"'is' expressions\" error, got: %v", err)
+	}
+
+	_, err = syntax.ParseStatement("X is Y + 1 :- val(Y).")
+	if err == nil {
+		t.Fatal("expected an error for an 'is' rule head, got nil")
+	}
+	if !strings.Contains(err.Error(), "'is' expressions are not allowed") {
+		t.Errorf("expected an \"'is' expressions\" error, got: %v", err)
+	}
+
+	// is remains legal in body position.
+	_, err = syntax.ParseStatement("double(X, Y) :- val(X), Y is X * 2.")
+	if err != nil {
+		t.Fatalf("'is' in the body should still be legal, got: %v", err)
+	}
+}
+
+func TestParseRejectsBuiltinHead(t *testing.T) {
+	_, err := syntax.ParseStatement(`@contains(X, "hello").`)
+	if err == nil {
+		t.Fatal("expected an error for a @builtin fact head, got nil")
+	}
+	if !strings.Contains(err.Error(), "not allowed as a rule or fact head") {
+		t.Errorf("expected a builtin-head error, got: %v", err)
+	}
+
+	// @builtins remain legal in body position.
+	_, err = syntax.ParseStatement(`has(X) :- msg(X), @contains(X, "hello").`)
+	if err != nil {
+		t.Fatalf("@builtin in the body should still be legal, got: %v", err)
+	}
+}
+
+// --- Bug 3: unterminated strings must error at the opening quote instead
+// of silently pairing with a later, unrelated quote. ---
+
+func TestParseUnterminatedStringErrors(t *testing.T) {
+	_, err := syntax.ParseStatement(`p("unterminated).`)
+	if err == nil {
+		t.Fatal("expected an error for an unterminated string, got nil")
+	}
+	if !strings.Contains(err.Error(), "unterminated string") {
+		t.Errorf("expected an 'unterminated string' error, got: %v", err)
+	}
+}
+
+func TestParseUnterminatedStringDoesNotPairAcrossStatements(t *testing.T) {
+	// A stray, unclosed quote must not consume the rest of the input
+	// (including a later statement's own closing quote) as one giant
+	// string constant.
+	_, err := syntax.ParseAll("p(\").\np(\").\n")
+	if err == nil {
+		t.Fatal("expected an error for a stray unterminated quote, got nil")
+	}
+	if !strings.Contains(err.Error(), "unterminated string") {
+		t.Errorf("expected an 'unterminated string' error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "line 1") {
+		t.Errorf("expected the error to be reported at the opening quote on line 1, got: %v", err)
+	}
+
+	// A well-formed string still parses normally.
+	result, err := syntax.ParseStatement(`p("ok").`)
+	if err != nil {
+		t.Fatalf("expected a well-formed string to parse cleanly, got: %v", err)
+	}
+	r := result.(*syntax.Rule)
+	if s, ok := r.Head.Terms[0].(datalog.String); !ok || string(s) != "ok" {
+		t.Errorf("expected String(ok), got %v", r.Head.Terms[0])
+	}
+}
+
+// --- Bug 4: unspaced '-' must lex as subtraction when it follows a token
+// that can end an expression, while still allowing negative literals. ---
+
+func TestParseUnspacedSubtraction(t *testing.T) {
+	result, err := syntax.ParseStatement("diff(Y) :- val(X), Y is 1-2.")
+	if err != nil {
+		t.Fatalf("expected unspaced subtraction to parse, got: %v", err)
+	}
+	r := result.(*syntax.Rule)
+	isAtom := r.Body[1]
+	bin, ok := isAtom.Expr.(syntax.BinExpr)
+	if !ok || bin.Op != "-" {
+		t.Fatalf("expected a '-' BinExpr, got %#v", isAtom.Expr)
+	}
+
+	// Spaced subtraction must keep working too.
+	result, err = syntax.ParseStatement("diff(Y) :- val(X), Y is 1 - 2.")
+	if err != nil {
+		t.Fatalf("expected spaced subtraction to parse, got: %v", err)
+	}
+	r = result.(*syntax.Rule)
+	if _, ok := r.Body[1].Expr.(syntax.BinExpr); !ok {
+		t.Fatalf("expected a BinExpr, got %#v", r.Body[1].Expr)
+	}
+
+	// Subtracting a variable, unspaced, must also work (not misread as a
+	// negative-number token).
+	result, err = syntax.ParseStatement("diff(Y) :- val(X), Y is X-1.")
+	if err != nil {
+		t.Fatalf("expected unspaced variable subtraction to parse, got: %v", err)
+	}
+}
+
+func TestParseNegativeLiteralStillParses(t *testing.T) {
+	result, err := syntax.ParseStatement("p(-5).")
+	if err != nil {
+		t.Fatalf("expected a negative literal fact to parse, got: %v", err)
+	}
+	r := result.(*syntax.Rule)
+	if v, ok := r.Head.Terms[0].(datalog.Integer); !ok || int64(v) != -5 {
+		t.Errorf("expected Integer(-5), got %v", r.Head.Terms[0])
+	}
+
+	// A negative literal on the right of 'is' must also still parse (unary
+	// minus in an expression's primary position).
+	result, err = syntax.ParseStatement("val(X) :- X is -5.")
+	if err != nil {
+		t.Fatalf("expected 'is -5' to parse, got: %v", err)
+	}
+	r = result.(*syntax.Rule)
+	term, ok := r.Body[0].Expr.(syntax.TermExpr)
+	if !ok {
+		t.Fatalf("expected a TermExpr, got %#v", r.Body[0].Expr)
+	}
+	if v, ok := term.Term.(datalog.Integer); !ok || int64(v) != -5 {
+		t.Errorf("expected Integer(-5), got %v", term.Term)
+	}
+}
+
+// --- Bug 5: freshVar must never collide with an explicit ?N written
+// anywhere in the same statement, regardless of lexical order. ---
+
+func TestParseFreshVarDoesNotCollideWithExplicitAnonName(t *testing.T) {
+	result, err := syntax.ParseStatement("p(_, ?0)?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := result.(*syntax.Query)
+	fresh := q.Body[0].Terms[0].(datalog.Variable)
+	explicit := q.Body[0].Terms[1].(datalog.Variable)
+	if fresh == explicit {
+		t.Fatalf("fresh variable for '_' collided with explicit %q", explicit)
+	}
+	if string(explicit) != "?0" {
+		t.Fatalf("expected the explicit variable to remain ?0, got %q", explicit)
+	}
+
+	// The explicit name can also appear before the anonymous position.
+	result, err = syntax.ParseStatement("p(?0, _)?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	q = result.(*syntax.Query)
+	explicit = q.Body[0].Terms[0].(datalog.Variable)
+	fresh = q.Body[0].Terms[1].(datalog.Variable)
+	if fresh == explicit {
+		t.Fatalf("fresh variable for '_' collided with explicit %q", explicit)
+	}
+
+	// ?N-looking text inside a string literal must not be mistaken for an
+	// explicit variable name reservation.
+	result, err = syntax.ParseStatement(`p("has ?0 in it", _)?`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q = result.(*syntax.Query)
+	if _, ok := q.Body[0].Terms[1].(datalog.Variable); !ok {
+		t.Fatalf("expected second term to be a Variable, got %v", q.Body[0].Terms[1])
+	}
+}

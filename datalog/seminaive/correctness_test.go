@@ -509,3 +509,19 @@ func TestAggregateUnboundGroupByVarFailsAtCompile(t *testing.T) {
 		t.Fatalf("expected the error to name the unbound variable, got: %v", err)
 	}
 }
+
+func TestAggregateRuleVarLimitFailsAtCompile(t *testing.T) {
+	rs, err := syntax.ParseAll(`
+		big(A, T) :- T = count : p(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P), q(Q).
+	`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	_, err = seminaive.New().Compile(rs)
+	if err == nil {
+		t.Fatal("expected a variable-limit error for an aggregate rule with 18 variables, got nil")
+	}
+	if !strings.Contains(err.Error(), "16") {
+		t.Fatalf("expected the error to mention the 16-variable limit, got: %v", err)
+	}
+}

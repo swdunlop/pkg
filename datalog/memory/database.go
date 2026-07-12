@@ -76,6 +76,11 @@ func (db *Database) Query(pred string, terms ...datalog.Term) iter.Seq[[]datalog
 		return func(yield func([]datalog.Constant) bool) {}
 	}
 	arity := len(terms)
+	if arity > interned.MaxFactArity {
+		// No fact can have this many terms (interned.MaxFactArity is the
+		// hard limit), so a query this wide can never match anything.
+		return func(yield func([]datalog.Constant) bool) {}
+	}
 
 	// Build bound set from constant positions.
 	var bs interned.BoundSet

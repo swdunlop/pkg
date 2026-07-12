@@ -3,6 +3,7 @@ package jsonfacts
 import (
 	"encoding/json"
 	"io"
+	"strconv"
 
 	"swdunlop.dev/pkg/datalog"
 )
@@ -61,7 +62,7 @@ func termKey(names []string, i int) string {
 	if i < len(names) && names[i] != "" {
 		return names[i]
 	}
-	return string(rune('0' + i)) // "0", "1", ..., "9" for small arities
+	return strconv.Itoa(i) // "0", "1", ..., "10", "11", ... for any arity
 }
 
 func constantToJSON(c datalog.Constant) any {

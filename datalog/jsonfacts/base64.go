@@ -15,13 +15,28 @@ type base64Variant struct {
 
 // base64Offsets returns the 3 base64-encoded variants of data at byte offsets 0, 1, 2.
 // Each variant is the substring that would appear in a base64-encoded stream containing
-// the data at the given alignment.
+// the data at the given alignment, trimmed to only the characters whose 6 bits are fully
+// determined by data itself.
+//
+// Base64 packs 3 input bytes into 4 output characters (6 bits per character). When data
+// is embedded at a leading offset of 1 or 2 unknown bytes, the first 1-2 output characters
+// straddle the boundary between the unknown prefix and data, so their bits are partly
+// determined by bytes we don't know: those characters must be skipped (skip=2 for offset 1,
+// skip=3 for offset 2). Symmetrically, at the tail end, the base64 group containing the
+// last byte(s) of data may also include unknown trailing bytes when (offset+len(data)) is
+// not a multiple of 3 bytes; the final character of that group is then partly determined by
+// those unknown trailing bytes and must also be trimmed, not just '=' padding. The count of
+// fully-determined characters is floor((offset+len(data))*4/3): that many characters, from
+// the start of the encoding, depend only on bytes up through offset+len(data), so slicing
+// to that index (after also applying the leading skip) yields exactly the substring that
+// data alone determines, regardless of what precedes or follows it in the real stream.
 func base64Offsets(data []byte) [3]string {
 	var result [3]string
 	for offset := 0; offset < 3; offset++ {
 		padded := make([]byte, offset+len(data))
 		copy(padded[offset:], data)
 		encoded := base64.StdEncoding.EncodeToString(padded)
+		encoded = strings.TrimRight(encoded, "=")
 
 		skip := 0
 		switch offset {
@@ -30,9 +45,14 @@ func base64Offsets(data []byte) [3]string {
 		case 2:
 			skip = 3
 		}
-		encoded = encoded[skip:]
-		encoded = strings.TrimRight(encoded, "=")
-		result[offset] = encoded
+		end := (offset + len(data)) * 4 / 3
+		if end > len(encoded) {
+			end = len(encoded)
+		}
+		if end < skip {
+			end = skip
+		}
+		result[offset] = encoded[skip:end]
 	}
 	return result
 }

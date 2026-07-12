@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -144,6 +145,46 @@ map(value.attachments, assert("email_attachment", [id, #.name, #.hash, #.size]))
 		if string(sender) != "alice" {
 			t.Errorf("email ID 0: expected sender alice, got %s", sender)
 		}
+	}
+}
+
+// TestImperativeMappingErrorAborts confirms that a runtime error raised by an
+// imperative Expr mapping on one record is surfaced as a load error (naming
+// the file and line) rather than silently dropping the rest of that record's
+// asserts and continuing, which would produce an undiagnosed partial load.
+func TestImperativeMappingErrorAborts(t *testing.T) {
+	dir := t.TempDir()
+	// Record 2 (line 2) has only 1 tag, so indexing tags[1] is out of range,
+	// which expr-lang raises as a runtime error. Records 1 and 3 are well-formed.
+	writeFile(t, dir, "recs.jsonl", `{"id":"r1","tags":["a","b"]}
+{"id":"r2","tags":["only-one"]}
+{"id":"r3","tags":["c","d"]}
+`)
+	writeSchema(t, dir, map[string]any{
+		"sources": []any{
+			map[string]any{
+				"file": "recs.jsonl",
+				"mappings": []any{
+					map[string]any{
+						"expr": `assert("rec", [value.id, value.tags[1]])`,
+					},
+				},
+			},
+		},
+	})
+
+	var cfg jsonfacts.Config
+	if err := cfg.LoadSchemaDir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := cfg.LoadDir(dir)
+	if err == nil {
+		t.Fatal("expected an error from the record 2 division-by-zero, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "recs.jsonl") || !strings.Contains(msg, "line 2") {
+		t.Errorf("expected error naming the file and line 2, got: %v", err)
 	}
 }
 
@@ -388,6 +429,70 @@ func TestPostLoadMatcherRegex(t *testing.T) {
 	}
 }
 
+// TestBase64MatcherAllOffsets confirms the base64 matcher finds a plaintext
+// pattern base64-encoded at all three byte alignments (0, 1, 2) within
+// surrounding, non-plaintext data, and that the fully-determined substrings
+// used for matching are exactly the hand-computed values below (i.e. the
+// trailing partially-determined character is trimmed along with '=' padding,
+// not just the padding).
+func TestBase64MatcherAllOffsets(t *testing.T) {
+	// "SECRET" base64-encoded at offsets 0, 1, 2 within "...SECRETTAIL12" (offset
+	// 0), "X" + "SECRET" + "TAIL12" (offset 1), "XY" + "SECRET" + "TAIL12"
+	// (offset 2). These full encodings were computed independently with
+	// encoding/base64 and are reproduced verbatim in the JSONL fixture below.
+	dir := t.TempDir()
+	writeFile(t, dir, "blobs.jsonl", `{"id":"b0","data":"U0VDUkVUVEFJTDEy"}
+{"id":"b1","data":"WFNFQ1JFVFRBSUwxMg=="}
+{"id":"b2","data":"WFlTRUNSRVRUQUlMMTI="}
+`)
+	writeSchema(t, dir, map[string]any{
+		"sources": []any{
+			map[string]any{
+				"file": "blobs.jsonl",
+				"mappings": []any{
+					map[string]any{
+						"predicate": "blob",
+						"args":      []string{"value.id", "value.data"},
+					},
+				},
+			},
+		},
+		"matchers": []any{
+			map[string]any{
+				"predicate": "blob",
+				"term":      1,
+				"base64":    []string{"SECRET"},
+			},
+		},
+	})
+
+	var cfg jsonfacts.Config
+	if err := cfg.LoadSchemaDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	db, err := cfg.LoadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	matched := map[string]bool{}
+	for row := range db.Facts("base64_contains", 2) {
+		matched[string(row[0].(datalog.String))] = true
+	}
+	for _, id := range []string{
+		"U0VDUkVUVEFJTDEy",     // offset 0
+		"WFNFQ1JFVFRBSUwxMg==", // offset 1
+		"WFlTRUNSRVRUQUlMMTI=", // offset 2
+	} {
+		if !matched[id] {
+			t.Errorf("expected base64_contains match for %q (SECRET embedded), got matches: %v", id, matched)
+		}
+	}
+	if len(matched) != 3 {
+		t.Errorf("expected exactly 3 base64_contains matches, got %d: %v", len(matched), matched)
+	}
+}
+
 func TestPatternFile(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "data.jsonl", `{"cmd":"certutil -urlcache"}
@@ -563,6 +668,54 @@ func TestEncoderNoDeclaration(t *testing.T) {
 	}
 }
 
+// TestEncoderManyTermsUsesDecimalKeys confirms termKey formats positional
+// keys with proper decimal digits ("10", "11", ...) for arities >= 10,
+// instead of the earlier `rune('0'+i)` fallback which emitted punctuation
+// characters like ':' and ';' for indices 10 and 11.
+func TestEncoderManyTermsUsesDecimalKeys(t *testing.T) {
+	var buf bytes.Buffer
+	enc := jsonfacts.NewEncoder(&buf, nil)
+
+	row := make([]datalog.Constant, 12)
+	for i := range row {
+		row[i] = datalog.Integer(int64(i))
+	}
+	if err := enc.Encode("wide", row); err != nil {
+		t.Fatal(err)
+	}
+
+	var obj map[string]map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &obj); err != nil {
+		t.Fatal(err)
+	}
+	wide, ok := obj["wide"]
+	if !ok {
+		t.Fatal("expected 'wide' key")
+	}
+	for _, key := range []string{"10", "11"} {
+		if _, ok := wide[key]; !ok {
+			t.Errorf("expected key %q in encoded object, got keys %v", key, keysOf(wide))
+		}
+	}
+	for _, bad := range []string{":", ";"} {
+		if _, ok := wide[bad]; ok {
+			t.Errorf("unexpected punctuation key %q in encoded object", bad)
+		}
+	}
+	if v, ok := wide["11"]; !ok || v != float64(11) {
+		t.Errorf(`expected wide["11"] == 11, got %v (ok=%v)`, v, ok)
+	}
+}
+
+func keysOf(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
 func TestIDType(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "data.jsonl", `{"x":"a"}
@@ -717,6 +870,36 @@ func TestLoadFS(t *testing.T) {
 	}
 	if declCount != 1 {
 		t.Errorf("expected 1 declaration, got %d", declCount)
+	}
+}
+
+// TestLoadFSValidatesProgrammaticConfig confirms that LoadFS itself validates
+// the Config, so a Config built programmatically (never routed through
+// LoadSchemaFS/loadSchemaFile) still has its mapping-mode conflicts caught
+// rather than silently reaching the loader.
+func TestLoadFSValidatesProgrammaticConfig(t *testing.T) {
+	cfg := jsonfacts.Config{
+		Sources: []jsonfacts.Source{
+			{
+				File: "data.jsonl",
+				Mappings: []jsonfacts.Mapping{
+					{
+						// Both expr and predicate/args/filter set: mutually exclusive.
+						Predicate: "foo",
+						Args:      []string{"value.x"},
+						Expr:      `assert("foo", [value.x])`,
+					},
+				},
+			},
+		},
+	}
+
+	dataFS := fstest.MapFS{
+		"data.jsonl": {Data: []byte(`{"x":1}` + "\n")},
+	}
+
+	if _, err := cfg.LoadFS(dataFS); err == nil {
+		t.Fatal("expected LoadFS to reject a programmatically-built config with a conflicting mapping, got nil error")
 	}
 }
 

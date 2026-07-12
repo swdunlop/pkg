@@ -166,10 +166,6 @@ func (fc *factChunks) toSlice() []InternedFact {
 	return fc.facts
 }
 
-func (fc *factChunks) appendFrom(other *factChunks) {
-	fc.facts = append(fc.facts, other.facts...)
-}
-
 // --- PredArityI and InternedFactSet ---
 
 // PredArityI is a zero-allocation map key for interned predicate+arity lookups.
@@ -487,6 +483,17 @@ func (fs InternedFactSet) Add(fact InternedFact) bool {
 	return fs.AddWithKey(fact, InternedFactHash(fact))
 }
 
+// AddWithKey trusts fk as the fact's identity with no equality check against
+// any fact already stored under that key -- a 64-bit FNV-1a hash collision
+// between two DIFFERENT facts would silently drop the second fact (see
+// TestAddWithKeyCollisionMechanism). This is an accepted, deliberate
+// trade-off, not an oversight: the birthday bound puts a 50% collision
+// probability at roughly 2^32 facts in a single set, and adding a
+// stored-fact equality check on every hash hit would require the index to
+// carry a locator back to the fact (not just presence), which measurably
+// slows this function -- it is called for every derived fact in the
+// semi-naive fixpoint's innermost loop. Revisit only if a fact set is ever
+// expected to approach billions of facts.
 func (fs InternedFactSet) AddWithKey(fact InternedFact, fk uint64) bool {
 	if _, exists := fs.Index[fk]; exists {
 		return false
@@ -598,15 +605,35 @@ func (fs InternedFactSet) colIndexFor(k PredArityI, col int) *colIndex {
 // Merge copies all facts from other into fs in bulk. Existing column
 // indexes stay valid (facts are append-only) and catch up on next Scan;
 // no index maintenance is needed here.
+//
+// Callers that already guarantee disjointness (e.g. evalRules, whose emit
+// closure checks both existing.Index and emitted.Index before adding a
+// fact) pay only the cost of the (pred,arity) presence check below, since
+// dfc is nil whenever fs has no facts yet for that key. Callers that can't
+// make that guarantee (e.g. an aggregate rule's derived facts, which are
+// only deduplicated against each other, not against the accumulated
+// existing set) rely on the per-fact hash check to avoid storing the same
+// fact twice under one hash-index entry.
 func (fs InternedFactSet) Merge(other InternedFactSet) {
-	maps.Copy(fs.Index, other.Index)
 	for k, ofc := range other.ByPred {
-		if dfc := fs.ByPred[k]; dfc != nil {
-			dfc.appendFrom(ofc)
-		} else {
+		dfc := fs.ByPred[k]
+		if dfc == nil {
 			fs.ByPred[k] = ofc
+			continue
+		}
+		for _, f := range ofc.facts {
+			fk := InternedFactHash(f)
+			if _, exists := fs.Index[fk]; exists {
+				continue
+			}
+			fs.Index[fk] = struct{}{}
+			dfc.append(f)
 		}
 	}
+	// Any (pred,arity) key present only in other was adopted wholesale
+	// above; copy remaining hash keys (facts under predicates fs never
+	// saw) that the per-fact loop didn't already add.
+	maps.Copy(fs.Index, other.Index)
 }
 
 // Clone returns a deep copy of the fact set. Column indexes are not

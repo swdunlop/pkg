@@ -82,7 +82,8 @@ type Option func(*Engine)
 
 // WithMaxIterations sets the maximum number of fixpoint iterations.
 // Transform returns an error if a stratum has not converged when the
-// limit is reached, rather than returning incomplete results.
+// limit is reached, rather than returning incomplete results. n must
+// be positive; Compile returns an error otherwise.
 func WithMaxIterations(n int) Option {
 	return func(e *Engine) { e.maxIter = n }
 }
@@ -156,6 +157,10 @@ func New(options ...Option) *Engine {
 
 // Compile validates the ruleset and returns a Transformer that applies the rules.
 func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
+	if e.maxIter <= 0 {
+		return nil, fmt.Errorf("seminaive: WithMaxIterations(%d): must be positive", e.maxIter)
+	}
+
 	for name, ep := range e.externals {
 		if ep.arity < 1 || ep.arity > interned.MaxFactArity {
 			return nil, fmt.Errorf("external predicate %s: arity %d out of range [1, %d]",

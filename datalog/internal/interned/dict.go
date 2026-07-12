@@ -3,6 +3,7 @@ package interned
 import (
 	"cmp"
 	"fmt"
+	"math"
 	"slices"
 
 	"swdunlop.dev/pkg/datalog"
@@ -31,12 +32,33 @@ func NewDict() *Dict {
 // with a String term whose value happens to be JSON text.
 type compositeKey string
 
+// nanKey is the comparable index key for float64 NaN. NaN != NaN under Go's
+// == (the map key comparison the index relies on), so every distinct NaN
+// payload would otherwise miss the index and mint a fresh ID -- equal-
+// looking terms with different identities, plus a dead index entry per
+// call. All NaN payloads canonicalize to this single zero-field struct
+// value, which does compare equal to itself, so repeated NaN interning
+// hits the index like any other value. NaN is not reachable through the
+// Datalog source language today (the lexer never produces a "nan" float
+// token, and `is` division-by-zero is guarded to fail rather than produce
+// NaN -- see applyBinOp/applyBinOpFloat in seminaive), but Dict.Intern is
+// also reachable directly via the Go API (e.g. a caller building a
+// datalog.Float(math.NaN()) fact by hand), so the guard sits at this entry
+// point rather than relying on every caller to avoid NaN.
+type nanKey struct{}
+
 // indexKey converts a value to the comparable key it is indexed under.
 // Composites are not comparable, so they index under their canonical
-// encoding; everything else indexes as itself.
+// encoding; NaN never equals itself, so it indexes under a fixed sentinel;
+// everything else indexes as itself.
 func indexKey(v any) any {
-	if c, ok := v.(*datalog.Composite); ok {
+	switch c := v.(type) {
+	case *datalog.Composite:
 		return compositeKey(c.Canonical())
+	case float64:
+		if math.IsNaN(c) {
+			return nanKey{}
+		}
 	}
 	return v
 }
@@ -44,7 +66,8 @@ func indexKey(v any) any {
 // Intern returns the ID for a value, assigning a new one if needed.
 // Integer-valued float64 values are normalized to int64 so that
 // JSON-loaded numbers (always float64) match Datalog integer literals.
-// *datalog.Composite values are hash-consed by canonical encoding.
+// *datalog.Composite values are hash-consed by canonical encoding. All NaN
+// payloads collapse to one interned value (see nanKey).
 func (d *Dict) Intern(v any) uint64 {
 	v = NormalizeNumeric(v)
 	key := indexKey(v)

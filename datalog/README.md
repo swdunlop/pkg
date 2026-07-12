@@ -13,7 +13,6 @@ package main
 
 import (
     "context"
-    "fmt"
     "os"
     "slices"
 
@@ -282,9 +281,12 @@ for name, arity := range db.Predicates() {
 }
 
 // Extend returns a new database with additional facts, without modifying the original.
-extended := db.Extend(
+extended, err := db.Extend(
     datalog.Fact{Name: "parent", Terms: []datalog.Constant{datalog.String("bob"), datalog.String("ann")}},
 )
+if err != nil {
+    panic(err)
+}
 ```
 
 ## Schema Configuration Reference

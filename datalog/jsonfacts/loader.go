@@ -26,6 +26,10 @@ func (cfg *Config) LoadDir(dir string) (*memory.Database, error) {
 // LoadFS loads JSONL files from fsys according to the Config, applies matchers,
 // and returns a memory.Database containing all loaded and derived facts.
 func (cfg *Config) LoadFS(fsys fs.FS) (*memory.Database, error) {
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+
 	var facts []datalog.Fact
 	counter := &idCounter{}
 	for _, src := range cfg.Sources {
@@ -134,10 +138,10 @@ func loadSource(src Source, fsys fs.FS, counter *idCounter) ([]datalog.Fact, err
 
 		runEnv := map[string]any{"value": obj}
 
-		for _, cm := range compiled {
+		for mi, cm := range compiled {
 			if cm.imperative != nil {
 				if _, err := expr.Run(cm.imperative, runEnv); err != nil {
-					continue
+					return nil, fmt.Errorf("%s: line %d: mapping %d: %w", src.File, lineNum, mi, err)
 				}
 				continue
 			}

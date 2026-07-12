@@ -13,36 +13,37 @@ import (
 type tokenKind int
 
 const (
-	tokEOF       tokenKind = iota
-	tokError               // unrecognized or incomplete token; val holds the offending text
-	tokIdent               // identifier (predicate name or variable, depending on context)
-	tokAnon                // ? (anonymous variable)
-	tokString              // "quoted string"
-	tokInt                 // integer literal
-	tokFloat               // float literal
-	tokLParen              // (
-	tokRParen              // )
-	tokComma               // ,
-	tokDot                 // .
-	tokImplies             // :-
-	tokNot                 // not
-	tokIs                  // is
-	tokEquals              // =
-	tokNotEquals           // !=
-	tokLT                  // <
-	tokGT                  // >
-	tokLE                  // <=
-	tokGE                  // >=
-	tokPlus                // +
-	tokMinus               // -
-	tokStar                // *
-	tokSlash               // /
-	tokColon               // :
-	tokLBrace              // {
-	tokRBrace              // }
-	tokLBracket            // [
-	tokRBracket            // ]
-	tokPipe                // |
+	tokEOF                tokenKind = iota
+	tokError                        // unrecognized or incomplete token; val holds the offending text
+	tokUnterminatedString           // "... with no closing quote before EOF; pos is where the string started
+	tokIdent                        // identifier (predicate name or variable, depending on context)
+	tokAnon                         // ? (anonymous variable)
+	tokString                       // "quoted string"
+	tokInt                          // integer literal
+	tokFloat                        // float literal
+	tokLParen                       // (
+	tokRParen                       // )
+	tokComma                        // ,
+	tokDot                          // .
+	tokImplies                      // :-
+	tokNot                          // not
+	tokIs                           // is
+	tokEquals                       // =
+	tokNotEquals                    // !=
+	tokLT                           // <
+	tokGT                           // >
+	tokLE                           // <=
+	tokGE                           // >=
+	tokPlus                         // +
+	tokMinus                        // -
+	tokStar                         // *
+	tokSlash                        // /
+	tokColon                        // :
+	tokLBrace                       // {
+	tokRBrace                       // }
+	tokLBracket                     // [
+	tokRBracket                     // ]
+	tokPipe                         // |
 )
 
 type token struct {
@@ -53,13 +54,43 @@ type token struct {
 
 // lexer tokenizes datalog input.
 type lexer struct {
-	input  string
-	pos    int
-	anonID int // counter for anonymous variables
+	input    string
+	pos      int
+	anonID   int       // counter for anonymous variables
+	prevKind tokenKind // kind of the last token returned by next(), for '-' disambiguation
+	hasPrev  bool
 }
 
 func newLexer(input string) *lexer {
-	return &lexer{input: input}
+	return &lexer{input: input, anonID: reservedAnonID(input)}
+}
+
+// reservedAnonID pre-scans the entire input for explicit ?N variable names
+// (as printed by Rule.String for desugared patterns) and returns one past
+// the largest N found, so that freshVar allocations later in the same
+// lexer's lifetime can never collide with an explicit ?N written anywhere
+// in the input -- including ones that appear after the fresh variable's
+// position, such as in "p(_, ?0)?". The scan uses a real lexer so string
+// and comment contents (which may contain "?0"-looking text) are properly
+// skipped rather than matched by a raw scan.
+func reservedAnonID(input string) int {
+	scan := &lexer{input: input}
+	max := 0
+	for {
+		tok := scan.nextRaw()
+		if tok.kind == tokEOF || isErrorTok(tok.kind) {
+			// A lexical error (including an unterminated string) will be
+			// reported properly once the real parser reaches it; stop
+			// scanning rather than risk looping on a token that doesn't
+			// advance the position forever, or misreading trailing input.
+			return max
+		}
+		if tok.kind == tokIdent && len(tok.val) > 1 && tok.val[0] == '?' {
+			if n, err := strconv.Atoi(tok.val[1:]); err == nil && n+1 > max {
+				max = n + 1
+			}
+		}
+	}
 }
 
 func (l *lexer) peek() byte {
@@ -93,7 +124,29 @@ func (l *lexer) skipWhitespace() {
 	}
 }
 
+// next returns the next token, updating prevKind so a subsequent '-' can be
+// disambiguated between a numeric sign and a subtraction operator.
 func (l *lexer) next() token {
+	tok := l.nextRaw()
+	l.prevKind = tok.kind
+	l.hasPrev = true
+	return tok
+}
+
+// canEndExpr reports whether a token of kind k can be the last token of a
+// complete term or expression (number, string, identifier/variable, or a
+// closing paren/bracket/brace). If the previous token cannot end an
+// expression, a following '-' must be a numeric sign rather than
+// subtraction; otherwise it is the subtraction/minus operator.
+func canEndExpr(k tokenKind) bool {
+	switch k {
+	case tokIdent, tokAnon, tokString, tokInt, tokFloat, tokRParen, tokRBracket, tokRBrace:
+		return true
+	}
+	return false
+}
+
+func (l *lexer) nextRaw() token {
 	l.skipWhitespace()
 	if l.pos >= len(l.input) {
 		return token{kind: tokEOF, pos: l.pos}
@@ -171,13 +224,16 @@ func (l *lexer) next() token {
 		l.advance()
 		// An explicit ?N names a parser-generated variable (as printed by
 		// Rule.String for desugared patterns), letting rules round-trip.
+		// reservedAnonID already scanned the whole input up front so
+		// anonID starts past every explicit ?N regardless of where it
+		// appears; this bump is just a defensive backstop.
 		if l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
 			start := l.pos
 			for l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
 				l.pos++
 			}
 			if n, err := strconv.Atoi(l.input[start:l.pos]); err == nil && n >= l.anonID {
-				l.anonID = n + 1 // fresh vars must not collide with explicit ?N
+				l.anonID = n + 1
 			}
 			return token{kind: tokIdent, val: "?" + l.input[start:l.pos], pos: startPos}
 		}
@@ -192,7 +248,13 @@ func (l *lexer) next() token {
 	case b == '"':
 		return l.readString()
 	case b == '-':
-		if l.pos+1 < len(l.input) && l.input[l.pos+1] >= '0' && l.input[l.pos+1] <= '9' {
+		// '-' is a numeric sign only when it cannot be read as subtraction:
+		// i.e. when the previous token could not end an expression (start of
+		// input, after an operator, '(', ',', ':-', etc). Otherwise it is
+		// the subtraction/minus operator, so "1-2" lexes as 1, -, 2 while
+		// "p(-5)" still lexes -5 as a negative literal.
+		if l.pos+1 < len(l.input) && l.input[l.pos+1] >= '0' && l.input[l.pos+1] <= '9' &&
+			(!l.hasPrev || !canEndExpr(l.prevKind)) {
 			return l.readNumber()
 		}
 		l.advance()
@@ -246,6 +308,15 @@ func (l *lexer) readString() token {
 		if b == '"' {
 			return token{kind: tokString, val: buf.String(), pos: start}
 		}
+		// A raw, unescaped newline means the statement ended (or a new one
+		// began) before the string was closed. Without this check, a
+		// missing closing quote would keep scanning across statement and
+		// even line boundaries until it happened to find some later,
+		// unrelated '"' to pair with -- e.g. `p(").\np(").` would lex as
+		// one giant string spanning both lines instead of two errors.
+		if b == '\n' {
+			return token{kind: tokUnterminatedString, val: l.input[start:l.pos], pos: start}
+		}
 		if b == '\\' && l.pos < len(l.input) {
 			next := l.advance()
 			switch next {
@@ -265,7 +336,10 @@ func (l *lexer) readString() token {
 		}
 		buf.WriteByte(b)
 	}
-	return token{kind: tokString, val: buf.String(), pos: start}
+	// Ran off the end of input without a closing quote; report the error at
+	// the position where the string started so callers can find the
+	// dangling '"' rather than pairing it with a later, unrelated quote.
+	return token{kind: tokUnterminatedString, val: l.input[start:l.pos], pos: start}
 }
 
 func (l *lexer) readNumber() token {
@@ -338,7 +412,7 @@ func (p *parser) advance() token {
 }
 
 func (p *parser) expect(kind tokenKind) (token, error) {
-	if p.current.kind == tokError {
+	if isErrorTok(p.current.kind) {
 		return token{}, p.errorTok(p.current)
 	}
 	if p.current.kind != kind {
@@ -347,9 +421,19 @@ func (p *parser) expect(kind tokenKind) (token, error) {
 	return p.advance(), nil
 }
 
-// errorTok reports a lexer error token (an unrecognized or incomplete
-// character sequence) as a positioned parse error.
+// isErrorTok reports whether a token kind represents a lexical error that
+// should short-circuit parsing with a positioned error.
+func isErrorTok(k tokenKind) bool {
+	return k == tokError || k == tokUnterminatedString
+}
+
+// errorTok reports a lexer error token (an unrecognized/incomplete
+// character sequence, or an unterminated string) as a positioned parse
+// error.
 func (p *parser) errorTok(tok token) error {
+	if tok.kind == tokUnterminatedString {
+		return p.errorf(tok.pos, "unterminated string")
+	}
 	return p.errorf(tok.pos, "unrecognized character %q", tok.val)
 }
 
@@ -392,6 +476,8 @@ func kindName(k tokenKind) string {
 		return "end of input"
 	case tokError:
 		return "unrecognized character"
+	case tokUnterminatedString:
+		return "unterminated string"
 	case tokIdent:
 		return "identifier"
 	case tokAnon:
@@ -485,6 +571,7 @@ func (p *parser) parseStatement() (any, error) {
 	// Could be a rule, fact, aggregate rule, or query. Patterns are parsed
 	// permissively here because the first atom may turn out to be a query
 	// body atom; they are rejected below once it proves to be a head.
+	headPos := p.current.pos
 	head, err := p.parseAtom()
 	if err != nil {
 		return nil, err
@@ -497,6 +584,9 @@ func (p *parser) parseStatement() (any, error) {
 		// fact: atom.
 		if len(headGetters) > 0 {
 			return nil, p.errorf(headPatternPos, "patterns are not allowed in rule heads")
+		}
+		if err := p.validateHeadAtom(head, headPos); err != nil {
+			return nil, err
 		}
 		p.advance()
 		return &Rule{Head: head}, nil
@@ -526,13 +616,16 @@ func (p *parser) parseStatement() (any, error) {
 	if len(headGetters) > 0 {
 		return nil, p.errorf(headPatternPos, "patterns are not allowed in rule heads")
 	}
+	if err := p.validateHeadAtom(head, headPos); err != nil {
+		return nil, err
+	}
 	if _, err := p.expect(tokImplies); err != nil {
 		return nil, err
 	}
 
 	// Check for aggregate pattern: Var = aggKind(...) : body
 	if p.current.kind == tokIdent {
-		savedPos := p.lex.pos
+		savedLex := *p.lex
 		savedCurrent := p.current
 		savedPrev := p.prev
 
@@ -553,7 +646,7 @@ func (p *parser) parseStatement() (any, error) {
 		}
 
 		// Not an aggregate, restore state and parse as normal rule body.
-		p.lex.pos = savedPos
+		*p.lex = savedLex
 		p.current = savedCurrent
 		p.prev = savedPrev
 		p.getters = nil // drop getters from a partially parsed aggregate body
@@ -567,6 +660,28 @@ func (p *parser) parseStatement() (any, error) {
 		return nil, err
 	}
 	return &Rule{Head: head, Body: body}, nil
+}
+
+// validateHeadAtom rejects atoms that cannot legally stand as a rule/fact
+// head: negated atoms (ToFact would silently drop the negation), comparison
+// or "is" pseudo-atoms (built-in predicates, not user relations), and
+// "@"-prefixed engine builtins (none of which are ever defined as rule
+// heads; grepping the codebase's example rules and tests finds "@..." used
+// only in bodies).
+func (p *parser) validateHeadAtom(head Atom, pos int) error {
+	if head.Negated {
+		return p.errorf(pos, "negated atoms are not allowed as a rule or fact head")
+	}
+	if head.Pred == "is" {
+		return p.errorf(pos, "'is' expressions are not allowed as a rule or fact head")
+	}
+	if isComparisonPred(head.Pred) {
+		return p.errorf(pos, "comparisons are not allowed as a rule or fact head")
+	}
+	if strings.HasPrefix(head.Pred, "@") {
+		return p.errorf(pos, "builtin predicate %q is not allowed as a rule or fact head", head.Pred)
+	}
+	return nil
 }
 
 func (p *parser) parseAggregateBody(head Atom, resultVar string, kind AggregateKind) (*AggregateRule, error) {
@@ -676,19 +791,19 @@ func (p *parser) parseAtom() (Atom, error) {
 			return p.parseComparisonAtom()
 		case tokIdent:
 			// Peek ahead to distinguish predicate(args) from variable comparisons/is-expressions.
-			savedPos := p.lex.pos
+			savedLex := *p.lex
 			savedCurrent := p.current
 			savedPrev := p.prev
 			p.advance() // consume ident
 			nextKind := p.current.kind
 			if nextKind == tokIs {
-				p.lex.pos = savedPos
+				*p.lex = savedLex
 				p.current = savedCurrent
 				p.prev = savedPrev
 				return p.parseIsAtom()
 			}
 			if isComparisonOp(nextKind) {
-				p.lex.pos = savedPos
+				*p.lex = savedLex
 				p.current = savedCurrent
 				p.prev = savedPrev
 				return p.parseComparisonAtom()
@@ -699,7 +814,7 @@ func (p *parser) parseAtom() (Atom, error) {
 		}
 	}
 
-	if p.current.kind == tokError {
+	if isErrorTok(p.current.kind) {
 		return Atom{}, p.errorTok(p.current)
 	}
 	if p.current.kind != tokIdent {
@@ -974,7 +1089,7 @@ func (p *parser) parsePrimaryExpr() (Expr, error) {
 
 func (p *parser) parseTerm() (datalog.Term, error) {
 	switch p.current.kind {
-	case tokError:
+	case tokError, tokUnterminatedString:
 		return nil, p.errorTok(p.current)
 	case tokIdent:
 		name := p.advance().val

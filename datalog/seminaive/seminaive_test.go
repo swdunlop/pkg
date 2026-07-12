@@ -106,6 +106,23 @@ func TestRecursiveRule(t *testing.T) {
 	}
 }
 
+func TestWithMaxIterationsNonPositiveFailsCompile(t *testing.T) {
+	rs, err := syntax.ParseAll(`
+		ancestor(X, Y) :- parent(X, Y).
+		ancestor(X, Y) :- parent(X, Z), ancestor(Z, Y).
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, n := range []int{0, -1} {
+		_, err := seminaive.New(seminaive.WithMaxIterations(n)).Compile(rs)
+		if err == nil {
+			t.Fatalf("WithMaxIterations(%d): expected Compile to fail, got nil error", n)
+		}
+	}
+}
+
 func TestQuery(t *testing.T) {
 	b := memory.NewBuilder()
 	b.AddFact(datalog.Fact{Name: "parent", Terms: []datalog.Constant{datalog.String("tom"), datalog.String("bob")}})
