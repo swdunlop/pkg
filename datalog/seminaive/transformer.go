@@ -131,7 +131,7 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 			}
 
 			if len(s.aggRules) > 0 {
-				aggDerived, err := ev.evalAggregates(s.aggRules, existing)
+				aggDerived, err := ev.evalAggregates(ctx, s.aggRules, existing)
 				if err != nil {
 					return nil, err
 				}
@@ -432,7 +432,11 @@ func (t *transformer) fetchExternals(ctx context.Context, dict *interned.Dict, e
 			fact.Pred = predID
 			fact.Arity = pd.ep.arity
 			for j, v := range tuple {
-				fact.Values[j] = dict.Intern(v)
+				nv, err := normalizeUserValue(v)
+				if err != nil {
+					return fmt.Errorf("external predicate %s: %w", predName, err)
+				}
+				fact.Values[j] = dict.Intern(nv)
 			}
 			existing.Add(fact)
 		}

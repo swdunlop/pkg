@@ -3,9 +3,11 @@ package seminaive_test
 import (
 	"context"
 	"iter"
+	"math"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"swdunlop.dev/pkg/datalog"
 	"swdunlop.dev/pkg/datalog/memory"
@@ -261,6 +263,113 @@ func TestStringContains(t *testing.T) {
 	}
 }
 
+func TestStringConstraintBuiltins(t *testing.T) {
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "msg", Terms: []datalog.Constant{datalog.String("hello world")}})
+	b.AddFact(datalog.Fact{Name: "msg", Terms: []datalog.Constant{datalog.String("goodbye")}})
+	input := b.Build()
+
+	cases := []struct {
+		name    string
+		rule    string
+		wantHit string // the msg value expected to match (others must not)
+	}{
+		{"contains", `hit(X) :- msg(X), @contains(X, "hello").`, "hello world"},
+		{"starts_with", `hit(X) :- msg(X), @starts_with(X, "hello").`, "hello world"},
+		{"ends_with", `hit(X) :- msg(X), @ends_with(X, "bye").`, "goodbye"},
+		{"regex_match", `hit(X) :- msg(X), @regex_match(X, "^go.*bye$").`, "goodbye"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rs, err := syntax.ParseAll(c.rule)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tr, err := seminaive.New().Compile(rs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			output, err := tr.Transform(context.Background(), input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []string
+			for row := range output.Facts("hit", 1) {
+				got = append(got, string(row[0].(datalog.String)))
+			}
+			if len(got) != 1 || got[0] != c.wantHit {
+				t.Errorf("%s: expected [%s], got %v", c.name, c.wantHit, got)
+			}
+		})
+	}
+}
+
+func TestWithBuiltinCannotOverrideConstraintBuiltin(t *testing.T) {
+	always := func(inputs []any) (any, bool) { return true, true }
+	yieldNone := func(inputs []any, yield func([]any) bool) {}
+
+	names := []string{"@contains", "@starts_with", "@ends_with", "@regex_match"}
+	for _, name := range names {
+		t.Run(name+"/WithBuiltin", func(t *testing.T) {
+			rs, err := syntax.ParseAll(`hit(X) :- msg(X), ` + name + `(X, "x").`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = seminaive.New(seminaive.WithBuiltin(name, always)).Compile(rs)
+			if err == nil {
+				t.Fatalf("expected Compile error overriding constraint builtin %s, got nil", name)
+			}
+		})
+		t.Run(name+"/WithMultiBuiltin", func(t *testing.T) {
+			rs, err := syntax.ParseAll(`hit(X) :- msg(X), ` + name + `(X, "x").`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = seminaive.New(seminaive.WithMultiBuiltin(name, 1, yieldNone)).Compile(rs)
+			if err == nil {
+				t.Fatalf("expected Compile error overriding constraint builtin %s via WithMultiBuiltin, got nil", name)
+			}
+		})
+	}
+}
+
+func TestConstraintBuiltinsStratifyAndReorderAsBefore(t *testing.T) {
+	// A rule where a constraint builtin gates a derived (non-EDB) predicate
+	// exercises stratify.go's and eval.go's reorderBody classification of
+	// the four constraint names together with a real join dependency, so a
+	// regression that mis-files them as binding builtins (or drops them
+	// from isConstraint) would either fail stratification or silently
+	// change which facts get derived.
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "msg", Terms: []datalog.Constant{datalog.String("hello world")}})
+	b.AddFact(datalog.Fact{Name: "msg", Terms: []datalog.Constant{datalog.String("goodbye")}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`
+		upper_or_same(X) :- msg(X).
+		flagged(X) :- upper_or_same(X), @contains(X, "hello").
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := seminaive.New().Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for range output.Facts("flagged", 1) {
+		count++
+	}
+	if count != 1 {
+		t.Errorf("expected 1 flagged fact, got %d", count)
+	}
+}
+
 func TestAggregateCount(t *testing.T) {
 	b := memory.NewBuilder()
 	b.AddFact(datalog.Fact{Name: "edge", Terms: []datalog.Constant{datalog.String("a"), datalog.String("b")}})
@@ -457,6 +566,88 @@ func TestContextCancellation(t *testing.T) {
 	_, err = tr.Transform(ctx, input)
 	if err == nil {
 		t.Error("expected context cancellation error")
+	}
+}
+
+// TestContextCancellationAggregate confirms an already-cancelled context
+// aborts an aggregate whose body is a multi-way self cross-product promptly,
+// rather than running the join to completion. Before threading ctx into
+// evalAggregates/queryInternedFacts, this join (150 facts joined 3-way,
+// ~3.4M candidate tuples) ran uncancellably for hundreds of milliseconds;
+// with the fix it must return quickly with ctx.Err().
+func TestContextCancellationAggregate(t *testing.T) {
+	b := memory.NewBuilder()
+	for i := range 150 {
+		b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.Integer(int64(i))}})
+	}
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`total(S) :- S = count : v(X), v(Y), v(Z).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := seminaive.New().Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	done := make(chan struct{})
+	var transformErr error
+	go func() {
+		defer close(done)
+		_, transformErr = tr.Transform(ctx, input)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Transform did not return promptly after context cancellation; aggregate join appears uncancellable")
+	}
+	if transformErr == nil {
+		t.Error("expected context cancellation error")
+	}
+}
+
+// TestAggregateCrossProductBackground confirms a normal (non-cancelled)
+// aggregate over a multi-way self cross-product is unaffected by the
+// cancellation checks added to evalAggregates/queryInternedFacts: it still
+// runs to completion and produces the correct count.
+func TestAggregateCrossProductBackground(t *testing.T) {
+	const n = 40
+	b := memory.NewBuilder()
+	for i := range n {
+		b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.Integer(int64(i))}})
+	}
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`total(S) :- S = count : v(X), v(Y), v(Z).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := seminaive.New().Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for row := range output.Query("total", datalog.Variable("S")) {
+		found = true
+		got := int64(row[0].(datalog.Integer))
+		want := int64(n * n * n)
+		if got != want {
+			t.Errorf("expected total = %d, got %d", want, got)
+		}
+	}
+	if !found {
+		t.Fatal("expected a total(S) fact")
 	}
 }
 
@@ -1333,5 +1524,254 @@ func TestExternalPredicateMixedEDBAndIDBAnchor(t *testing.T) {
 	expected := []string{"A", "C"}
 	if !slices.Equal(results, expected) {
 		t.Errorf("expected %v, got %v", expected, results)
+	}
+}
+
+// TestExternalGoIntNormalizesAndJoins verifies that an ExternalFunc
+// returning bare Go int values (not int64) is normalized so the resulting
+// facts actually join against int64-typed data facts, rather than silently
+// interning as a type-distinct value that never matches.
+func TestExternalGoIntNormalizesAndJoins(t *testing.T) {
+	score := func(ctx context.Context, b seminaive.Bindings) iter.Seq[[]any] {
+		return func(yield func([]any) bool) {
+			// Returns a bare Go int, not int64.
+			if !yield([]any{"alice", int(42)}) {
+				return
+			}
+			yield([]any{"bob", int(7)})
+		}
+	}
+
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "threshold", Terms: []datalog.Constant{datalog.Integer(42)}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`
+		matched(Name) :- score(Name, S), threshold(S).
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithExternal("score", 2, score))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var results []string
+	for row := range output.Facts("matched", 1) {
+		results = append(results, string(row[0].(datalog.String)))
+	}
+	expected := []string{"alice"}
+	if !slices.Equal(results, expected) {
+		t.Errorf("expected %v (int normalized to int64, joins with threshold), got %v", expected, results)
+	}
+
+	// Facts() must not panic walking the "score" external facts themselves.
+	count := 0
+	for range output.Facts("score", 2) {
+		count++
+	}
+	if count != 2 {
+		t.Errorf("expected 2 score facts, got %d", count)
+	}
+}
+
+// unsupportedExternalValue is a type normalizeUserValue cannot handle,
+// used to verify Transform reports an error naming the offending predicate
+// instead of interning the value raw and panicking later in Facts().
+type unsupportedExternalValue struct{ X int }
+
+func TestExternalUnsupportedTypeErrors(t *testing.T) {
+	bad := func(ctx context.Context, b seminaive.Bindings) iter.Seq[[]any] {
+		return func(yield func([]any) bool) {
+			yield([]any{"x", unsupportedExternalValue{X: 1}})
+		}
+	}
+
+	rs, err := syntax.ParseAll(`bad(N, V) :- ext_bad(N, V).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithExternal("ext_bad", 2, bad))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = tr.Transform(context.Background(), memory.NewBuilder().Build())
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "ext_bad") {
+		t.Errorf("expected error to name predicate ext_bad, got: %v", err)
+	}
+}
+
+func TestExternalUint64OverflowErrors(t *testing.T) {
+	huge := func(ctx context.Context, b seminaive.Bindings) iter.Seq[[]any] {
+		return func(yield func([]any) bool) {
+			yield([]any{"x", uint64(math.MaxInt64) + 1})
+		}
+	}
+
+	rs, err := syntax.ParseAll(`huge(N, V) :- ext_huge(N, V).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithExternal("ext_huge", 2, huge))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = tr.Transform(context.Background(), memory.NewBuilder().Build())
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "ext_huge") {
+		t.Errorf("expected error to name predicate ext_huge, got: %v", err)
+	}
+}
+
+// TestBuiltinGoIntNormalizesAndJoins verifies that a BuiltinFunc returning
+// a bare Go int is normalized so the derived fact joins against int64-typed
+// data facts.
+func TestBuiltinGoIntNormalizesAndJoins(t *testing.T) {
+	answer := func(inputs []any) (any, bool) {
+		return int(42), true // bare Go int, not int64
+	}
+
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "seed", Terms: []datalog.Constant{datalog.String("x")}})
+	b.AddFact(datalog.Fact{Name: "threshold", Terms: []datalog.Constant{datalog.Integer(42)}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`
+		derived(N, V) :- seed(N), @answer(V).
+		matched(N) :- derived(N, V), threshold(V).
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithBuiltin("@answer", answer))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var results []string
+	for row := range output.Facts("matched", 1) {
+		results = append(results, string(row[0].(datalog.String)))
+	}
+	expected := []string{"x"}
+	if !slices.Equal(results, expected) {
+		t.Errorf("expected %v (builtin int normalized to int64, joins with threshold), got %v", expected, results)
+	}
+
+	// Facts() must not panic walking the "derived" facts themselves.
+	count := 0
+	for range output.Facts("derived", 2) {
+		count++
+	}
+	if count != 1 {
+		t.Errorf("expected 1 derived fact, got %d", count)
+	}
+}
+
+func TestBuiltinUnsupportedTypeErrors(t *testing.T) {
+	bad := func(inputs []any) (any, bool) {
+		return unsupportedExternalValue{X: 1}, true
+	}
+
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "seed", Terms: []datalog.Constant{datalog.String("x")}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`bad(N, V) :- seed(N), @bad(V).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithBuiltin("@bad", bad))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = tr.Transform(context.Background(), input)
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "@bad") {
+		t.Errorf("expected error to name builtin @bad, got: %v", err)
+	}
+}
+
+func TestBuiltinUint64OverflowErrors(t *testing.T) {
+	huge := func(inputs []any) (any, bool) {
+		return uint64(math.MaxInt64) + 1, true
+	}
+
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "seed", Terms: []datalog.Constant{datalog.String("x")}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`huge(N, V) :- seed(N), @huge(V).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithBuiltin("@huge", huge))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = tr.Transform(context.Background(), input)
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "@huge") {
+		t.Errorf("expected error to name builtin @huge, got: %v", err)
+	}
+}
+
+// TestMultiBuiltinUnsupportedTypeErrors covers the WithMultiBuiltin output
+// path (evalBindMulti), which has the same raw-intern hole as the single
+// builtin path.
+func TestMultiBuiltinUnsupportedTypeErrors(t *testing.T) {
+	bad := func(inputs []any, yield func(outputs []any) bool) {
+		yield([]any{unsupportedExternalValue{X: 1}})
+	}
+
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "seed", Terms: []datalog.Constant{datalog.String("x")}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`bad(N, V) :- seed(N), @multibad(V).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithMultiBuiltin("@multibad", 1, bad))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = tr.Transform(context.Background(), input)
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "@multibad") {
+		t.Errorf("expected error to name builtin @multibad, got: %v", err)
 	}
 }

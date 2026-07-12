@@ -17,14 +17,36 @@ import (
 // regexCache caches compiled regular expressions for regex_match.
 var regexCache sync.Map // map[string]*regexp.Regexp
 
+// constraintBuiltinNames is the single source of truth for the string
+// constraint predicates (@contains, @starts_with, @ends_with, @regex_match):
+// isConstraint below, checkConstraintV's evaluation switch, and
+// Compile's rejection of WithBuiltin/WithMultiBuiltin overrides on these
+// names all consult this set, so there is exactly one place that lists them.
+//
+// These four are boolean predicates over two already-bound arguments, not
+// binding builtins: unlike a BuiltinFunc (whose last atom argument is an
+// output position it binds) a constraint like @contains(Str, "password")
+// takes both arguments as inputs and produces no new binding. That shape
+// mismatch is why they can't be expressed as an ordinary BuiltinFunc and
+// registered through WithBuiltin -- doing so would require checkRuleSafety
+// and compileBody to treat the last argument as unbound-and-bindable, which
+// is wrong for these predicates and would silently change rule safety
+// semantics. Compile rejects any attempt to override these names via
+// WithBuiltin/WithMultiBuiltin with a clear error instead.
+var constraintBuiltinNames = map[string]bool{
+	"@contains":    true,
+	"@starts_with": true,
+	"@ends_with":   true,
+	"@regex_match": true,
+}
+
 // isConstraint reports whether an atom is an inline constraint (comparison or string builtin).
 func isConstraint(a syntax.Atom) bool {
 	switch a.Pred {
-	case "=", "!=", "<", ">", "<=", ">=",
-		"@contains", "@starts_with", "@ends_with", "@regex_match":
+	case "=", "!=", "<", ">", "<=", ">=":
 		return true
 	}
-	return false
+	return constraintBuiltinNames[a.Pred]
 }
 
 // isBindBuiltin reports whether an atom is a binding builtin (produces a new variable binding).
@@ -197,6 +219,17 @@ func checkConstraintV(pred string, terms []interned.CompiledTerm, sub *interned.
 }
 
 // evalBindBuiltin evaluates a binding builtin and returns the interned result ID.
+//
+// A BuiltinFunc that returns a value normalizeUserValue rejects (e.g. a bare
+// Go int or bool, or an unsupported type) is a programming error in the
+// builtin, not a data miss -- unlike an (nil, false) return, which just
+// means "no result for these inputs" and is handled by the ok=false path
+// here. evalBindBuiltin has no error return (it is called from
+// evalBodyRecursiveV's hot recursive loop, which threads no error out
+// either), so a bad type panics with builtinValueError; the panic is
+// recovered at the two callers that do have an error return, evalRules and
+// queryInternedFacts, mirroring the existing queryCancelled sentinel
+// pattern used for ctx-cancellation unwinding.
 func evalBindBuiltin(a syntax.Atom, sub interned.InternedSub, dict *interned.Dict, builtins map[string]BuiltinFunc) (uint64, bool) {
 	fn, ok := builtins[a.Pred]
 	if !ok {
@@ -214,7 +247,24 @@ func evalBindBuiltin(a syntax.Atom, sub interned.InternedSub, dict *interned.Dic
 	if !ok {
 		return 0, false
 	}
-	return dict.Intern(result), true
+	nv, err := normalizeUserValue(result)
+	if err != nil {
+		panic(builtinValueError{pred: a.Pred, err: err})
+	}
+	return dict.Intern(nv), true
+}
+
+// builtinValueError is panicked by evalBindBuiltin and evalBindMulti when a
+// user-supplied BuiltinFunc/MultiBuiltinFunc yields a value normalizeUserValue
+// rejects. It unwinds through evalBodyRecursiveV (which has no error return)
+// to be recovered by a caller that does: evalRules or queryInternedFacts.
+type builtinValueError struct {
+	pred string
+	err  error
+}
+
+func (e builtinValueError) Error() string {
+	return fmt.Sprintf("builtin %s: %s", e.pred, e.err)
 }
 
 // compareValues compares two values, mirroring the int/float mixing that
@@ -611,9 +661,20 @@ type evaluator struct {
 
 // evalRules runs semi-naive evaluation for a set of rules to fixpoint.
 // It returns an error if the fixpoint is not reached within maxIter
-// iterations or the context is cancelled mid-evaluation; the partial
-// results are discarded in either case.
+// iterations, the context is cancelled mid-evaluation, or a builtin yields
+// a value of an unsupported type (see builtinValueError); the partial
+// results are discarded in any case.
 func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existing interned.InternedFactSet, maxIter int) (factCount int, iterations int, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if bve, ok := r.(builtinValueError); ok {
+				err = bve
+				return
+			}
+			panic(r)
+		}
+	}()
+
 	emitted := interned.NewLightInternedFactSet()
 	delta := interned.NewLightInternedFactSet()
 
@@ -794,7 +855,11 @@ func (ev *evaluator) evalBindMulti(item bodyItem, sub *interned.VarSub, next fun
 			return true
 		}
 		for j, t := range outTerms {
-			valID := ev.dict.Intern(outputs[j])
+			nv, err := normalizeUserValue(outputs[j])
+			if err != nil {
+				panic(builtinValueError{pred: item.atom.Pred, err: err})
+			}
+			valID := ev.dict.Intern(nv)
 			if t.VarIdx < 0 {
 				// Constant output position acts as a filter.
 				if t.ConstID != valID {
@@ -1190,6 +1255,18 @@ func exprVarsBound(expr compiledExpr, boundVars uint16) bool {
 	return true
 }
 
+// queryCancelled is a sentinel panicked from queryInternedFacts' emit
+// callback to unwind evalBodyRecursiveV's recursion early on context
+// cancellation, without threading an abort return value through every
+// recursive call and join loop shared with evalRules' hot path.
+var queryCancelled = new(int)
+
+// queryTuplesPerCheck bounds how often queryInternedFacts calls ctx.Err()
+// while draining a body's solutions: once every N emitted candidate rows,
+// mirroring evalRules' once-per-iteration check rather than paying a
+// syscall-ish Err() call on every tuple.
+const queryTuplesPerCheck = 1024
+
 // queryInternedFacts evaluates a query/aggregate-rule body against a single
 // static fact set, returning results as InternedSub for compatibility with
 // aggregate grouping. It shares its atom classification (compileBody), body
@@ -1207,7 +1284,17 @@ func exprVarsBound(expr compiledExpr, boundVars uint16) bool {
 // semi-naive delta to track here -- deltaJoinIdx is always -1 and every join
 // scans memFacts directly, mirroring how evalRules itself falls back to a
 // full existing/emitted scan on iteration 0.
-func (ev *evaluator) queryInternedFacts(body []syntax.Atom, memFacts interned.InternedFactSet) []interned.InternedSub {
+//
+// A large unconstrained join (e.g. an aggregate body that is itself a
+// multi-way cross product) can spend a long time inside the shared
+// evalBodyRecursiveV recursion without ever returning to a caller that could
+// observe ctx cancellation. evalBodyRecursiveV is also evalRules' innermost
+// hot loop, so it deliberately takes no ctx and gets no per-tuple check.
+// Instead, the emit callback below -- invoked once per complete body
+// solution, not per candidate tuple examined by an inner join loop --
+// samples ctx.Err() every queryTuplesPerCheck solutions and aborts the
+// recursion via a panic/recover pair local to this function.
+func (ev *evaluator) queryInternedFacts(ctx context.Context, body []syntax.Atom, memFacts interned.InternedFactSet) (_ []interned.InternedSub, err error) {
 	items, negativeBody, _, varMap := compileBody(body, ev.dict, ev.builtins, ev.multiBuiltins)
 	items = reorderBody(items)
 
@@ -1219,10 +1306,31 @@ func (ev *evaluator) queryInternedFacts(body []syntax.Atom, memFacts interned.In
 	noDelta := interned.InternedFactSet{}
 	noEmitted := interned.InternedFactSet{}
 
+	defer func() {
+		if r := recover(); r != nil {
+			if r == queryCancelled {
+				err = ctx.Err()
+				return
+			}
+			if bve, ok := r.(builtinValueError); ok {
+				err = bve
+				return
+			}
+			panic(r)
+		}
+	}()
+
 	var results []interned.InternedSub
 	var sub interned.VarSub
+	n := 0
 	ev.evalBodyRecursiveV(items, negativeBody, varNames, -1, noDelta, memFacts, noEmitted, &sub, 0, func(vs *interned.VarSub) {
 		results = append(results, varSubToInternedSub(vs, varNames))
+		n++
+		if n%queryTuplesPerCheck == 0 {
+			if err := ctx.Err(); err != nil {
+				panic(queryCancelled)
+			}
+		}
 	})
-	return results
+	return results, nil
 }

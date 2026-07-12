@@ -88,8 +88,20 @@ func WithMaxIterations(n int) Option {
 	return func(e *Engine) { e.maxIter = n }
 }
 
-// WithBuiltin registers a named binding builtin that can be used in rule bodies.
-// The builtin predicate should start with "@" by convention.
+// WithBuiltin registers a named binding builtin that can be used in rule
+// bodies. The builtin predicate should start with "@" by convention.
+//
+// A binding builtin's last atom argument is an output position it binds
+// (see BuiltinFunc); registering one under a name already used for a
+// non-JSON default (currently only the JSON destructuring builtins:
+// @json_get, @json_len, @json_type, @json_slice, @json_each, @json_items)
+// replaces that default. The four string constraint predicates -- @contains,
+// @starts_with, @ends_with, @regex_match -- are NOT overridable this way:
+// they are boolean checks over two already-bound arguments, not binders, and
+// registering a same-named BuiltinFunc would silently do nothing (it is
+// never consulted by constraint evaluation). Compile rejects any
+// WithBuiltin/WithMultiBuiltin registration under one of those four names
+// with an explicit error instead of accepting it silently.
 func WithBuiltin(name string, fn BuiltinFunc) Option {
 	return func(e *Engine) {
 		if e.builtins == nil {
@@ -102,6 +114,9 @@ func WithBuiltin(name string, fn BuiltinFunc) Option {
 // WithMultiBuiltin registers a named multi-result builtin that can be used in
 // rule bodies. The builtin predicate should start with "@" by convention.
 // The last `outputs` args of the atom are output positions; the rest are inputs.
+// Like WithBuiltin, this cannot be used to override the four string
+// constraint predicates (@contains, @starts_with, @ends_with, @regex_match);
+// Compile rejects that with an explicit error.
 func WithMultiBuiltin(name string, outputs int, fn MultiBuiltinFunc) Option {
 	return func(e *Engine) {
 		if e.multiBuiltins == nil {
@@ -165,6 +180,22 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 		if ep.arity < 1 || ep.arity > interned.MaxFactArity {
 			return nil, fmt.Errorf("external predicate %s: arity %d out of range [1, %d]",
 				name, ep.arity, interned.MaxFactArity)
+		}
+	}
+
+	// The four string constraint predicates are evaluated directly by
+	// checkConstraintV, never by consulting e.builtins/e.multiBuiltins, so a
+	// WithBuiltin/WithMultiBuiltin registration under one of these names
+	// would silently have no effect. Reject it loudly at compile time
+	// instead (see WithBuiltin's doc comment).
+	for name := range e.builtins {
+		if constraintBuiltinNames[name] {
+			return nil, fmt.Errorf("cannot override constraint builtin %s: it is not a binding builtin (see WithBuiltin)", name)
+		}
+	}
+	for name := range e.multiBuiltins {
+		if constraintBuiltinNames[name] {
+			return nil, fmt.Errorf("cannot override constraint builtin %s: it is not a binding builtin (see WithMultiBuiltin)", name)
 		}
 	}
 

@@ -1,6 +1,7 @@
 package seminaive
 
 import (
+	"context"
 	"fmt"
 
 	"swdunlop.dev/pkg/datalog"
@@ -10,11 +11,24 @@ import (
 
 // evalAggregates evaluates aggregate rules against the current facts,
 // returning new derived facts. All computation stays in interned space.
-func (ev *evaluator) evalAggregates(aggRules []syntax.AggregateRule, memFacts interned.InternedFactSet) (interned.InternedFactSet, error) {
+//
+// ctx is checked once per aggregate rule (before running its body join, the
+// expensive part) and once per group while computing aggregates, matching
+// evalRules' once-per-iteration granularity; queryInternedFacts additionally
+// samples ctx during a single rule's body evaluation so one large aggregate
+// body (e.g. a multi-way self cross-product) can't itself run uncancellably.
+func (ev *evaluator) evalAggregates(ctx context.Context, aggRules []syntax.AggregateRule, memFacts interned.InternedFactSet) (interned.InternedFactSet, error) {
 	result := interned.NewLightInternedFactSet()
 
 	for _, ar := range aggRules {
-		bindings := ev.queryInternedFacts(ar.Body, memFacts)
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+
+		bindings, err := ev.queryInternedFacts(ctx, ar.Body, memFacts)
+		if err != nil {
+			return result, err
+		}
 
 		// Determine group-by variables: all variables in the head except ResultVar.
 		var groupByVars []string
@@ -63,9 +77,20 @@ func (ev *evaluator) evalAggregates(aggRules []syntax.AggregateRule, memFacts in
 		// Pre-compile head atom for grounding.
 		head := interned.CompileAtom(ar.Head.Pred, ar.Head.Terms, ev.dict)
 
-		// Compute aggregate for each group.
+		// Compute aggregate for each group. groupsChecked counts groups
+		// processed across all buckets so ctx is sampled every N groups
+		// (queryTuplesPerCheck) rather than on every single one, mirroring
+		// queryInternedFacts' sampling of solutions during the join above.
+		groupsChecked := 0
 		for _, bucket := range groups {
 			for _, g := range bucket {
+				groupsChecked++
+				if groupsChecked%queryTuplesPerCheck == 0 {
+					if err := ctx.Err(); err != nil {
+						return result, err
+					}
+				}
+
 				aggResultID, err := computeInternedAggregate(
 					ar.Kind, aggVarName, aggConstID, aggIsConst,
 					g.subs, ev.dict,
