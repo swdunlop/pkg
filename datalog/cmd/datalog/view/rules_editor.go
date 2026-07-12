@@ -23,7 +23,9 @@ import (
 // left for a later wave since this task only covers Run/check).
 //
 //   - #rules-text    — the program textarea (data-bind:rules-text)
-//   - #rules-error   — parse/compile error list, line:col prefixed
+//   - #rules-error   — parse/compile error list, line:col prefixed, rendered
+//     between the textarea and the actions row so it pushes the buttons
+//     down instead of the textarea above it as errors accumulate
 //   - #rules-results — Run's query results (one block per query)
 //   - #status        — Run's streamed progress / timeout report
 func RulesEditor(rulesText string) html.Content {
@@ -63,8 +65,11 @@ func RulesEditor(rulesText string) html.Content {
 
 	return PaneSection.Set("id", "pane-rules-editor").Add(
 		PaneHeading.Add(html.Text("Datalog Editor")),
-		ErrorList.Set("id", "rules-error"),
 		rulesTextarea,
+		// ErrorList renders between the textarea and the actions row so a
+		// growing error list pushes the buttons down instead of the
+		// textarea above it out from under the cursor.
+		ErrorList.Set("id", "rules-error"),
 		tag.New("div.actions", runButton, saveButton),
 		StatusDiv.Set("id", "status"),
 		tag.New("div#rules-results"),

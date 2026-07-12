@@ -21,8 +21,10 @@ import (
 //
 //   - #jsonfacts-row     — selected source row, pretty-printed
 //   - #schema-text       — the config textarea (data-bind:schema-text)
+//   - #jsonfacts-error   — in-form error list, line:col prefixed, rendered
+//     between the textarea and the actions row so it pushes the buttons
+//     down instead of the textarea above it as errors accumulate
 //   - #jsonfacts-output  — live single-row extraction output
-//   - #jsonfacts-error   — in-form error list, line:col prefixed
 func JSONFactsEditor(schemaText string, selectedRow html.Content, output html.Content) html.Content {
 	schemaTextarea := Textarea.
 		Set("id", "schema-text").
@@ -50,9 +52,12 @@ func JSONFactsEditor(schemaText string, selectedRow html.Content, output html.Co
 
 	return PaneSection.Set("id", "pane-jsonfacts-editor").Add(
 		PaneHeading.Add(html.Text("jsonfacts Editor")),
-		ErrorList.Set("id", "jsonfacts-error"),
 		selectedRow,
 		schemaTextarea,
+		// ErrorList renders between the textarea and the actions row so a
+		// growing error list pushes the buttons down instead of the
+		// textarea above it out from under the cursor.
+		ErrorList.Set("id", "jsonfacts-error"),
 		tag.New("div.actions", applyButton, saveButton),
 		output,
 	)

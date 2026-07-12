@@ -32,9 +32,24 @@
   --danger: light-dark(#a3333d, #bf616a);             /* md-error */
 }
 
+/* The page itself never scrolls: header is a fixed-height flex item, main
+ * fills the rest of the viewport, and each pane below scrolls on its own
+ * (see main#workbench / section.pane). */
+html,
+body {
+  height: 100%;
+}
+body {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  overflow: hidden;
+}
+
 /* Header bar: title, view nav, and Global Cancel, left to right. */
 header#chrome {
   display: flex;
+  flex: none;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-4);
@@ -69,17 +84,32 @@ nav#views a.active {
 }
 
 /* Each view's three panes in a responsive grid: three columns when the
- * viewport allows, collapsing on narrower windows. align-items:start keeps
- * a short pane from stretching to its row partner's height. */
+ * viewport allows, collapsing on narrower windows. main fills the remaining
+ * viewport height below the header (body is the flex container); rows are
+ * 1fr so a wrapped second row still divides that height instead of growing
+ * past it, and align-items:stretch makes every pane in a row the row's full
+ * height so each can own its own scrollbar rather than the page scrolling. */
 main#workbench {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(24rem, 1fr));
+  grid-auto-rows: 1fr;
   gap: var(--space-4);
-  align-items: start;
+  align-items: stretch;
   padding: var(--space-4);
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
 }
 
+/* Each pane is its own scroll region: a fixed-height column (from the grid
+ * row above) that scrolls its own content instead of the page scrolling.
+ * display:flex + min-height:0 lets a flex-grow child (the editor textarea
+ * below) claim the pane's remaining height and scroll itself instead. */
 section.pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
   background: var(--card);
   color: var(--card-foreground);
   border: 1px solid var(--border);
@@ -88,6 +118,7 @@ section.pane {
   min-width: 0; /* let grid tracks shrink; wide tables scroll instead */
 }
 section.pane > h2 {
+  flex: none;
   margin: 0 0 var(--space-3);
   font-size: var(--text-5);
   color: var(--muted-foreground);
@@ -95,15 +126,19 @@ section.pane > h2 {
   letter-spacing: 0.05em;
 }
 
-/* Editor textareas: real working height, monospace, resizable. */
+/* Editor textareas (jsonfacts/rules panes): grow to fill whatever space the
+ * pane's other children (heading, errors, action buttons, output) leave, so
+ * the textarea's own scrollbar handles a long document instead of the pane
+ * column scrolling to reveal a short, fixed-height box. */
 textarea.editor {
+  flex: 1 1 auto;
+  min-height: 6rem;
   width: 100%;
-  min-height: 18rem;
   background-color: light-dark(#ffffff, #1a1e26); /* md-input-bg */
   font-family: var(--font-mono);
   font-size: var(--text-7);
   line-height: var(--leading-normal);
-  resize: vertical;
+  resize: none;
   tab-size: 4;
 }
 
