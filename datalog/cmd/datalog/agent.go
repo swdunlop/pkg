@@ -221,6 +221,147 @@ func (d *kitDriver) Answer(requestID, optionID string) error {
 
 func (d *kitDriver) Close() error { return d.k.Close() }
 
+// readOnlyTools is the workbench's own read-only MCP tool set (mcp.go): the
+// three tools that only ever read the session's schema/rules/facts back to
+// the caller, never mutate them. set_schema, set_rules, and sample_input are
+// deliberately excluded — they REPLACE the human's working documents (see
+// mcp_docs.go's tool descriptions) and must keep prompting.
+var readOnlyTools = map[string]bool{
+	"query":           true,
+	"sample_facts":    true,
+	"list_predicates": true,
+}
+
+// readOnlyToolName recognizes a permission request's tool-call title as one
+// of the workbench's own read-only session tools (query, sample_facts,
+// list_predicates — see readOnlyTools), returning the bare tool name and
+// true when it does. This is the auto-allow policy's sole gate
+// (doc/features/acp-integration.md's "Permission requests" bullet): the
+// workbench's own tools were engineered for an untrusted caller (path
+// confinement, expr-environment audit, limits, timeouts — observation 5),
+// so a request recognizably gating one of them can be answered without the
+// human. A generic ACP tool-kind of "read" is deliberately NOT consulted
+// here — an external agent like Claude Code carries its own built-in tools,
+// and its own "read" means reading the OPERATOR'S FILES, which must keep
+// prompting; only titles that resolve to one of THIS package's own MCP tool
+// names match.
+//
+// Adapters name MCP tools in a permission request's title in several
+// observed shapes: the bare name ("query"), MCP-namespace-prefixed
+// ("mcp__datalog__query", "datalog__query"), or colon/space/parenthesis-
+// decorated ("datalog:query", "datalog - query (MCP)"). The extraction
+// below normalizes case, strips a trailing parenthetical annotation (e.g.
+// "(MCP)"), then takes the LAST colon- or whitespace-separated token and the
+// part of THAT token following the last "__" separator (if any) or the last
+// "-"-separated word — never a substring match, since a false positive here
+// silently grants permission. A title that only happens to CONTAIN a
+// read-only name (e.g. "Bash: psql query") does not match: after taking the
+// last token ("query"), that token itself must equal a read-only name, but
+// "psql query" splits into two tokens ("psql", "query") on whitespace, and
+// only the trailing one ("query") is considered — so this case actually
+// looks like it matches. To guard against that specific shape (a bare tool
+// invocation embedded at the end of an unrelated title), the function also
+// requires that everything BEFORE the matched trailing token, once trimmed
+// of separators, is either empty or itself looks like a namespace/prefix
+// token (no internal whitespace) — "Bash: psql" has internal whitespace, so
+// "Bash: psql query" is rejected; "datalog - query (MCP)" and
+// "mcp__datalog__query" both pass because their prefixes ("datalog -" once
+// the trailing parenthetical is stripped, and "mcp__datalog") are single
+// tokens once "__"/"-" separators are accounted for.
+func readOnlyToolName(title string) (string, bool) {
+	s := strings.TrimSpace(title)
+	if s == "" {
+		return "", false
+	}
+	s = strings.ToLower(s)
+
+	// Strip one trailing parenthetical annotation, e.g. "(mcp)".
+	if i := strings.LastIndex(s, "("); i >= 0 && strings.HasSuffix(s, ")") {
+		s = strings.TrimSpace(s[:i])
+	}
+	if s == "" {
+		return "", false
+	}
+
+	// Split on the last colon, if any: "datalog:query" -> prefix "datalog",
+	// tail "query". A title with no colon has an empty prefix here.
+	prefix := ""
+	tail := s
+	if i := strings.LastIndex(s, ":"); i >= 0 {
+		prefix, tail = strings.TrimSpace(s[:i]), strings.TrimSpace(s[i+1:])
+	}
+
+	// Split the tail on whitespace and take the last field: "datalog -
+	// query" (after stripping "(mcp)" and finding no colon) tails to
+	// "datalog - query", whose last field is "query"; anything before that
+	// field folds into prefix too.
+	fields := strings.Fields(tail)
+	if len(fields) == 0 {
+		return "", false
+	}
+	last := fields[len(fields)-1]
+	if len(fields) > 1 {
+		if prefix != "" {
+			prefix += " "
+		}
+		prefix += strings.Join(fields[:len(fields)-1], " ")
+	}
+
+	// Within the final field, take the part after the last "__" or "-"
+	// separator (MCP-namespace and dash-joined prefixes), folding anything
+	// before that separator into prefix as well.
+	name := last
+	if i := strings.LastIndex(name, "__"); i >= 0 {
+		if prefix != "" {
+			prefix += " "
+		}
+		prefix += name[:i]
+		name = name[i+2:]
+	} else if i := strings.LastIndex(name, "-"); i >= 0 {
+		if prefix != "" {
+			prefix += " "
+		}
+		prefix += name[:i]
+		name = name[i+1:]
+	}
+
+	if !readOnlyTools[name] {
+		return "", false
+	}
+
+	// Reject a prefix that itself contains whitespace or a stray "-" once
+	// trimmed: a genuine MCP-namespace prefix ("datalog", "mcp__datalog",
+	// "datalog -") is one token from the caller's naming convention, while
+	// "Bash: psql" or "some other tool" reads as unrelated prose that
+	// happens to end in a read-only tool's name — the precise-extraction
+	// rule this function is built around means such a title must NOT match.
+	prefix = strings.TrimSpace(strings.Trim(prefix, "-"))
+	if strings.ContainsAny(prefix, " \t") {
+		return "", false
+	}
+	return name, true
+}
+
+// autoAllowOption picks the permission option the auto-allow policy answers
+// with, per acp-integration.md's "Permission requests" bullet: prefer an
+// option whose Kind is exactly allow_once; failing that, any Kind with the
+// "allow" prefix (covers allow_always, and any future allow_* ACP adds).
+// Returns ok = false when the request offers no allow option at all, so the
+// caller falls through to normal button rendering rather than guessing.
+func autoAllowOption(opts []agentOption) (agentOption, bool) {
+	for _, o := range opts {
+		if o.Kind == "allow_once" {
+			return o, true
+		}
+	}
+	for _, o := range opts {
+		if strings.HasPrefix(o.Kind, "allow") {
+			return o, true
+		}
+	}
+	return agentOption{}, false
+}
+
 // agentTurnJobKey gates the Agent tab on the jobs set: one turn at a time,
 // and Global Cancel (Stop) cancels the active turn's context — the
 // emergency-brake extension acp-integration.md observation 7 specifies.
@@ -366,6 +507,33 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 		case "error":
 			wb.consoleAppend("agent", "error", html.Text(ev.Text))
 		case "permission":
+			// Auto-allow policy (doc/features/acp-integration.md's
+			// "Permission requests" bullet): a request recognizably gating
+			// one of the workbench's own read-only session tools (query,
+			// sample_facts, list_predicates — readOnlyToolName) is answered
+			// immediately, without a human click, because those tools were
+			// already engineered for an untrusted caller (observation 5).
+			// Everything else — mutating workbench tools, and any tool
+			// belonging to an external agent's OWN built-ins (e.g. Claude
+			// Code's file reads, which this package cannot and must not
+			// distinguish from a legitimate ACP "read" kind) — still gets
+			// the interactive rendering below. Answer is called
+			// synchronously right here in the sink: the agentDriver
+			// interface's doc comment on Answer notes it sends on a
+			// buffered channel, so this cannot deadlock against the very
+			// Prompt call whose goroutine is running this sink. A driver
+			// error (a raced turn teardown — e.g. the turn ended between
+			// the event firing and this call) falls through to the normal
+			// buttons path so the request is never silently dropped.
+			if _, ok := readOnlyToolName(ev.ToolName); ok {
+				if opt, ok := autoAllowOption(ev.Options); ok {
+					if err := driver.Answer(ev.RequestID, opt.ID); err == nil {
+						wb.consoleAppend("agent", "note",
+							html.Text("auto-allowed: "+permissionSummary(ev)))
+						return
+					}
+				}
+			}
 			// Interactive rendering (acp-integration.md work item 9): one
 			// entry with a live button per option. The entry id is tracked
 			// under wb.permMu — NOT the local toolIDs map above — because

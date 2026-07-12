@@ -24,6 +24,11 @@ package main
 //     ends the turn with stopReason "cancelled".
 //   - "exit3": exits the process with status 3 immediately after
 //     initialize, before ever answering session/new or session/prompt.
+//   - "readonly-perm": requests permission for a bare "query"-titled tool
+//     call and asserts the turn completes with NO /console/answer POST —
+//     agent.go's auto-allow policy (readOnlyToolName) must answer it
+//     without the human, exercised end to end through runAgentTurn's real
+//     driver.Answer call rather than a fakeDriver stand-in.
 
 import (
 	"context"
@@ -108,7 +113,7 @@ func TestFakeACPAgentHelperProcess(t *testing.T) {
 type fakeACPAgent struct {
 	conn *acp.AgentSideConnection
 
-	script string // "full" | "cancel" | "exit3"
+	script string // "full" | "cancel" | "exit3" | "readonly-perm"
 
 	// Recorded handshake state, read by the test after the turn completes
 	// (single-threaded access is safe: the test only reads these after
@@ -189,6 +194,8 @@ func (a *fakeACPAgent) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 	case "exit3":
 		os.Exit(3)
 		panic("unreachable")
+	case "readonly-perm":
+		return a.promptReadOnlyPermScript(ctx, params)
 	default:
 		return a.promptFullScript(ctx, params)
 	}
@@ -252,11 +259,19 @@ func (a *fakeACPAgent) promptFullScript(ctx context.Context, params acp.PromptRe
 			acp.WithUpdateContent(content)),
 	}))
 
+	// Title is "set_rules", a MUTATING workbench tool, not the "list_predicates"
+	// call actually made above: the auto-allow policy (agent.go's
+	// readOnlyToolName) only fires for the three read-only tools, so this
+	// script's permission request must keep requiring a human answer for
+	// TestACPDriver_PermissionViaConsoleHTTP (which drives this same script
+	// through runAgentTurn and asserts the manual-button path) to still
+	// exercise that path. TestACPDriver_PermissionForReadOnlyToolAutoAllowed
+	// below covers the auto-allow path with its own "readonly-perm" script.
 	outcome, err := a.conn.RequestPermission(ctx, acp.RequestPermissionRequest{
 		SessionId: params.SessionId,
 		ToolCall: acp.ToolCallUpdate{
 			ToolCallId: toolCallID,
-			Title:      acp.Ptr("list_predicates"),
+			Title:      acp.Ptr("set_rules"),
 		},
 		Options: []acp.PermissionOption{
 			{OptionId: "allow_once", Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce},
@@ -275,6 +290,45 @@ func (a *fakeACPAgent) promptFullScript(ctx context.Context, params acp.PromptRe
 		SessionId: params.SessionId,
 		Update:    acp.UpdateAgentMessageText(final),
 	}))
+
+	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+}
+
+// promptReadOnlyPermScript requests permission for a bare "query"-titled
+// tool call, offering both an allow_once and a reject_once option — the
+// same option shape a real permission gate would offer — and asserts (via
+// the outcome text folded into its final message) whether the request was
+// answered "allow_once" without ever being told to be. Driven through
+// runAgentTurn (not driver.Prompt directly, unlike promptFullScript's
+// TestACPDriver_FullTurnEndToEnd caller), this exercises agent.go's
+// auto-allow policy against a REAL RequestPermission RPC round-trip: no
+// /console/answer POST should ever be needed for the turn to complete.
+func (a *fakeACPAgent) promptReadOnlyPermScript(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
+	outcome, err := a.conn.RequestPermission(ctx, acp.RequestPermissionRequest{
+		SessionId: params.SessionId,
+		ToolCall: acp.ToolCallUpdate{
+			ToolCallId: acp.ToolCallId("call-1"),
+			Title:      acp.Ptr("query"),
+		},
+		Options: []acp.PermissionOption{
+			{OptionId: "allow_once", Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce},
+			{OptionId: "reject_once", Name: "Reject", Kind: acp.PermissionOptionKindRejectOnce},
+		},
+	})
+	if err != nil {
+		return acp.PromptResponse{}, err
+	}
+
+	final := "permission outcome was cancelled"
+	if outcome.Outcome.Selected != nil {
+		final = "permission answered: " + string(outcome.Outcome.Selected.OptionId)
+	}
+	if err := a.conn.SessionUpdate(ctx, acp.SessionNotification{
+		SessionId: params.SessionId,
+		Update:    acp.UpdateAgentMessageText(final),
+	}); err != nil {
+		return acp.PromptResponse{}, err
+	}
 
 	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
 }
@@ -604,6 +658,46 @@ func TestACPDriver_PermissionViaConsoleHTTP(t *testing.T) {
 	wb.permMu.Unlock()
 	if n != 0 {
 		t.Fatalf("pendingPerm not cleared after the turn ended: %d entries remain", n)
+	}
+}
+
+// TestACPDriver_PermissionForReadOnlyToolAutoAllowed drives the
+// "readonly-perm" script through the workbench's own console handlers, the
+// same way TestACPDriver_PermissionViaConsoleHTTP drives "full" — but here
+// the permission request's title ("query") is one of the workbench's own
+// read-only tools, so agent.go's auto-allow policy must answer it via a
+// REAL driver.Answer call inside runAgentTurn's sink, with no
+// /console/answer POST ever issued and nothing left in wb.pendingPerm.
+func TestACPDriver_PermissionForReadOnlyToolAutoAllowed(t *testing.T) {
+	wb, srv, cfg := newACPTestWorkbenchAndServer(t)
+	setFakeACPAgentScript(t, "readonly-perm")
+	wb.agentCfg = cfg
+
+	resp := postSignals(t, srv, "/console/prompt", map[string]any{"consolePrompt": "check things"})
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	// The turn completes on its own — no button click, no /console/answer
+	// POST — because the auto-allow policy answers the request from inside
+	// the sink the instant it arrives.
+	waitFor(t, func() bool { return strings.Contains(renderLog(wb, "agent"), "permission answered: allow_once") })
+
+	log := renderLog(wb, "agent")
+	if !strings.Contains(log, "auto-allowed: query") {
+		t.Fatalf("expected an auto-allowed note in the transcript: %s", log)
+	}
+	if strings.Contains(log, "permission-option") {
+		t.Fatalf("a read-only tool's permission request rendered buttons instead of auto-allowing: %s", log)
+	}
+	if strings.Contains(log, "agent is waiting for permission") {
+		t.Fatalf("a read-only tool's permission request rendered the pending-button phrasing: %s", log)
+	}
+
+	wb.permMu.Lock()
+	n := len(wb.pendingPerm)
+	wb.permMu.Unlock()
+	if n != 0 {
+		t.Fatalf("auto-allowed request left an entry in wb.pendingPerm: %d entries remain", n)
 	}
 }
 

@@ -191,7 +191,13 @@ turn runs. The pane renders `agentEvent`s as they stream:
 - **Plan** (phase 2) — a checklist block updated in place.
 - **Permission requests** (phase 2) — the request's options rendered
   as inline buttons; the reply carries the chosen option. A turn
-  blocked on permission shows that state plainly.
+  blocked on permission shows that state plainly. A request
+  recognizably gating one of the workbench's own read-only session
+  tools (`query`, `sample_facts`, `list_predicates`) is answered
+  "allow" automatically, without a button, because those tools were
+  already engineered for an untrusted caller (observation 5) — every
+  other request, including anything that looks like a generic ACP
+  "read" on an external agent's own built-in tools, still prompts.
 - **Turn end** — the stop reason is shown when it is not `end_turn`;
   an agent crash renders an explicit "agent exited (code N)" terminal
   state, never silence.

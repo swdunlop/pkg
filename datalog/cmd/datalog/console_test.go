@@ -598,6 +598,174 @@ func TestRunAgentTurnCancelledResolvesPendingPermission(t *testing.T) {
 	}
 }
 
+// -- auto-allow policy (doc/features/acp-integration.md's "Permission
+// requests" bullet: a request gating one of the workbench's own read-only
+// tools — query, sample_facts, list_predicates — is answered "allow"
+// without the human) --------------------------------------------------------
+
+// TestRunAgentTurnAutoAllowsReadOnlyTool exercises the happy path: a
+// permission request titled for the read-only "query" tool, offering both
+// an allow_once and a reject_once option. runAgentTurn's sink must call
+// driver.Answer with the allow_once option right there (fakeDriver.answered
+// records the call), render a "auto-allowed: ..." note instead of buttons,
+// and never track the request in wb.pendingPerm at all.
+func TestRunAgentTurnAutoAllowsReadOnlyTool(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	driver := &fakeDriver{
+		answerable: true,
+		events: []agentEvent{
+			{
+				Kind: "permission", RequestID: "req-auto-1", ToolName: "query",
+				ToolArgs: `{"query":"copied_to(F,H)?"}`,
+				Options: []agentOption{
+					{ID: "allow_once", Name: "Allow", Kind: "allow_once"},
+					{ID: "reject_once", Name: "Reject", Kind: "reject_once"},
+				},
+			},
+			{Kind: "message", Text: "done"},
+		},
+		stopReason: "stop",
+	}
+
+	wb.runAgentTurn(context.Background(), driver, "how many copies?")
+
+	if len(driver.answered) != 1 {
+		t.Fatalf("Answer called %d times, want 1: %+v", len(driver.answered), driver.answered)
+	}
+	if got := driver.answered[0]; got.requestID != "req-auto-1" || got.optionID != "allow_once" {
+		t.Fatalf("Answer called with %+v, want {req-auto-1 allow_once}", got)
+	}
+
+	log := renderLog(wb, "agent")
+	if !strings.Contains(log, "auto-allowed: query") {
+		t.Fatalf("expected an auto-allowed note in the transcript: %s", log)
+	}
+	if strings.Contains(log, "permission-option") {
+		t.Fatalf("auto-allowed request still rendered buttons: %s", log)
+	}
+	if strings.Contains(log, "agent is waiting for permission") {
+		t.Fatalf("auto-allowed request rendered the pending-button phrasing: %s", log)
+	}
+
+	wb.permMu.Lock()
+	n := len(wb.pendingPerm)
+	wb.permMu.Unlock()
+	if n != 0 {
+		t.Fatalf("auto-allowed request was tracked in wb.pendingPerm: %d entries", n)
+	}
+}
+
+// TestRunAgentTurnMutatingToolStillPrompts is the auto-allow policy's
+// negative case: a permission request for set_rules (a MUTATING workbench
+// tool) must render the normal interactive buttons and must NOT call
+// driver.Answer on the agent's behalf — set_schema/set_rules/sample_input
+// replace the human's working documents, so the human decides.
+func TestRunAgentTurnMutatingToolStillPrompts(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	driver := newBlockingPermissionDriver() // emits ToolName "datalog__set_rules"
+
+	turnDone := make(chan struct{})
+	go func() {
+		wb.runAgentTurn(context.Background(), driver, "change the rules")
+		close(turnDone)
+	}()
+
+	waitFor(t, func() bool { return strings.Contains(renderLog(wb, "agent"), "permission-option") })
+
+	log := renderLog(wb, "agent")
+	if !strings.Contains(log, "agent is waiting for permission") {
+		t.Fatalf("expected the pending-button phrasing for a mutating tool: %s", log)
+	}
+	if len(driver.answered) != 0 {
+		t.Fatalf("set_rules should not be auto-answered")
+	}
+
+	wb.permMu.Lock()
+	_, tracked := wb.pendingPerm["req-1"]
+	wb.permMu.Unlock()
+	if !tracked {
+		t.Fatalf("mutating tool's request must be tracked in wb.pendingPerm")
+	}
+
+	// Resolve it manually so the turn (and its goroutine) finishes cleanly.
+	if err := driver.Answer("req-1", "allow"); err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+	<-turnDone
+}
+
+// readOnlyNoAllowPermissionDriver emits one permission event for a
+// read-only tool whose options carry no allow kind at all (e.g. an agent
+// that only offers "always allow"/"always reject" or some future kind this
+// package doesn't recognize), then blocks Prompt until Answer is called —
+// mirroring blockingPermissionDriver above, needed here (rather than the
+// simpler non-blocking fakeDriver) so the turn stays open long enough to
+// assert the request is still tracked in wb.pendingPerm before resolving it.
+type readOnlyNoAllowPermissionDriver struct {
+	answered chan answerCall
+}
+
+func (d *readOnlyNoAllowPermissionDriver) Prompt(ctx context.Context, text string, sink func(agentEvent)) (string, error) {
+	sink(agentEvent{
+		Kind: "permission", RequestID: "req-no-allow", ToolName: "sample_facts",
+		Options: []agentOption{
+			{ID: "reject_once", Name: "Reject", Kind: "reject_once"},
+			{ID: "reject_always", Name: "Always reject", Kind: "reject_always"},
+		},
+	})
+	select {
+	case <-d.answered:
+		return "stop", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (d *readOnlyNoAllowPermissionDriver) Answer(requestID, optionID string) error {
+	d.answered <- answerCall{requestID, optionID}
+	return nil
+}
+
+func (d *readOnlyNoAllowPermissionDriver) Close() error { return nil }
+
+// TestRunAgentTurnReadOnlyToolWithoutAllowOptionStillPrompts covers a
+// read-only tool whose options carry no allow kind at all — autoAllowOption
+// returns ok=false, so the request must fall through to the normal buttons
+// rather than guessing.
+func TestRunAgentTurnReadOnlyToolWithoutAllowOptionStillPrompts(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	driver := &readOnlyNoAllowPermissionDriver{answered: make(chan answerCall, 1)}
+
+	turnDone := make(chan struct{})
+	go func() {
+		wb.runAgentTurn(context.Background(), driver, "sample something")
+		close(turnDone)
+	}()
+
+	waitFor(t, func() bool { return strings.Contains(renderLog(wb, "agent"), "permission-option") })
+
+	log := renderLog(wb, "agent")
+	if !strings.Contains(log, "agent is waiting for permission") {
+		t.Fatalf("expected the pending-button phrasing when no allow option exists: %s", log)
+	}
+	if strings.Contains(log, "auto-allowed") {
+		t.Fatalf("must not claim auto-allowed when no allow option exists: %s", log)
+	}
+
+	wb.permMu.Lock()
+	_, tracked := wb.pendingPerm["req-no-allow"]
+	wb.permMu.Unlock()
+	if !tracked {
+		t.Fatalf("request without an allow option must be tracked in wb.pendingPerm")
+	}
+
+	// Resolve it manually so the turn (and its goroutine) finishes cleanly.
+	if err := driver.Answer("req-no-allow", "reject_once"); err != nil {
+		t.Fatalf("Answer: %v", err)
+	}
+	<-turnDone
+}
+
 // -- plan checklist ------------------------------------------------------------
 
 func TestRunAgentTurnPlanMorphsInPlace(t *testing.T) {
