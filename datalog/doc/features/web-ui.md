@@ -124,10 +124,11 @@ button is the persistence step for agent-authored documents too
 
 ### The panes
 
-Four workspace panes plus the chat pane (defined in acp-integration.md),
-split across two three-column views rather than one page — four disjoint
-panes on a single screen proved unworkable, and each pair naturally shares
-a Fact Browser as its "what did that just produce" column:
+Four workspace panes plus a console drawer shared by both views (the
+drawer's Agent tab is defined in acp-integration.md), split across two
+three-column views rather than one page — four disjoint panes on a
+single screen proved unworkable, and each pair naturally shares a Fact
+Browser as its "what did that just produce" column:
 
 - **Facts view** (`/facts`): Data Browser | jsonfacts Editor | Fact Browser
   (base facts only) — authoring how base facts are extracted from JSONL.
@@ -207,6 +208,22 @@ subsequent completion — including ones triggered by agent tool calls —
 as a `Batch` of both fragments; Datastar morphs whichever id the current
 view actually has on screen and no-ops on the other.
 
+**Console drawer.** A full-width strip beneath the three columns,
+present on both views and collapsed by default to a one-line status
+bar (so the no-agent, no-query-yet case costs no screen). Two tabs:
+**Query** — an ad-hoc query input running through the same `query`
+handler as Run (same 5s timeout, same sandbox, same `Jobs` key
+discipline), with a scrollback of results — the REPL's `?` line with a
+rendered face, so one-off probes stop requiring edits to the rules
+document; and **Agent** — the chat pane defined in acp-integration.md.
+Both tabs' scrollbacks are session state like `schemaText`: the server
+owns the transcript, the drawer re-renders it on page load, and new
+entries patch in over SSE (the same page-scoped subscription pattern
+as the Fact Browser). Switching views mid-turn or mid-query therefore
+loses nothing — the drawer on the next page picks the stream back up.
+A drawer rather than a fourth column because the three-column rhythm
+was hard-won; the ultrawide case is an open question below.
+
 ### Execution sandbox
 
 Malformed rules can loop or explode combinatorially; handlers must
@@ -272,6 +289,10 @@ see mcp-server.md and acp-integration.md.
     suppression, fact cap.
 11. **Tests**: handler tests against `examples/mordor`; timeout,
     cancel, and stale-suppression tests.
+12. **Console drawer**: the collapsible shell shared by both views,
+    session-owned scrollback, and the Query tab (input → `query`
+    handler → appended result fragment). The Agent tab is
+    acp-integration.md's work, not this feature's.
 
 ## Risks / open questions
 
@@ -291,6 +312,12 @@ see mcp-server.md and acp-integration.md.
 - **Snapshot memory.** Pointer-swap semantics briefly hold two full
   databases during a mutation. Inherent to the snapshot model;
   acceptable at target scale.
+- **Ultrawide users may want the console as a fourth column.** The
+  drawer trades vertical space to preserve the three-column layout; on
+  an ultrawide monitor a right-rail column may be strictly better. If
+  asked for, a layout toggle (drawer vs. column) is chrome-only — the
+  console's content, session state, and SSE wiring are unchanged —
+  but it is deliberately not built until someone asks.
 
 ## Out of scope
 

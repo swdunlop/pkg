@@ -167,6 +167,18 @@ live session even when kit is the agent.
 
 ### Chat pane
 
+The chat pane is the **Agent tab of the console drawer** (web-ui.md
+"Console drawer"): a full-width collapsible strip beneath both views'
+three columns, not a peer pane in the column grid. The placement is
+forced by this feature's premise — the agent's mutations land in the
+panes above, and the human must watch those panes *while* the agent
+types, so the chat cannot live on a view of its own. The transcript
+is session state: the server owns it, page loads re-render it, and
+streamed events patch it over SSE, so navigating between the Facts
+and Rules views mid-turn drops nothing. (An ultrawide fourth-column
+layout is an acknowledged possible future toggle — see web-ui.md's
+open questions — and would change only chrome, nothing here.)
+
 A prompt box issues one turn at a time, with send disabled while a
 turn runs. The pane renders `agentEvent`s as they stream:
 
