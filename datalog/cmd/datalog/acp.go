@@ -30,6 +30,18 @@ type acpDriver struct {
 
 	agentCaps acp.AgentCapabilities // recorded at Initialize
 
+	// exited closes once the subprocess has been waited on by the single
+	// monitor goroutine started in newACPDriver (exec.Cmd.Wait's contract
+	// permits exactly one caller per process); exitErr and exitCode are
+	// written before the close, so any goroutine that observes <-exited
+	// closed is guaranteed to see both fields correctly per the memory
+	// model's happens-before rule for channel closes. Prompt and cancelTurn
+	// both select on this channel and share the exitError helper below
+	// rather than each racing their own Wait call.
+	exited   chan struct{}
+	exitErr  error
+	exitCode int
+
 	mcpURL   string
 	mcpToken string
 
@@ -85,11 +97,26 @@ func newACPDriver(cfg agentConfig) (*acpDriver, error) {
 
 	d := &acpDriver{
 		cmd:      cmd,
+		exited:   make(chan struct{}),
 		mcpURL:   cfg.MCPURL,
 		mcpToken: cfg.MCPToken,
 		pending:  map[string]chan acp.RequestPermissionOutcome{},
 	}
 	d.conn = acp.NewClientSideConnection(d, stdin, stdout)
+
+	// The one and only Wait call for this subprocess (exec.Cmd.Wait must be
+	// called exactly once per process). Started here, immediately after
+	// Start, rather than per-turn in Prompt, so a mid-turn crash on any turn
+	// — not just the first — is observed and unblocks whichever of
+	// Prompt/cancelTurn is currently selecting on d.exited.
+	go func() {
+		err := cmd.Wait()
+		d.exitErr = err
+		if cmd.ProcessState != nil {
+			d.exitCode = cmd.ProcessState.ExitCode()
+		}
+		close(d.exited)
+	}()
 
 	initCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -175,13 +202,12 @@ func (d *acpDriver) Prompt(ctx context.Context, text string, sink func(agentEven
 		d.mu.Unlock()
 	}()
 
-	// exited fires if the subprocess dies mid-turn — surfaced as a Prompt
+	// d.exited fires if the subprocess dies mid-turn — surfaced as a Prompt
 	// error so runAgentTurn's dropAgentDriver path fires and the next
 	// prompt respawns a fresh subprocess (per the design's "a subprocess
-	// exit surfaces as a Prompt error ... so that path fires").
-	exited := make(chan error, 1)
-	go func() { exited <- d.cmd.Wait() }()
-
+	// exit surfaces as a Prompt error ... so that path fires"). The wait
+	// itself happened on the single monitor goroutine started in
+	// newACPDriver; this just reads its recorded outcome.
 	promptDone := make(chan promptResult, 1)
 	go func() {
 		resp, err := d.conn.Prompt(ctx, acp.PromptRequest{
@@ -197,15 +223,22 @@ func (d *acpDriver) Prompt(ctx context.Context, text string, sink func(agentEven
 			return "", r.err
 		}
 		return string(r.resp.StopReason), nil
-	case werr := <-exited:
-		code := d.cmd.ProcessState.ExitCode()
-		if werr == nil {
-			return "", fmt.Errorf("agent exited (code %d)", code)
-		}
-		return "", fmt.Errorf("agent exited (code %d): %w", code, werr)
+	case <-d.exited:
+		return "", d.exitError()
 	case <-ctx.Done():
-		return d.cancelTurn(sessionID, promptDone, exited)
+		return d.cancelTurn(sessionID, promptDone)
 	}
+}
+
+// exitError formats the subprocess's recorded exit outcome (set once, by
+// the single monitor goroutine started in newACPDriver) as the "agent
+// exited (code N)" error shared by Prompt and cancelTurn — both select on
+// d.exited and want the same message.
+func (d *acpDriver) exitError() error {
+	if d.exitErr == nil {
+		return fmt.Errorf("agent exited (code %d)", d.exitCode)
+	}
+	return fmt.Errorf("agent exited (code %d): %w", d.exitCode, d.exitErr)
 }
 
 // promptResult carries one Prompt RPC's outcome across goroutines — a
@@ -223,7 +256,7 @@ type promptResult struct {
 // cancelled outcome here via cancelPending, matching ACP's requirement that
 // a client cancelling a turn must answer every outstanding
 // request_permission with Cancelled.
-func (d *acpDriver) cancelTurn(sessionID acp.SessionId, promptDone <-chan promptResult, exited <-chan error) (string, error) {
+func (d *acpDriver) cancelTurn(sessionID acp.SessionId, promptDone <-chan promptResult) (string, error) {
 	d.cancelPending()
 
 	cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -238,12 +271,8 @@ func (d *acpDriver) cancelTurn(sessionID acp.SessionId, promptDone <-chan prompt
 			return "", r.err
 		}
 		return string(r.resp.StopReason), nil
-	case werr := <-exited:
-		code := d.cmd.ProcessState.ExitCode()
-		if werr == nil {
-			return "", fmt.Errorf("agent exited (code %d)", code)
-		}
-		return "", fmt.Errorf("agent exited (code %d): %w", code, werr)
+	case <-d.exited:
+		return "", d.exitError()
 	case <-timer.C:
 		// The subprocess ignored session/cancel — kill it outright (the
 		// doc's kill timer). The next prompt respawns a fresh driver via
