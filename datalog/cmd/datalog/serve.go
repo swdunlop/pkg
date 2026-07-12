@@ -243,6 +243,15 @@ type workbench struct {
 	selValid  bool   // whether a selection has been made yet
 }
 
+// currentSelection reads the jsonfacts Editor's evaluation-target selection
+// under selMu, for handlers (like the Data Browser's row rendering) that
+// only need to know which row to highlight, not its raw content.
+func (wb *workbench) currentSelection() (file string, row int, valid bool) {
+	wb.selMu.Lock()
+	defer wb.selMu.Unlock()
+	return wb.selFile, wb.selRow, wb.selValid
+}
+
 // routes registers the full route table on mux using Go 1.22+ method+
 // pattern syntax. Pane endpoints are stubs for now (later waves fill them
 // in, one file per pane so parallel agents never touch this file); the
@@ -299,14 +308,14 @@ func (wb *workbench) handleFactsView(w http.ResponseWriter, r *http.Request) {
 	schemaText := wb.h.sess.schemaText
 	wb.h.mu.Unlock()
 
-	sel, output := wb.renderJSONFactsSelection()
+	output := wb.renderJSONFactsSelection()
 
 	page := view.Page{
-		Title:  "datalog workbench — facts",
+		Title:  "Datalog Workbench — facts",
 		Active: "facts",
 		Columns: []html.Content{
 			view.DataBrowser(),
-			view.JSONFactsEditor(schemaText, sel, output),
+			view.JSONFactsEditor(schemaText, output),
 			view.FactBrowser("base", "Base Facts"),
 		},
 	}
@@ -324,7 +333,7 @@ func (wb *workbench) handleRulesView(w http.ResponseWriter, r *http.Request) {
 	wb.h.mu.Unlock()
 
 	page := view.Page{
-		Title:  "datalog workbench — rules",
+		Title:  "Datalog Workbench — Rules",
 		Active: "rules",
 		Columns: []html.Content{
 			view.FactBrowser("base", "Base Facts"),

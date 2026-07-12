@@ -49,8 +49,9 @@ var (
 
 	// Textarea is the shared shape for the jsonfacts/rules editors' raw
 	// text documents (data-bind wiring added at the call site, since the
-	// bound signal name differs per editor).
-	Textarea = tag.New("textarea.editor")
+	// bound signal name differs per editor). spellcheck is off because
+	// Firefox et al flag most YAML/Datalog identifiers as misspelled.
+	Textarea = tag.New("textarea.editor").Set("spellcheck", "false")
 
 	// StatusDiv is a small status/progress fragment target
 	// (doc/notes/datastar.md §9's `#status` div), rendered empty by default

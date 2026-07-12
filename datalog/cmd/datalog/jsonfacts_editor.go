@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"sort"
@@ -26,40 +25,25 @@ type jsonfactsSignals struct {
 const jsonfactsApplyJobKey = "jsonfacts-apply"
 
 // renderJSONFactsSelection reads the current row selection under wb.selMu
-// and returns the #jsonfacts-row and #jsonfacts-output fragments for it —
-// used both by GET / (initial page render, design constraint 1: render
-// current selection if any) and can be reused by any handler that needs to
-// re-render the selection unchanged.
-func (wb *workbench) renderJSONFactsSelection() (row html.Content, output html.Content) {
+// and returns the #jsonfacts-output fragment for it — used both by GET /
+// (initial page render, design constraint 1: render current selection if
+// any) and can be reused by any handler that needs to re-render the
+// selection unchanged. The selected row itself is rendered by the Data
+// Browser (view.DataRow's highlight), not here.
+func (wb *workbench) renderJSONFactsSelection() (output html.Content) {
 	wb.selMu.Lock()
 	valid := wb.selValid
-	raw := wb.selRecord
 	wb.selMu.Unlock()
 
 	if !valid {
-		return view.JSONFactsNoSelection(), view.JSONFactsOutputMessage("no row selected yet")
+		return view.JSONFactsOutputMessage("no row selected yet")
 	}
 
-	pretty := prettyJSONLine(raw)
 	lines, err := wb.extractSelectedRow()
 	if err != nil {
-		return view.JSONFactsRow(pretty), view.JSONFactsOutputMessage(err.Error())
+		return view.JSONFactsOutputMessage(err.Error())
 	}
-	return view.JSONFactsRow(pretty), view.JSONFactsOutput(lines)
-}
-
-// prettyJSONLine pretty-prints raw as JSON via json.MarshalIndent, falling
-// back to the raw line verbatim if it doesn't parse as JSON.
-func prettyJSONLine(raw string) string {
-	var obj any
-	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
-		return raw
-	}
-	buf, err := json.MarshalIndent(obj, "", "  ")
-	if err != nil {
-		return raw
-	}
-	return string(buf)
+	return view.JSONFactsOutput(lines)
 }
 
 // extractSelectedRow extracts facts for the currently selected row against

@@ -5,8 +5,10 @@ import (
 	"github.com/swdunlop/html-go/tag"
 )
 
-// JSONFactsEditor renders the jsonfacts Editor pane shell: a three-pane grid
-// (selected row, config textarea, live output). The config textarea binds
+// JSONFactsEditor renders the jsonfacts Editor pane shell: a config textarea
+// plus live output. The tested row itself lives in the Data Browser (it
+// highlights the selected row there, per doc/features/web-ui.md — no need
+// to duplicate the record here too). The config textarea binds
 // data-bind:schema-text per doc/notes/datastar.md §6 — the content is
 // genuinely observed keystroke-by-keystroke — with a 500ms-debounced
 // keydown posting to /jsonfacts/preview (extracts the single selected row
@@ -16,16 +18,17 @@ import (
 //
 // schemaText is the session's CURRENT canonical document (design constraint
 // 1: the editor content IS the document), rendered as the textarea's
-// initial value at page load. selectedRow and output render the current
-// jsonfacts-test selection, if any, so a page reload doesn't lose context.
+// initial value at page load. output renders the current jsonfacts-test
+// selection's extraction, if any, so a page reload doesn't lose context.
 //
-//   - #jsonfacts-row     — selected source row, pretty-printed
 //   - #schema-text       — the config textarea (data-bind:schema-text)
+//   - #jsonfacts-output  — live single-row extraction output, rendered
+//     between the textarea and the actions row so a test run doesn't
+//     reflow the buttons below it
 //   - #jsonfacts-error   — in-form error list, line:col prefixed, rendered
-//     between the textarea and the actions row so it pushes the buttons
-//     down instead of the textarea above it as errors accumulate
-//   - #jsonfacts-output  — live single-row extraction output
-func JSONFactsEditor(schemaText string, selectedRow html.Content, output html.Content) html.Content {
+//     between the output and the actions row so it pushes the buttons
+//     down instead of the content above it as errors accumulate
+func JSONFactsEditor(schemaText string, output html.Content) html.Content {
 	schemaTextarea := Textarea.
 		Set("id", "schema-text").
 		Set("data-bind:schema-text").
@@ -52,32 +55,15 @@ func JSONFactsEditor(schemaText string, selectedRow html.Content, output html.Co
 
 	return PaneSection.Set("id", "pane-jsonfacts-editor").Add(
 		PaneHeadingWithNav("jsonfacts Editor", "facts"),
-		selectedRow,
 		schemaTextarea,
-		// ErrorList renders between the textarea and the actions row so a
+		// output renders directly below the textarea, above the actions
+		// row, so running a test doesn't reflow the buttons underneath it.
+		output,
+		// ErrorList renders between the output and the actions row so a
 		// growing error list pushes the buttons down instead of the
-		// textarea above it out from under the cursor.
+		// content above it out from under the cursor.
 		ErrorList.Set("id", "jsonfacts-error"),
 		tag.New("div.actions", applyButton, saveButton, StopButton),
-		output,
-	)
-}
-
-// JSONFactsRow renders the #jsonfacts-row fragment: the selected source
-// record, pretty-printed. pretty is the caller's json.MarshalIndent output
-// (or a placeholder message when nothing is selected yet).
-func JSONFactsRow(pretty string) html.Content {
-	return tag.New("div#jsonfacts-row",
-		tag.New("pre", html.Text(pretty)),
-	)
-}
-
-// JSONFactsNoSelection renders the #jsonfacts-row fragment's placeholder
-// state, before any row has been selected via the Data Browser's Test
-// button.
-func JSONFactsNoSelection() html.Content {
-	return tag.New("div#jsonfacts-row",
-		tag.New("p.text-light", html.Text("No row selected yet — use \"Test\" in the Data Browser.")),
 	)
 }
 

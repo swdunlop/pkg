@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"path"
@@ -19,7 +18,9 @@ const dataPageSize = 50
 // handleDataList is the Data Browser's file-list handler (GET /data): the
 // file list comes from the session's cfg.Sources[].file, not a directory
 // walk (design's explicit call-out), read under wb.h.mu since it's session
-// state.
+// state. The first file (if any) is auto-selected and its first chunk of
+// rows loaded in the same response, so the pane isn't left empty until the
+// operator manually picks a file from the <select>.
 func (wb *workbench) handleDataList(w http.ResponseWriter, r *http.Request) {
 	stream, err := datastar.RequestStream(w, r)
 	if err != nil {
@@ -34,14 +35,14 @@ func (wb *workbench) handleDataList(w http.ResponseWriter, r *http.Request) {
 	wb.h.mu.Unlock()
 
 	_ = stream.Emit(datastar.Elements(view.DataFileList(files)))
+	if len(files) > 0 {
+		wb.emitDataFile(stream, files[0], 0)
+	}
 }
 
 // handleDataFile is the Data Browser's paginated-row handler
-// (GET /data/{file}?offset=N). Files are re-read per request (accepted
-// per the design's O(offset) risk note); the model/browser-supplied file
-// ref is passed through wb.h.confine before ever reaching wb.h.fsys, since
-// it must never escape the data root. offset=0 (or absent) replaces the
-// table body; offset>0 appends the next chunk via datastar.Mode("append").
+// (GET /data/{file}?offset=N). offset=0 (or absent) replaces the row list;
+// offset>0 appends the next chunk via datastar.Mode("append").
 func (wb *workbench) handleDataFile(w http.ResponseWriter, r *http.Request) {
 	stream, err := datastar.RequestStream(w, r)
 	if err != nil {
@@ -61,6 +62,17 @@ func (wb *workbench) handleDataFile(w http.ResponseWriter, r *http.Request) {
 		offset = n
 	}
 
+	wb.emitDataFile(stream, file, offset)
+}
+
+// emitDataFile reads file's row chunk at offset (dataPageSize rows) and
+// emits the resulting #data-table-body fragment (or #data-error on
+// failure). Files are re-read per request (accepted per the design's
+// O(offset) risk note); the model/browser-supplied file ref is passed
+// through wb.h.confine before ever reaching wb.h.fsys, since it must never
+// escape the data root. Shared by handleDataFile (explicit file switches)
+// and handleDataList (auto-loading the first file).
+func (wb *workbench) emitDataFile(stream datastar.Stream, file string, offset int) {
 	ref, err := wb.h.confine(file)
 	if err != nil {
 		_ = stream.Emit(datastar.Elements(view.DataErrors([]string{err.Error()})))
@@ -74,7 +86,8 @@ func (wb *workbench) handleDataFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	nextOffset := offset + len(rows)
-	body := view.DataTableBody(file, rows, nextOffset, hasMore)
+	selFile, selRow, selValid := wb.currentSelection()
+	body := view.DataTableBody(file, rows, nextOffset, hasMore, selFile, selRow, selValid)
 
 	opts := []datastar.ElementsOption{datastar.Selector("#data-table-body")}
 	if offset > 0 {
@@ -123,9 +136,10 @@ func readDataChunk(wb *workbench, ref string, offset, limit int) ([]view.DataRow
 
 // handleJSONFactsTest is the Data Browser's "Test" button handler
 // (GET /jsonfacts/test/{file}/{row}): selects that record as the jsonfacts
-// editor's evaluation target and, in the same response, patches
-// #jsonfacts-row (pretty-printed) and #jsonfacts-output (live extraction of
-// that single record against the CURRENT session config).
+// editor's evaluation target and, in the same response, patches the newly
+// and previously selected #data-row-N elements (to move the highlight) and
+// #jsonfacts-output (live extraction of that single record against the
+// CURRENT session config).
 func (wb *workbench) handleJSONFactsTest(w http.ResponseWriter, r *http.Request) {
 	stream, err := datastar.RequestStream(w, r)
 	if err != nil {
@@ -154,24 +168,23 @@ func (wb *workbench) handleJSONFactsTest(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	var obj any
-	prettyErr := json.Unmarshal([]byte(raw), &obj)
-	var pretty string
-	if prettyErr != nil {
-		pretty = raw // fall back to the raw line if it isn't valid JSON
-	} else {
-		buf, _ := json.MarshalIndent(obj, "", "  ")
-		pretty = string(buf)
-	}
-
 	wb.selMu.Lock()
+	prevFile, prevRow, prevRecord, prevValid := wb.selFile, wb.selRow, wb.selRecord, wb.selValid
 	wb.selFile = file
 	wb.selRow = row
 	wb.selRecord = raw
 	wb.selValid = true
 	wb.selMu.Unlock()
 
-	_ = stream.Emit(datastar.Elements(view.JSONFactsRow(pretty)))
+	_ = stream.Emit(datastar.Elements(view.DataRow(file, row, raw, true)))
+	// The previously selected row only needs unhighlighting if it's still
+	// rendered in the same file's table; a stale id from a different file
+	// won't match anything in the DOM, so patching it is a harmless no-op,
+	// but skipping the (row == row) case avoids overwriting the just-sent
+	// highlighted row with an unhighlighted one.
+	if prevValid && prevFile == file && prevRow != row {
+		_ = stream.Emit(datastar.Elements(view.DataRow(prevFile, prevRow, prevRecord, false)))
+	}
 
 	lines, extractErr := wb.extractSelectedRow()
 	if extractErr != nil {

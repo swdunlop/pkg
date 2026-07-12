@@ -173,8 +173,8 @@ div.status {
   font-size: var(--text-7);
 }
 
-/* Tables (Data Browser rows, query results, fact pages): full width, but
- * scroll horizontally inside the pane rather than blowing out the grid. */
+/* Tables (query results, fact pages): full width, but scroll horizontally
+ * inside the pane rather than blowing out the grid. */
 section.pane table {
   width: 100%;
   display: block;
@@ -185,14 +185,32 @@ section.pane table {
 section.pane td {
   overflow-wrap: anywhere;
 }
-/* Raw JSONL previews in the Data Browser get long; keep rows readable. */
-#data-table td {
+
+/* Data Browser rows: a plain list, not a table (single column of raw-line
+ * previews). Rows are clickable (selects the row as the jsonfacts Editor's
+ * test target); the Load More row keeps the default cursor since it isn't. */
+#data-table-body {
+  font-size: var(--text-7);
+  margin-block: var(--space-3);
+}
+#data-table-body li {
+  overflow-wrap: anywhere;
   max-width: 40rem;
   font-family: var(--font-mono);
+  padding: var(--space-1) var(--space-2);
+}
+#data-table-body li:not(#data-load-more) {
+  cursor: pointer;
+}
+#data-table-body li:not(#data-load-more):hover {
+  background: var(--faint);
+}
+/* The row currently selected as the jsonfacts Editor's test target. */
+#data-table-body li.selected {
+  background: var(--accent);
 }
 
-/* Selected-row / extraction-output panels in the jsonfacts Editor. */
-#jsonfacts-row pre,
+/* Extraction-output panels in the jsonfacts Editor. */
 #jsonfacts-output pre,
 section.pane details pre {
   max-height: 14rem;
@@ -201,14 +219,9 @@ section.pane details pre {
   margin-block: var(--space-2);
 }
 
-/* Data Browser file list. */
-#data-files ul {
-  list-style: none;
-  padding: 0;
+/* Data Browser file picker. */
+#data-files select {
   margin-block: var(--space-2);
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
 }
 
 /* Fact Browser predicate rows: clickable, hover feedback, badge + count. */

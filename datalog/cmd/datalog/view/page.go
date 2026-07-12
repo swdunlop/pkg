@@ -54,7 +54,7 @@ func (p Page) AppendHTML(buf []byte) []byte {
 func head(p Page) html.Content {
 	title := p.Title
 	if title == "" {
-		title = "datalog workbench"
+		title = "Datalog Workbench"
 	}
 	return tag.New("head",
 		tag.New("meta[charset=utf-8]"),
