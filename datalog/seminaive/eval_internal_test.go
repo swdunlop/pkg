@@ -10,6 +10,7 @@ package seminaive
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"swdunlop.dev/pkg/datalog"
@@ -57,9 +58,12 @@ func TestMatchesAnyVCancelsDuringScan(t *testing.T) {
 	// MatchesBound rejects every fact and the loop must walk the entire
 	// slice without an early match; Y is left unbound.
 	varMap := map[string]int8{"X": 0, "Y": 1}
-	ca := interned.CompileAtomV("blocked", []datalog.Term{
+	ca, err := interned.CompileAtomV("blocked", []datalog.Term{
 		datalog.Variable("X"), datalog.Variable("Y"),
 	}, dict, varMap)
+	if err != nil {
+		t.Fatalf("CompileAtomV: %v", err)
+	}
 
 	var sub interned.VarSub
 	sub.Set(0, dict.Intern(int64(2)))
@@ -178,5 +182,122 @@ func TestEvalAggregatesSharesCountStepCounter(t *testing.T) {
 		t.Fatalf("evalAggregates advanced ev.steps to %d, no more than queryInternedFacts' own join-scan baseline of %d; "+
 			"the group loop isn't driving the shared countStep counter (a leftover independent counter would produce exactly this)",
 			full.steps, baseline.steps)
+	}
+}
+
+// overArityTerms builds MaxFactArity+1 distinct integer terms -- one more
+// term than interned.CompileAtomV accepts -- for constructing atoms that
+// bypass Engine.Compile's checkRuleArity gate entirely. These tests call
+// compileBody/evalRules/evalAggregates/queryInternedFacts directly (the way
+// a future second compile path inside this package might, without routing
+// through checkRuleArity first) to prove the arity guard now surfaces as an
+// error from the interned package's own chokepoint, not a panic.
+func overArityTerms() []datalog.Term {
+	terms := make([]datalog.Term, interned.MaxFactArity+1)
+	for i := range terms {
+		terms[i] = datalog.Integer(i)
+	}
+	return terms
+}
+
+// TestCompileBodyRejectsOverArityAtom confirms compileBody -- the single
+// atom-classification path shared by evalRules and evalAggregates via
+// queryInternedFacts -- surfaces CompileAtomV's arity error as its own error
+// return instead of letting the panic (now removed) escape uncaught.
+func TestCompileBodyRejectsOverArityAtom(t *testing.T) {
+	dict := interned.NewDict()
+	body := []syntax.Atom{{Pred: "wide", Terms: overArityTerms()}}
+
+	_, _, _, _, err := compileBody(body, dict, nil, nil)
+	if err == nil {
+		t.Fatalf("expected compileBody to return an error for an atom wider than MaxFactArity")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("expected a labeled arity-exceeded error, got %v", err)
+	}
+}
+
+// TestEvalRulesRejectsOverArityHead confirms evalRules surfaces an over-arity
+// rule head as a compile-time error rather than panicking, even when called
+// directly and bypassing Engine.Compile's checkRuleArity gate -- exactly the
+// "future compile path" scenario CompileAtomV's error return exists for.
+func TestEvalRulesRejectsOverArityHead(t *testing.T) {
+	dict := interned.NewDict()
+	rules := []syntax.Rule{{
+		Head: syntax.Atom{Pred: "wide", Terms: overArityTerms()},
+		Body: []syntax.Atom{{Pred: "v", Terms: []datalog.Term{datalog.Variable("X")}}},
+	}}
+
+	ev := &evaluator{ctx: context.Background(), dict: dict}
+	existing := interned.NewInternedFactSet()
+	if _, _, err := ev.evalRules(context.Background(), rules, existing, 10); err == nil {
+		t.Fatalf("expected evalRules to return an error for an over-arity rule head")
+	} else if !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("expected a labeled arity-exceeded error, got %v", err)
+	}
+}
+
+// TestEvalRulesRejectsOverArityBodyAtom is TestEvalRulesRejectsOverArityHead's
+// counterpart for a body atom rather than the head, confirming compileBody's
+// error (not just the head's separate CompileAtomV call in evalRules) reaches
+// the caller.
+func TestEvalRulesRejectsOverArityBodyAtom(t *testing.T) {
+	dict := interned.NewDict()
+	rules := []syntax.Rule{{
+		Head: syntax.Atom{Pred: "out", Terms: []datalog.Term{datalog.Variable("X")}},
+		Body: []syntax.Atom{{Pred: "wide", Terms: overArityTerms()}},
+	}}
+
+	ev := &evaluator{ctx: context.Background(), dict: dict}
+	existing := interned.NewInternedFactSet()
+	if _, _, err := ev.evalRules(context.Background(), rules, existing, 10); err == nil {
+		t.Fatalf("expected evalRules to return an error for an over-arity body atom")
+	} else if !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("expected a labeled arity-exceeded error, got %v", err)
+	}
+}
+
+// TestQueryInternedFactsRejectsOverArityAtom confirms queryInternedFacts --
+// the query-compilation path (also used by evalAggregates to run an
+// aggregate's body) -- surfaces compileBody's arity error rather than
+// panicking.
+func TestQueryInternedFactsRejectsOverArityAtom(t *testing.T) {
+	dict := interned.NewDict()
+	body := []syntax.Atom{{Pred: "wide", Terms: overArityTerms()}}
+
+	ev := &evaluator{ctx: context.Background(), dict: dict}
+	if _, err := ev.queryInternedFacts(context.Background(), body, interned.NewInternedFactSet()); err == nil {
+		t.Fatalf("expected queryInternedFacts to return an error for an over-arity atom")
+	} else if !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("expected a labeled arity-exceeded error, got %v", err)
+	}
+}
+
+// TestEvalAggregatesRejectsOverArityHead confirms evalAggregates surfaces an
+// over-arity aggregate head (compiled via the CompileAtom convenience
+// wrapper, not CompileAtomV) as an error rather than panicking.
+func TestEvalAggregatesRejectsOverArityHead(t *testing.T) {
+	dict := interned.NewDict()
+	vID := dict.Intern("v")
+	memFacts := interned.NewInternedFactSet()
+	var f interned.InternedFact
+	f.Pred = vID
+	f.Arity = 1
+	f.Values[0] = dict.Intern(int64(1))
+	memFacts.Add(f)
+
+	headTerms := append(overArityTerms(), datalog.Variable("S"))
+	aggRules := []syntax.AggregateRule{{
+		Head:      syntax.Atom{Pred: "wide", Terms: headTerms},
+		ResultVar: "S",
+		Kind:      syntax.AggCount,
+		Body:      []syntax.Atom{{Pred: "v", Terms: []datalog.Term{datalog.Variable("X")}}},
+	}}
+
+	ev := &evaluator{ctx: context.Background(), dict: dict}
+	if _, err := ev.evalAggregates(context.Background(), aggRules, memFacts); err == nil {
+		t.Fatalf("expected evalAggregates to return an error for an over-arity aggregate head")
+	} else if !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("expected a labeled arity-exceeded error, got %v", err)
 	}
 }

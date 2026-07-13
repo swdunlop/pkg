@@ -78,7 +78,10 @@ func (ev *evaluator) evalAggregates(ctx context.Context, aggRules []syntax.Aggre
 		}
 
 		// Pre-compile head atom for grounding.
-		head := interned.CompileAtom(ar.Head.Pred, ar.Head.Terms, ev.dict)
+		head, err := interned.CompileAtom(ar.Head.Pred, ar.Head.Terms, ev.dict)
+		if err != nil {
+			return result, err
+		}
 
 		// Compute aggregate for each group, sampling ctx via the evaluator's
 		// shared countStep -- the same mechanism the join scans in

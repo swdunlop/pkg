@@ -593,14 +593,26 @@ type bodyItem struct {
 // joinCount counts the positive join atoms (bodyItemJoin), which the caller
 // uses both for delta-based semi-naive iteration and to detect join-free
 // bodies.
-func compileBody(body []syntax.Atom, dict *interned.Dict, builtins map[string]BuiltinFunc, multiBuiltins map[string]multiBuiltin) (items []bodyItem, negativeBody []interned.CompiledAtom, joinCount int, varMap map[string]int8) {
+//
+// compileBody returns an error if any atom in body compiles to more than
+// interned.MaxFactArity terms. checkRuleArity in Engine.Compile already
+// rejects such atoms earlier, with a friendlier message naming the rule; this
+// is the backstop for a compile path (or test) that reaches compileBody
+// without going through checkRuleArity first -- see CompileAtomV's doc
+// comment for why the bounds check belongs there rather than at each of its
+// call sites.
+func compileBody(body []syntax.Atom, dict *interned.Dict, builtins map[string]BuiltinFunc, multiBuiltins map[string]multiBuiltin) (items []bodyItem, negativeBody []interned.CompiledAtom, joinCount int, varMap map[string]int8, err error) {
 	varMap = make(map[string]int8)
 	items = make([]bodyItem, 0, len(body))
 
 	for _, a := range body {
 		switch {
 		case a.Negated:
-			negativeBody = append(negativeBody, interned.CompileAtomV(a.Pred, a.Terms, dict, varMap))
+			ca, err := interned.CompileAtomV(a.Pred, a.Terms, dict, varMap)
+			if err != nil {
+				return nil, nil, 0, nil, err
+			}
+			negativeBody = append(negativeBody, ca)
 		case a.Pred == "is":
 			registerExprVars(a.Expr, varMap)
 			outVarIdx := int8(-1)
@@ -616,7 +628,11 @@ func compileBody(body []syntax.Atom, dict *interned.Dict, builtins map[string]Bu
 			ce := compileExpr(a.Expr, dict, varMap)
 			items = append(items, bodyItem{kind: bodyItemIs, atom: a, cExpr: ce, outVarIdx: outVarIdx})
 		case isConstraint(a):
-			items = append(items, bodyItem{kind: bodyItemCompare, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, dict, varMap)})
+			ca, err := interned.CompileAtomV(a.Pred, a.Terms, dict, varMap)
+			if err != nil {
+				return nil, nil, 0, nil, err
+			}
+			items = append(items, bodyItem{kind: bodyItemCompare, atom: a, ca: ca})
 		case isBindBuiltin(a, builtins):
 			registerAtomVars(a, varMap)
 			outVarIdx := int8(-1)
@@ -629,16 +645,28 @@ func compileBody(body []syntax.Atom, dict *interned.Dict, builtins map[string]Bu
 					varMap[name] = outVarIdx
 				}
 			}
-			items = append(items, bodyItem{kind: bodyItemBind, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, dict, varMap), outVarIdx: outVarIdx})
+			ca, err := interned.CompileAtomV(a.Pred, a.Terms, dict, varMap)
+			if err != nil {
+				return nil, nil, 0, nil, err
+			}
+			items = append(items, bodyItem{kind: bodyItemBind, atom: a, ca: ca, outVarIdx: outVarIdx})
 		case isMultiBindBuiltin(a, multiBuiltins):
 			registerAtomVars(a, varMap)
-			items = append(items, bodyItem{kind: bodyItemBindMulti, atom: a, ca: interned.CompileAtomV(a.Pred, a.Terms, dict, varMap), multiOut: multiBuiltins[a.Pred].outputs})
+			ca, err := interned.CompileAtomV(a.Pred, a.Terms, dict, varMap)
+			if err != nil {
+				return nil, nil, 0, nil, err
+			}
+			items = append(items, bodyItem{kind: bodyItemBindMulti, atom: a, ca: ca, multiOut: multiBuiltins[a.Pred].outputs})
 		default:
-			items = append(items, bodyItem{kind: bodyItemJoin, ca: interned.CompileAtomV(a.Pred, a.Terms, dict, varMap), joinIdx: joinCount})
+			ca, err := interned.CompileAtomV(a.Pred, a.Terms, dict, varMap)
+			if err != nil {
+				return nil, nil, 0, nil, err
+			}
+			items = append(items, bodyItem{kind: bodyItemJoin, ca: ca, joinIdx: joinCount})
 			joinCount++
 		}
 	}
-	return items, negativeBody, joinCount, varMap
+	return items, negativeBody, joinCount, varMap, nil
 }
 
 // evaluator holds per-evaluation state.
@@ -734,8 +762,14 @@ func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existin
 	compiled := make([]compiledRule, 0, len(rules))
 	for _, rule := range rules {
 		var cr compiledRule
-		items, negativeBody, joinCount, varMap := compileBody(rule.Body, ev.dict, ev.builtins, ev.multiBuiltins)
-		cr.head = interned.CompileAtomV(rule.Head.Pred, rule.Head.Terms, ev.dict, varMap)
+		items, negativeBody, joinCount, varMap, err := compileBody(rule.Body, ev.dict, ev.builtins, ev.multiBuiltins)
+		if err != nil {
+			return 0, 0, err
+		}
+		cr.head, err = interned.CompileAtomV(rule.Head.Pred, rule.Head.Terms, ev.dict, varMap)
+		if err != nil {
+			return 0, 0, err
+		}
 		cr.body = items
 		cr.negativeBody = negativeBody
 		cr.joinCount = joinCount
@@ -1341,7 +1375,10 @@ func exprVarsBound(expr compiledExpr, boundVars uint16) bool {
 func (ev *evaluator) queryInternedFacts(ctx context.Context, body []syntax.Atom, memFacts interned.InternedFactSet) (_ []interned.InternedSub, err error) {
 	defer recoverEvalError(ctx, &err)
 
-	items, negativeBody, _, varMap := compileBody(body, ev.dict, ev.builtins, ev.multiBuiltins)
+	items, negativeBody, _, varMap, err := compileBody(body, ev.dict, ev.builtins, ev.multiBuiltins)
+	if err != nil {
+		return nil, err
+	}
 	items = reorderBody(items)
 
 	varNames := make([]string, len(varMap))

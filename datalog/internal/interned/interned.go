@@ -83,7 +83,7 @@ type CompiledAtom struct {
 }
 
 // CompileAtom pre-interns an atom's predicate and constant terms.
-func CompileAtom(pred string, terms []datalog.Term, dict *Dict) CompiledAtom {
+func CompileAtom(pred string, terms []datalog.Term, dict *Dict) (CompiledAtom, error) {
 	return CompileAtomV(pred, terms, dict, nil)
 }
 
@@ -98,19 +98,18 @@ func CompileAtom(pred string, terms []datalog.Term, dict *Dict) CompiledAtom {
 // three; guarding at each sink instead would triple the check on paths that
 // run per substitution in the semi-naive fixpoint's innermost loop.
 //
-// This panics rather than returning an error (unlike InternFact, which can
-// afford to since it runs once per loaded fact): every current caller of
+// This returns an error rather than panicking: every current caller of
 // CompileAtomV/CompileAtom lives in seminaive's rule-compilation path, which
 // already rejects over-wide atoms earlier and with a friendlier message via
-// checkRuleArity in Engine.Compile, so this panic is unreachable today and
+// checkRuleArity in Engine.Compile, so this error is unreachable today and
 // exists only as a documented backstop against a future compile path that
 // forgets to call checkRuleArity first -- it turns a silent
 // index-out-of-range panic deep in a ground/hash sink (with no context
-// about which atom or predicate caused it) into an immediate, labeled one at
-// the point the oversized atom was compiled.
-func CompileAtomV(pred string, terms []datalog.Term, dict *Dict, varMap map[string]int8) CompiledAtom {
+// about which atom or predicate caused it) into an immediate, labeled
+// compile-time error at the point the oversized atom was compiled.
+func CompileAtomV(pred string, terms []datalog.Term, dict *Dict, varMap map[string]int8) (CompiledAtom, error) {
 	if len(terms) > MaxFactArity {
-		panic(fmt.Sprintf("interned: atom %s has arity %d, exceeds maximum %d", pred, len(terms), MaxFactArity))
+		return CompiledAtom{}, fmt.Errorf("interned: atom %s has arity %d, exceeds maximum %d", pred, len(terms), MaxFactArity)
 	}
 	compiled := make([]CompiledTerm, len(terms))
 	for i, t := range terms {
@@ -135,7 +134,7 @@ func CompileAtomV(pred string, terms []datalog.Term, dict *Dict, varMap map[stri
 		Pred:  dict.Intern(pred),
 		Arity: len(terms),
 		Terms: compiled,
-	}
+	}, nil
 }
 
 // --- boundSet (stack-allocated replacement for map[int]uint64) ---

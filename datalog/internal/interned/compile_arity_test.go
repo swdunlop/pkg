@@ -25,29 +25,28 @@ func TestCompileAtomVRejectsOverArityAtom(t *testing.T) {
 		terms[i] = datalog.Integer(i)
 	}
 
-	defer func() {
-		r := recover()
-		if r == nil {
-			t.Fatalf("expected CompileAtomV to panic on an atom wider than MaxFactArity")
-		}
-		msg, ok := r.(string)
-		if !ok || !strings.Contains(msg, "exceeds maximum") {
-			t.Fatalf("expected a labeled arity-exceeded panic message, got %v", r)
-		}
-	}()
-	CompileAtomV("wide_pred", terms, dict, nil)
+	_, err := CompileAtomV("wide_pred", terms, dict, nil)
+	if err == nil {
+		t.Fatalf("expected CompileAtomV to return an error on an atom wider than MaxFactArity")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("expected a labeled arity-exceeded error message, got %v", err)
+	}
 }
 
 // TestCompileAtomVAcceptsMaxArityAtom checks the boundary itself: exactly
-// MaxFactArity terms must compile without panicking (off-by-one guard
-// against a fencepost error in the new check).
+// MaxFactArity terms must compile without error (off-by-one guard against a
+// fencepost error in the arity check).
 func TestCompileAtomVAcceptsMaxArityAtom(t *testing.T) {
 	dict := NewDict()
 	terms := make([]datalog.Term, MaxFactArity)
 	for i := range terms {
 		terms[i] = datalog.Integer(i)
 	}
-	ca := CompileAtomV("full_pred", terms, dict, nil)
+	ca, err := CompileAtomV("full_pred", terms, dict, nil)
+	if err != nil {
+		t.Fatalf("expected CompileAtomV to accept an atom at exactly MaxFactArity, got error: %v", err)
+	}
 	if ca.Arity != MaxFactArity {
 		t.Fatalf("expected arity %d, got %d", MaxFactArity, ca.Arity)
 	}
@@ -63,10 +62,8 @@ func TestCompileAtomRejectsOverArityAtom(t *testing.T) {
 		terms[i] = datalog.Integer(i)
 	}
 
-	defer func() {
-		if recover() == nil {
-			t.Fatalf("expected CompileAtom to panic on an atom wider than MaxFactArity")
-		}
-	}()
-	CompileAtom("wide_pred", terms, dict)
+	_, err := CompileAtom("wide_pred", terms, dict)
+	if err == nil {
+		t.Fatalf("expected CompileAtom to return an error on an atom wider than MaxFactArity")
+	}
 }
