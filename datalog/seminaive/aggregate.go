@@ -14,11 +14,13 @@ import (
 // returning new derived facts. All computation stays in interned space.
 //
 // ctx is checked once per aggregate rule (before running its body join, the
-// expensive part) and once per group while computing aggregates, matching
-// evalRules' once-per-iteration granularity; queryInternedFacts additionally
-// samples ctx during a single rule's body evaluation so one large aggregate
-// body (e.g. a multi-way self cross-product) can't itself run uncancellably.
-func (ev *evaluator) evalAggregates(ctx context.Context, aggRules []syntax.AggregateRule, memFacts interned.InternedFactSet) (interned.InternedFactSet, error) {
+// expensive part) and, via the evaluator's shared countStep sampling, once
+// every evalStepsPerCheck groups while computing aggregates -- the same
+// sampling queryInternedFacts uses during a single rule's body evaluation, so
+// one large aggregate body (e.g. a multi-way self cross-product) or a group
+// loop over many groups can't itself run uncancellably.
+func (ev *evaluator) evalAggregates(ctx context.Context, aggRules []syntax.AggregateRule, memFacts interned.InternedFactSet) (_ interned.InternedFactSet, err error) {
+	defer recoverEvalError(ctx, &err)
 	result := interned.NewLightInternedFactSet()
 
 	for _, ar := range aggRules {
@@ -78,19 +80,13 @@ func (ev *evaluator) evalAggregates(ctx context.Context, aggRules []syntax.Aggre
 		// Pre-compile head atom for grounding.
 		head := interned.CompileAtom(ar.Head.Pred, ar.Head.Terms, ev.dict)
 
-		// Compute aggregate for each group. groupsChecked counts groups
-		// processed across all buckets so ctx is sampled every N groups
-		// (evalStepsPerCheck) rather than on every single one, mirroring
-		// the evaluator's countStep sampling during the join above.
-		groupsChecked := 0
+		// Compute aggregate for each group, sampling ctx via the evaluator's
+		// shared countStep -- the same mechanism the join scans in
+		// evalBodyRecursiveV and matchesAnyV use -- rather than a second,
+		// independent per-group counter.
 		for _, bucket := range groups {
 			for _, g := range bucket {
-				groupsChecked++
-				if groupsChecked%evalStepsPerCheck == 0 {
-					if err := ctx.Err(); err != nil {
-						return result, err
-					}
-				}
+				ev.countStep()
 
 				aggResultID, err := computeInternedAggregate(
 					ar.Kind, aggVarName, aggConstID, aggIsConst,
@@ -148,7 +144,7 @@ func computeInternedAggregate(
 		var sumFloat float64
 		isInt := true
 		for _, sub := range subs {
-			val, err := resolveInternedAggValue(aggVarName, aggConstID, aggIsConst, sub, dict)
+			val, err := resolveInternedAggValue(aggVarName, aggConstID, aggIsConst, sub, dict, "sum")
 			if err != nil {
 				return 0, err
 			}
@@ -200,9 +196,9 @@ func computeInternedAggregate(
 // (as an earlier version did) could return a "minimum" larger than the true
 // minimum and not present in the input at all. Keeping the winner's original
 // value also means an int64 extremum stays an int64 even when floats appear
-// elsewhere in the group. NaN is unordered (compareValues reports !ok), so
-// its position in the group could otherwise silently decide the result;
-// error loudly instead, matching the non-numeric case.
+// elsewhere in the group. NaN inputs are rejected by resolveInternedAggValue
+// before they ever reach here, so the only remaining !ok from compareValues
+// is a genuine non-numeric mismatch, not NaN.
 func computeExtremum(
 	name string, sign int,
 	aggVarName string, aggConstID uint64, aggIsConst bool,
@@ -210,7 +206,7 @@ func computeExtremum(
 ) (uint64, error) {
 	var best any
 	for _, sub := range subs {
-		val, err := resolveInternedAggValue(aggVarName, aggConstID, aggIsConst, sub, dict)
+		val, err := resolveInternedAggValue(aggVarName, aggConstID, aggIsConst, sub, dict, name)
 		if err != nil {
 			return 0, err
 		}
@@ -220,17 +216,12 @@ func computeExtremum(
 			return 0, fmt.Errorf("cannot compute %s of non-numeric value: %v", name, val)
 		}
 		if best == nil {
-			if f, ok := val.(float64); ok && math.IsNaN(f) {
-				return 0, fmt.Errorf("cannot compute %s of NaN", name)
-			}
 			best = val
 			continue
 		}
 		c, ok := compareValues(val, best)
 		if !ok {
-			// int64/float64 mixes always compare; the only unorderable
-			// numeric operand is NaN.
-			return 0, fmt.Errorf("cannot compute %s of NaN", name)
+			return 0, fmt.Errorf("cannot compute %s of non-numeric value: %v", name, val)
 		}
 		if sign*c > 0 {
 			best = val
@@ -244,18 +235,46 @@ func computeExtremum(
 	return dict.Intern(best), nil
 }
 
+// resolveInternedAggValue is the single chokepoint every numeric aggregate
+// (sum, min, max, and avg if/when it exists) resolves its per-row value
+// through. NaN is an admitted value at interning (dict.go's nanKey -- that
+// trade-off is settled and not revisited here), but letting it flow into an
+// aggregate silently produces bad results downstream: computeExtremum can't
+// order it (a NaN could win or lose a min/max depending on its arbitrary
+// position in the group) and AggSum would silently intern a NaN total that
+// then compares unordered-false against everything else. So this is the one
+// place that checks for it, uniformly, for every aggregate kind, and the
+// error names both the aggregate (via name) and the offending predicate/rule
+// context the caller already carries in its own wrapping (evalAggregates
+// wraps this error with "aggregate %s: %w").
 func resolveInternedAggValue(
 	varName string, constID uint64, isConst bool,
-	sub interned.InternedSub, dict *interned.Dict,
+	sub interned.InternedSub, dict *interned.Dict, name string,
 ) (any, error) {
+	var val any
 	if isConst {
-		return dict.Resolve(constID), nil
+		val = dict.Resolve(constID)
+	} else {
+		id, ok := sub.Get(varName)
+		if !ok {
+			return nil, fmt.Errorf("unbound variable %s in aggregate", varName)
+		}
+		val = dict.Resolve(id)
 	}
-	id, ok := sub.Get(varName)
-	if !ok {
-		return nil, fmt.Errorf("unbound variable %s in aggregate", varName)
+	if f, ok := val.(float64); ok && math.IsNaN(f) {
+		return nil, fmt.Errorf("cannot compute %s: NaN value in %s", name, describeAggSource(varName, isConst))
 	}
-	return dict.Resolve(id), nil
+	return val, nil
+}
+
+// describeAggSource names the aggregate's input for a NaN error message: the
+// bound variable whose value is NaN, or "constant" when the aggregated term
+// is a literal rather than a variable.
+func describeAggSource(varName string, isConst bool) string {
+	if isConst {
+		return "constant"
+	}
+	return fmt.Sprintf("variable %s", varName)
 }
 
 // addInt64Checked adds a and b, reporting overflow instead of wrapping. This

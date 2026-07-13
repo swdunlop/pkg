@@ -124,13 +124,46 @@ func ConstantToAny(c datalog.Constant) any {
 	panic("unknown constant type")
 }
 
+// minInt64AsFloat and maxInt64BoundAsFloat bound the range of float64
+// values NormalizeNumeric will even attempt to convert to int64.
+// minInt64AsFloat (-2^63) is exactly representable as a float64 and is
+// itself a valid int64 (math.MinInt64), so the lower bound is inclusive.
+// maxInt64BoundAsFloat (2^63) is also exactly representable as a float64,
+// but 2^63 itself overflows int64 (math.MaxInt64 is 2^63-1, which is NOT
+// exactly representable as a float64 -- the nearest representable value
+// rounds up to 2^63), so the upper bound is exclusive.
+const (
+	minInt64AsFloat      = -9223372036854775808.0 // -2^63, exactly representable, == math.MinInt64
+	maxInt64BoundAsFloat = 9223372036854775808.0  // 2^63, exactly representable, one past math.MaxInt64
+)
+
 // NormalizeNumeric converts float64 values that represent exact integers
-// to int64, ensuring JSON numbers and Datalog integer literals intern identically.
+// to int64, ensuring JSON numbers and Datalog integer literals intern
+// identically.
+//
+// The range is checked explicitly before ever converting to int64, rather
+// than converting first and checking the round-trip: Go's float64->int64
+// conversion is implementation-defined for out-of-range values, and at
+// least one real platform disagrees with amd64 about the result. On
+// arm64, FCVTZS saturates an out-of-range float to MaxInt64, and
+// float64(math.MaxInt64) rounds back up to exactly 2^63 -- so a
+// round-trip-only guard (float64(int64(f)) == f) would accept f == 2^63
+// and mint it as int64 math.MaxInt64 (9223372036854775807), a value one
+// off from the true magnitude and indistinguishable from a genuine
+// MaxInt64 fact, while amd64 would reject the same input. Reachable from
+// the public API via a JSONL number literal like 9223372036854775808
+// (strconv.ParseInt fails, jsonfacts falls back to json.Number.Float64,
+// which returns exactly 2^63). The explicit pre-check never performs the
+// implementation-defined conversion for any out-of-range float, so the
+// result is identical on every platform: 2^63 (and anything >=) stays a
+// float64, never becomes an int64.
 func NormalizeNumeric(v any) any {
 	if f, ok := v.(float64); ok {
-		i := int64(f)
-		if float64(i) == f {
-			return i
+		if f >= minInt64AsFloat && f < maxInt64BoundAsFloat {
+			i := int64(f)
+			if float64(i) == f {
+				return i
+			}
 		}
 	}
 	return v

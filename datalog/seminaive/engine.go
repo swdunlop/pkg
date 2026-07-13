@@ -417,9 +417,6 @@ func checkBodySafety(body []syntax.Atom, builtins map[string]BuiltinFunc, multiB
 	return bound, nil
 }
 
-// checkRuleVarLimit errors when a rule uses more distinct variables than the
-// evaluator's fixed-size substitution supports. Destructuring patterns consume
-// fresh variables for intermediates, so pattern-heavy rules can hit this.
 // checkRuleArity rejects any atom (head, fact, or body literal) wider than
 // interned.MaxFactArity. The interned representation stores fact values and
 // compiled atom terms in fixed [MaxFactArity] arrays, so this is the single
@@ -447,6 +444,9 @@ func checkRuleArity(head syntax.Atom, body []syntax.Atom) error {
 	return nil
 }
 
+// checkRuleVarLimit errors when a rule uses more distinct variables than the
+// evaluator's fixed-size substitution supports. Destructuring patterns consume
+// fresh variables for intermediates, so pattern-heavy rules can hit this.
 func checkRuleVarLimit(head syntax.Atom, body []syntax.Atom) error {
 	vars := map[string]bool{}
 	addTerms := func(terms []datalog.Term) {

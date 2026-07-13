@@ -223,16 +223,12 @@ func (l *lexer) nextRaw() token {
 		l.advance()
 		// An explicit ?N names a parser-generated variable (as printed by
 		// Rule.String for desugared patterns), letting rules round-trip.
-		// reservedAnonID already scanned the whole input up front so
-		// anonID starts past every explicit ?N regardless of where it
-		// appears; this bump is just a defensive backstop.
+		// reservedAnonID already scanned the whole input up front so anonID
+		// starts past every explicit ?N regardless of where it appears.
 		if l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
 			start := l.pos
 			for l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
 				l.pos++
-			}
-			if n, err := strconv.Atoi(l.input[start:l.pos]); err == nil && n >= l.anonID {
-				l.anonID = n + 1
 			}
 			return token{kind: tokIdent, val: "?" + l.input[start:l.pos], pos: startPos}
 		}

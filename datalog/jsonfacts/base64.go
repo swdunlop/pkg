@@ -46,12 +46,8 @@ func base64Offsets(data []byte) [3]string {
 			skip = 3
 		}
 		end := (offset + len(data)) * 4 / 3
-		if end > len(encoded) {
-			end = len(encoded)
-		}
-		if end < skip {
-			end = skip
-		}
+		end = min(end, len(encoded))
+		end = max(end, skip)
 		result[offset] = encoded[skip:end]
 	}
 	return result

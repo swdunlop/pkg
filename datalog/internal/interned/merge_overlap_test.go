@@ -94,3 +94,52 @@ func TestMergePartialOverlap(t *testing.T) {
 		t.Fatalf("expected 2 facts (1 shared deduped + 1 new), got %d", len(facts))
 	}
 }
+
+// TestMergeWholesaleAdoptedIndexStaysConsistent is the regression test for
+// Merge's single index-maintenance mechanism: a (pred,arity) key fs has
+// never seen is adopted wholesale (fs.ByPred[k] = ofc), and that path must
+// still record every one of those facts' hash keys in fs.Index itself,
+// rather than depending on a separate bulk copy of other.Index. A version
+// of Merge that maintained the index two ways (per-fact writes for the
+// overlap path, plus a trailing maps.Copy of the whole other.Index for the
+// wholesale path) could drift if the two mechanisms ever disagreed about
+// which facts were actually stored; pinning both paths through one
+// mechanism means a wholesale-adopted fact set is immediately queryable
+// and its Index entries are exactly the facts present in ByPred, with no
+// stray entries and no missing ones -- verified here by mixing a
+// wholesale-adopted predicate with an overlap-deduped one in the same
+// Merge call.
+func TestMergeWholesaleAdoptedIndexStaysConsistent(t *testing.T) {
+	const predOld, predNew = 7, 8
+	dst := NewInternedFactSet()
+	shared := mkFact(predOld, 1, 2, 3)
+	dst.Add(shared)
+
+	src := NewLightInternedFactSet()
+	src.Add(shared) // overlap on predOld, already in dst
+	wf1 := mkFact(predNew, 4, 5, 6)
+	wf2 := mkFact(predNew, 7, 8, 9)
+	src.Add(wf1) // predNew is new to dst: adopted wholesale
+	src.Add(wf2)
+
+	dst.Merge(src)
+
+	oldFacts := dst.Get(predOld, 3)
+	if len(oldFacts) != 1 {
+		t.Fatalf("predOld: expected 1 fact after dedup, got %d", len(oldFacts))
+	}
+	newFacts := dst.Get(predNew, 3)
+	if len(newFacts) != 2 {
+		t.Fatalf("predNew: expected 2 wholesale-adopted facts, got %d", len(newFacts))
+	}
+	// Index must have exactly 3 entries: the deduped shared fact, plus the
+	// two wholesale-adopted facts -- no double counting, no missing entries.
+	if len(dst.Index) != 3 {
+		t.Fatalf("expected 3 index entries, got %d", len(dst.Index))
+	}
+	for _, f := range []InternedFact{shared, wf1, wf2} {
+		if _, ok := dst.Index[InternedFactHash(f)]; !ok {
+			t.Fatalf("expected Index to contain hash for fact %v", f)
+		}
+	}
+}

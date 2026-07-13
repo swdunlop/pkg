@@ -2,6 +2,8 @@ package seminaive_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"iter"
 	"math"
 	"slices"
@@ -611,6 +613,65 @@ func TestContextCancellationAggregate(t *testing.T) {
 	}
 }
 
+// TestContextCancellationAggregateGroupLoop confirms cancellation is caught
+// by evalAggregates' group loop itself (evaluator.countStep), not just by
+// queryInternedFacts before the loop starts. The rule below produces one
+// group per distinct X (via count with no non-trivial join cost -- v(X) is
+// a single-atom body, so queryInternedFacts' own countStep sampling barely
+// runs), but many thousands of groups, so if the group loop's cancellation
+// check were missing (as it was before this counter was replaced with
+// ev.countStep) or its panic escaped unrecovered (as it would if
+// evalAggregates lacked its own recoverEvalError defer), the loop would
+// either run to completion uncancelled or crash the whole process instead
+// of returning a clean error.
+func TestContextCancellationAggregateGroupLoop(t *testing.T) {
+	b := memory.NewBuilder()
+	const n = 50_000
+	for i := range n {
+		b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.Integer(int64(i))}})
+	}
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`total(X, S) :- S = count : v(X).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := seminaive.New().Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	done := make(chan struct{})
+	var transformErr error
+	go func() {
+		defer func() {
+			// A panic escaping to here (rather than being converted to
+			// transformErr by recoverEvalError) is itself the regression
+			// this test targets when the group loop's cancellation check
+			// is a bare panic with no matching recover.
+			if r := recover(); r != nil {
+				transformErr = fmt.Errorf("panic escaped Transform: %v", r)
+			}
+			close(done)
+		}()
+		_, transformErr = tr.Transform(ctx, input)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Transform did not return promptly after context cancellation; evalAggregates' group loop appears uncancellable")
+	}
+	if transformErr == nil {
+		t.Error("expected context cancellation error")
+	} else if !errors.Is(transformErr, context.Canceled) {
+		t.Errorf("expected a context.Canceled error, got: %v", transformErr)
+	}
+}
+
 // TestAggregateCrossProductBackground confirms a normal (non-cancelled)
 // aggregate over a multi-way self cross-product is unaffected by the
 // cancellation checks added to evalAggregates/queryInternedFacts: it still
@@ -648,6 +709,117 @@ func TestAggregateCrossProductBackground(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected a total(S) fact")
+	}
+}
+
+// TestContextCancellationUnboundedMultiBuiltin confirms Stop actually stops
+// a body dominated by a MultiBuiltinFunc stream. Before countStep was added
+// to evalBindMulti's yield callback, a body with no bodyItemJoin scan at all
+// -- just seed(N), @naturals(N, I) below -- sampled ctx zero times anywhere
+// in evalBodyRecursiveV, so an unbounded generator ignored cancellation
+// entirely and ran until the process ran out of memory. naturals streams
+// forever (it never returns from its yield loop on its own), so if
+// cancellation doesn't work this test hangs; the timeout guard turns that
+// hang into a reported failure instead of a wedged test run.
+func TestContextCancellationUnboundedMultiBuiltin(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// naturals streams forever on its own; cancel is triggered from inside
+	// the stream after it has already produced many tuples, so the only way
+	// this test passes is if something inside the yield loop itself notices
+	// the cancellation -- a check before/after the whole body (e.g. once per
+	// fixpoint iteration) would never get a chance to run.
+	naturals := func(inputs []any, yield func(outputs []any) bool) {
+		for i := int64(0); ; i++ {
+			if i == 10 {
+				cancel()
+			}
+			if !yield([]any{i}) {
+				return
+			}
+		}
+	}
+
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "seed", Terms: []datalog.Constant{datalog.Integer(0)}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`out(N, I) :- seed(N), @naturals(N, I).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := seminaive.New(seminaive.WithMultiBuiltin("@naturals", 1, naturals)).Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	var transformErr error
+	go func() {
+		defer close(done)
+		_, transformErr = tr.Transform(ctx, input)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Transform did not return promptly after context cancellation; unbounded @naturals stream appears uncancellable")
+	}
+	if transformErr == nil {
+		t.Error("expected context cancellation error")
+	}
+}
+
+// TestContextCancellationNegationScan confirms a Transform whose body is
+// dominated by matchesAnyV's negation scan (rather than a positive join)
+// surfaces a cancellation error end-to-end. r(X) joins a single seed(X)
+// fact (one cheap join tuple) then negates against blocked(X, _) -- X is
+// bound (by seed), but the anonymous second position is exempt from rule
+// safety's "every negated variable must be bound" check (see
+// checkRuleSafety's isAnonymousVar), so the atom is never fully ground and
+// matchesAnyV must scan blocked facts to decide the one negation check.
+// @mark cancels the context on its first call and, because it depends on
+// nothing, reorderBody places it before the join and the negation check.
+// The tight, non-timing-dependent proof that matchesAnyV's scan loops
+// themselves sample ctx (rather than some coarser boundary merely noticing
+// a stale cancellation afterward) lives in
+// TestMatchesAnyVCancelsDuringScan (eval_internal_test.go), which calls
+// matchesAnyV directly and asserts on ev.steps; this test just confirms the
+// whole Transform pipeline still produces an error for this rule shape.
+func TestContextCancellationNegationScan(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mark := func(inputs []any) (any, bool) {
+		cancel()
+		return inputs[0], true
+	}
+
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "seed", Terms: []datalog.Constant{datalog.Integer(1)}})
+	// blocked facts all use X=2, never X=1 (seed's value), so the negation
+	// check for X=1 never matches and matchesAnyV's scan runs to the end of
+	// the fact set instead of returning on an early hit.
+	const m = 5000
+	for i := range m {
+		b.AddFact(datalog.Fact{Name: "blocked", Terms: []datalog.Constant{
+			datalog.Integer(2), datalog.Integer(int64(i)),
+		}})
+	}
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`r(X, V) :- seed(X), not blocked(X, _), @mark(X, V).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := seminaive.New(seminaive.WithBuiltin("@mark", mark)).Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := tr.Transform(ctx, input); err == nil {
+		t.Error("expected context cancellation error")
 	}
 }
 

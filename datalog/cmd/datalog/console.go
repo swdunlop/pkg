@@ -217,16 +217,20 @@ func (wb *workbench) handleConsoleQuery(w http.ResponseWriter, r *http.Request) 
 			}
 			return err
 		})
-		if ctx.Err() != nil {
-			wb.consoleAppend("query", "error", queryEcho(q.String()),
-				html.Text(evalHaltStatus(ctx, "query stopped")))
+		outcome := classifyQueryOutcome(ctx, q.String(), blk, qErr, "query stopped")
+		if outcome.RenderBlock {
+			if outcome.Block.Err != "" {
+				wb.consoleAppend("query", "error", queryEcho(outcome.Block.Query), html.Text(outcome.Block.Err))
+			} else {
+				wb.consoleAppend("query", "query", resultBlock(outcome.Block))
+			}
+		}
+		if outcome.Halt != "" {
+			wb.consoleAppend("query", "error", queryEcho(q.String()), html.Text(outcome.Halt))
+		}
+		if !outcome.Continue {
 			return
 		}
-		if qErr != nil {
-			wb.consoleAppend("query", "error", queryEcho(q.String()), html.Text(qErr.Error()))
-			continue
-		}
-		wb.consoleAppend("query", "query", resultBlock(blk))
 	}
 }
 

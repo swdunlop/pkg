@@ -2,6 +2,7 @@ package seminaive
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -74,11 +75,7 @@ func stratify(rules []syntax.Rule, aggRules []syntax.AggregateRule, builtins map
 	}
 	for _, e := range edges {
 		if e.negative && predToSCC[e.from] == predToSCC[e.to] {
-			members := make([]string, 0, len(sccs[predToSCC[e.from]]))
-			for p := range sccs[predToSCC[e.from]] {
-				members = append(members, p)
-			}
-			slices.Sort(members)
+			members := slices.Sorted(maps.Keys(sccs[predToSCC[e.from]]))
 			if e.agg {
 				return nil, fmt.Errorf("unstratifiable: cycle through an aggregate involving %s", strings.Join(members, ", "))
 			}

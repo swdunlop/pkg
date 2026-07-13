@@ -1,7 +1,7 @@
 package interned
 
 import (
-	"maps"
+	"fmt"
 	"math/bits"
 
 	"swdunlop.dev/pkg/datalog"
@@ -89,7 +89,29 @@ func CompileAtom(pred string, terms []datalog.Term, dict *Dict) CompiledAtom {
 
 // CompileAtomV pre-interns an atom and assigns variable indices from varMap.
 // If varMap is non-nil, new variables are added and indexed.
+//
+// CompileAtomV is the sole constructor of CompiledAtom, and CompiledAtom.Arity
+// is trusted without a further bounds check by every ground/hash sink that
+// consumes it -- HashAndGroundV, GroundV, and (via BoundArgsV) BoundSet.Set
+// all write into fixed [MaxFactArity] arrays using ca.Arity as the loop
+// bound, with no local check of their own. Guarding here, once, covers all
+// three; guarding at each sink instead would triple the check on paths that
+// run per substitution in the semi-naive fixpoint's innermost loop.
+//
+// This panics rather than returning an error (unlike InternFact, which can
+// afford to since it runs once per loaded fact): every current caller of
+// CompileAtomV/CompileAtom lives in seminaive's rule-compilation path, which
+// already rejects over-wide atoms earlier and with a friendlier message via
+// checkRuleArity in Engine.Compile, so this panic is unreachable today and
+// exists only as a documented backstop against a future compile path that
+// forgets to call checkRuleArity first -- it turns a silent
+// index-out-of-range panic deep in a ground/hash sink (with no context
+// about which atom or predicate caused it) into an immediate, labeled one at
+// the point the oversized atom was compiled.
 func CompileAtomV(pred string, terms []datalog.Term, dict *Dict, varMap map[string]int8) CompiledAtom {
+	if len(terms) > MaxFactArity {
+		panic(fmt.Sprintf("interned: atom %s has arity %d, exceeds maximum %d", pred, len(terms), MaxFactArity))
+	}
 	compiled := make([]CompiledTerm, len(terms))
 	for i, t := range terms {
 		switch v := t.(type) {
@@ -531,23 +553,37 @@ func (fs InternedFactSet) colIndexFor(k PredArityI, col int) *colIndex {
 	return ci
 }
 
-// Merge copies all facts from other into fs in bulk. Existing column
-// indexes stay valid (facts are append-only) and catch up on next Scan;
-// no index maintenance is needed here.
+// Merge copies all facts from other into fs. Existing column indexes stay
+// valid (facts are append-only) and catch up on next Scan; no column index
+// maintenance is needed here.
+//
+// Index maintenance uses exactly one mechanism: every fact that ends up
+// stored in fs, whether adopted wholesale or appended one at a time, has
+// its hash key written into fs.Index at the point it is stored. There is
+// no separate bulk maps.Copy(fs.Index, other.Index) pass -- an earlier
+// version had both, which meant a fact could be recorded in fs.Index by
+// the wholesale copy while never actually being appended to fs.ByPred (or
+// vice versa), leaving the index and the stored facts disagreeing about
+// what's present (see TestMergeOverlappingFactNotDuplicated, the
+// regression test for the resulting double-store/double-yield).
 //
 // Callers that already guarantee disjointness (e.g. evalRules, whose emit
 // closure checks both existing.Index and emitted.Index before adding a
 // fact) pay only the cost of the (pred,arity) presence check below, since
-// dfc is nil whenever fs has no facts yet for that key. Callers that can't
-// make that guarantee (e.g. an aggregate rule's derived facts, which are
-// only deduplicated against each other, not against the accumulated
-// existing set) rely on the per-fact hash check to avoid storing the same
-// fact twice under one hash-index entry.
+// dfc is nil whenever fs has no facts yet for that key -- the whole chunk
+// is adopted in one assignment, and its hash keys copied in one pass.
+// Callers that can't make that guarantee (e.g. an aggregate rule's derived
+// facts, which are only deduplicated against each other, not against the
+// accumulated existing set) rely on the per-fact hash check below to avoid
+// storing the same fact twice under one hash-index entry.
 func (fs InternedFactSet) Merge(other InternedFactSet) {
 	for k, ofc := range other.ByPred {
 		dfc := fs.ByPred[k]
 		if dfc == nil {
 			fs.ByPred[k] = ofc
+			for _, f := range ofc.facts {
+				fs.Index[InternedFactHash(f)] = struct{}{}
+			}
 			continue
 		}
 		for _, f := range ofc.facts {
@@ -559,10 +595,6 @@ func (fs InternedFactSet) Merge(other InternedFactSet) {
 			dfc.append(f)
 		}
 	}
-	// Any (pred,arity) key present only in other was adopted wholesale
-	// above; copy remaining hash keys (facts under predicates fs never
-	// saw) that the per-fact loop didn't already add.
-	maps.Copy(fs.Index, other.Index)
 }
 
 // Clone returns a deep copy of the fact set. Column indexes are not

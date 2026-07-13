@@ -119,14 +119,14 @@ func checkConstraintV(pred string, terms []interned.CompiledTerm, sub *interned.
 	}
 	ct0, ct1 := terms[0], terms[1]
 	switch pred {
-	case "=":
+	case "=", "!=":
 		lid, lok := resolveCompiledTermID(ct0, sub)
 		rid, rok := resolveCompiledTermID(ct1, sub)
 		if !lok || !rok {
 			return false
 		}
 		if lid == rid {
-			return true
+			return pred == "="
 		}
 		// Identical interned IDs cover exact matches (including equal
 		// strings/atoms); mixed int64/float64 constants intern to distinct
@@ -134,23 +134,13 @@ func checkConstraintV(pred string, terms []interned.CompiledTerm, sub *interned.
 		// comparison in that case.
 		lhs, rhs := dict.Resolve(lid), dict.Resolve(rid)
 		if c, ok := compareValues(lhs, rhs); ok {
-			return c == 0
+			return (c == 0) == (pred == "=")
 		}
-		return false
-	case "!=":
-		lid, lok := resolveCompiledTermID(ct0, sub)
-		rid, rok := resolveCompiledTermID(ct1, sub)
-		if !lok || !rok {
-			return false
-		}
-		if lid == rid {
-			return false
-		}
-		lhs, rhs := dict.Resolve(lid), dict.Resolve(rid)
-		if c, ok := compareValues(lhs, rhs); ok {
-			return c != 0
-		}
-		return true
+		// Unorderable (e.g. a NaN operand): "=" is false, "!=" is true,
+		// matching IEEE 754's "NaN != anything" for ordering purposes even
+		// though interned identity (the lid == rid branch above) already
+		// treats two NaNs as equal.
+		return pred == "!="
 	case "@contains":
 		lhs, lok := resolveCompiledTermValue(ct0, sub, dict)
 		rhs, rok := resolveCompiledTermValue(ct1, sub, dict)
@@ -661,12 +651,19 @@ type evaluator struct {
 	// ctx and steps implement cancellation for the shared body evaluator.
 	// evalBodyRecursiveV is the innermost hot loop of every pipeline (plain
 	// rules, queries, and aggregate bodies) and threads no error return, so
-	// each entry point (evalRules, queryInternedFacts) stores its ctx here
-	// and countStep samples it every evalStepsPerCheck scanned join tuples,
-	// unwinding via the evalCancelled sentinel to a recoverEvalError defer.
-	// Sampling at the tuple scan -- not once per solution or per iteration --
-	// is what makes a single huge cross-product body (many tuples, few or
-	// many solutions) abort promptly instead of running to completion.
+	// ctx is set once, at construction (transformer.go's Transform, which
+	// already has ctx in scope when it builds the evaluator), and countStep
+	// samples it every evalStepsPerCheck scanned join tuples, unwinding via
+	// the evalCancelled sentinel to a recoverEvalError defer. Sampling at the
+	// tuple scan -- not once per solution or per iteration -- is what makes a
+	// single huge cross-product body (many tuples, few or many solutions)
+	// abort promptly instead of running to completion. Every evaluator entry
+	// point (evalRules, queryInternedFacts, evalAggregates) receives its own
+	// ctx parameter too, for the coarser per-iteration/per-rule checks that
+	// don't go through countStep; that parameter must always be the same ctx
+	// the evaluator was constructed with -- there is exactly one evaluator
+	// per Transform call, so this is not a place two different contexts could
+	// legitimately disagree.
 	ctx   context.Context
 	steps uint
 }
@@ -720,7 +717,6 @@ func recoverEvalError(ctx context.Context, err *error) {
 // a value of an unsupported type (see builtinValueError); the partial
 // results are discarded in any case.
 func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existing interned.InternedFactSet, maxIter int) (factCount int, iterations int, err error) {
-	ev.ctx = ctx
 	defer recoverEvalError(ctx, &err)
 
 	emitted := interned.NewLightInternedFactSet()
@@ -905,6 +901,10 @@ func (ev *evaluator) evalBindMulti(item bodyItem, sub *interned.VarSub, next fun
 	outTerms := item.ca.Terms[nIn:]
 	savedMask := sub.Mask
 	mb.fn(inputs, func(outputs []any) bool {
+		// A MultiBuiltinFunc can stream an unbounded number of tuples with no
+		// join scan of its own to sample ctx from (see countStep's doc); this
+		// is the only place that yield loop's cancellation is checked.
+		ev.countStep()
 		if len(outputs) != nOut {
 			return true
 		}
@@ -1114,6 +1114,7 @@ func (ev *evaluator) matchesAnyV(ca interned.CompiledAtom, sub *interned.VarSub,
 	savedMask := sub.Mask
 	existScan := existing.Scan(ca.Pred, ca.Arity, &bs)
 	for i := range existScan.Len() {
+		ev.countStep()
 		fact := existScan.Fact(i)
 		if !interned.MatchesBound(&bs, fact) {
 			continue
@@ -1125,6 +1126,7 @@ func (ev *evaluator) matchesAnyV(ca interned.CompiledAtom, sub *interned.VarSub,
 	}
 	emitScan := emitted.Scan(ca.Pred, ca.Arity, &bs)
 	for i := range emitScan.Len() {
+		ev.countStep()
 		fact := emitScan.Fact(i)
 		if !interned.MatchesBound(&bs, fact) {
 			continue
@@ -1328,12 +1330,15 @@ func exprVarsBound(expr compiledExpr, boundVars uint16) bool {
 // scans memFacts directly, mirroring how evalRules itself falls back to a
 // full existing/emitted scan on iteration 0.
 //
-// Cancellation rides the evaluator's shared countStep sampling inside
-// evalBodyRecursiveV's join scans (see evaluator.ctx), so a large
-// unconstrained join -- e.g. an aggregate body that is itself a multi-way
-// cross product -- aborts promptly whether or not it is producing solutions.
+// Cancellation rides the evaluator's shared countStep sampling, which covers
+// every shape a body can take: the join scans in evalBodyRecursiveV, the
+// yield callback in evalBindMulti (a MultiBuiltinFunc can stream unboundedly
+// with no join scan of its own), and matchesAnyV's negation scans (see
+// evaluator.ctx). So a large unconstrained join -- e.g. an aggregate body
+// that is itself a multi-way cross product, or one dominated by an
+// unbounded multi-result builtin -- aborts promptly whether or not it is
+// producing solutions.
 func (ev *evaluator) queryInternedFacts(ctx context.Context, body []syntax.Atom, memFacts interned.InternedFactSet) (_ []interned.InternedSub, err error) {
-	ev.ctx = ctx
 	defer recoverEvalError(ctx, &err)
 
 	items, negativeBody, _, varMap := compileBody(body, ev.dict, ev.builtins, ev.multiBuiltins)

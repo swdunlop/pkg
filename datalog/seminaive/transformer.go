@@ -82,7 +82,7 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 			}
 		}
 
-		ev := &evaluator{dict: dict, maxIter: t.maxIter, builtins: t.builtins, multiBuiltins: t.multiBuiltins}
+		ev := &evaluator{ctx: ctx, dict: dict, maxIter: t.maxIter, builtins: t.builtins, multiBuiltins: t.multiBuiltins}
 
 		var stats []StratumStats
 		if t.profile != nil {

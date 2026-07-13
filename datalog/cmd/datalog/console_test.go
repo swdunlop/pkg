@@ -86,6 +86,81 @@ func TestConsoleQueryStop(t *testing.T) {
 	}
 }
 
+// TestConsoleQueryMultiQueryCompletedResultsSurviveMidBatchCancel is the
+// handler-level regression for the round-two review's finding, exercised
+// through the exact multi-query shape the review called out: a batch of two
+// queries where the FIRST query's own Transform is cancelled mid-flight
+// (mirroring one query consuming the shared budget or a Stop landing while
+// it runs) must still render that first query's halt-status entry, and must
+// NOT go on to silently run or render anything for the second query — the
+// classifyQueryOutcome ordering rule's Continue=false is what stops the loop
+// here. This complements the deterministic classifyQueryOutcome unit tests
+// in rules_editor_test.go, which pin the qErr==nil/ctx-already-dead ordering
+// directly; reproducing THAT exact instruction-level gap through the real
+// HTTP handler is not reliably reachable (semi-naive's own ctx check inside
+// Transform races any external POST /cancel and almost always wins), so this
+// test instead pins the reachable, equally real regression shape: a batch
+// input must never drop a query's own halt reporting nor silently continue
+// past it.
+func TestConsoleQueryMultiQueryCompletedResultsSurviveMidBatchCancel(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	srv := startTestServer(wb)
+	defer srv.Close()
+
+	inTransform := make(chan struct{})
+	var once sync.Once
+	wb.h.mu.Lock()
+	wb.h.sess.engineOpts = append(wb.h.sess.engineOpts,
+		seminaive.WithExternal("slow3", 1, func(ctx context.Context, _ seminaive.Bindings) iter.Seq[[]any] {
+			return func(yield func([]any) bool) {
+				once.Do(func() { close(inTransform) })
+				<-ctx.Done()
+			}
+		}))
+	wb.h.mu.Unlock()
+
+	queryDone := make(chan struct{})
+	go func() {
+		defer close(queryDone)
+		resp := postSignals(t, srv, "/console/query", map[string]any{
+			// Two queries in one batch — the second must never run once the
+			// first is cancelled mid-Transform.
+			"consoleQuery": "slow3(X)?\ncopied_to(F, H)?",
+		})
+		defer resp.Body.Close()
+		_, _ = io.ReadAll(resp.Body)
+	}()
+
+	select {
+	case <-inTransform:
+	case <-time.After(10 * time.Second):
+		t.Fatal("query never reached the blocking external")
+	}
+
+	resp, err := http.Post(srv.URL+"/cancel", "", nil)
+	if err != nil {
+		t.Fatalf("POST /cancel: %v", err)
+	}
+	resp.Body.Close()
+
+	select {
+	case <-queryDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("query handler did not return after /cancel")
+	}
+
+	log := renderLog(wb, "query")
+	if !strings.Contains(log, "query stopped") {
+		t.Fatalf("scrollback missing 'query stopped' for the cancelled first query: %s", log)
+	}
+	if strings.Contains(log, "context canceled") {
+		t.Fatalf("halt-status entry duplicated with a raw ctx error: %s", log)
+	}
+	if strings.Contains(log, "copied_to") {
+		t.Fatalf("second query in the batch ran after the first was cancelled: %s", log)
+	}
+}
+
 func TestConsoleQuery(t *testing.T) {
 	wb := newMordorWorkbench(t)
 	srv := startTestServer(wb)

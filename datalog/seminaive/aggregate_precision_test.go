@@ -291,3 +291,32 @@ func TestAggregateMinMaxNaNErrors(t *testing.T) {
 		t.Fatalf("expected the error to mention NaN, got: %v", err)
 	}
 }
+
+// TestAggregateSumNaNErrors confirms sum over a group containing NaN fails
+// loudly instead of silently interning a NaN result fact. Before the NaN
+// check was centralized at resolveInternedAggValue (the chokepoint every
+// numeric aggregate's per-row value passes through), AggSum had no NaN check
+// of its own -- only computeExtremum did -- so a sum silently produced a NaN
+// fact that then compares unordered-false against everything downstream.
+func TestAggregateSumNaNErrors(t *testing.T) {
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.Float(math.NaN())}})
+	b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.Integer(1)}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`s(S) :- S = sum(X) : v(X).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := seminaive.New().Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.Transform(context.Background(), input); err == nil {
+		t.Fatal("expected an error computing sum over a group containing NaN, got nil")
+	} else if !strings.Contains(err.Error(), "NaN") {
+		t.Fatalf("expected the error to mention NaN, got: %v", err)
+	} else if !strings.Contains(err.Error(), "sum") {
+		t.Fatalf("expected the error to name the aggregate (sum), got: %v", err)
+	}
+}

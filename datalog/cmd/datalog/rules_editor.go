@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -219,15 +220,20 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 			return err
 		})
 
-		if ctx.Err() != nil {
+		var blk queryResultBlock
+		if qErr == nil {
+			blk = renderQueryResult(q.String(), vars, rows)
+		}
+		outcome := classifyQueryOutcome(ctx, q.String(), blk, qErr, "run stopped")
+		if outcome.RenderBlock {
+			blocks = append(blocks, outcome.Block)
+		}
+		if outcome.Halt != "" {
 			timedOut = true
+		}
+		if !outcome.Continue {
 			break
 		}
-		if qErr != nil {
-			blocks = append(blocks, queryResultBlock{Query: q.String(), Err: qErr.Error()})
-			continue
-		}
-		blocks = append(blocks, renderQueryResult(q.String(), vars, rows))
 	}
 
 	if evalErr != nil {
@@ -262,6 +268,62 @@ func evalHaltStatus(ctx context.Context, stopped string) string {
 		return stopped
 	}
 	return "evaluation timed out, results may be incomplete"
+}
+
+// perQueryOutcome is the result of running one query in a multi-query loop
+// (handleConsoleQuery, handleRulesRun): the mechanism both call sites use to
+// decide what to render and whether to keep looping. A round-two review
+// found both loops checking ctx.Err() BEFORE looking at whether runQuery had
+// already produced a result, so a deadline landing in the gap after a
+// successful runQuery returned discarded the finished rows and showed only
+// halt-status wording — with multi-query input, one query consuming the
+// budget silently ate the next query's completed results. The fix is this
+// ordering rule, applied once here rather than at each call site: whenever
+// runQuery produced an outcome of its own — a completed result (qErr nil) or
+// the query's OWN failure, one unrelated to ctx ending — that outcome is
+// ALWAYS rendered (RenderBlock true), regardless of what ctx.Err() reports
+// afterward. The one case Block is suppressed is qErr being the ctx
+// cancellation/deadline itself (errors.Is(qErr, ctx.Err()) — semi-naive's own
+// mid-Transform ctx check unwound the query, so qErr carries no information
+// beyond "ctx ended" already): showing a raw "context canceled" block right
+// next to the halt message would just duplicate the same event twice. Either
+// way, ctx.Err() alone controls whether a trailing halt-status message
+// follows (Halt) and whether the caller's loop should keep going (Continue
+// false stops it).
+type perQueryOutcome struct {
+	RenderBlock bool             // true: Block holds a result or the query's own error, always render it
+	Block       queryResultBlock // valid when RenderBlock is true
+	Halt        string           // non-empty: append this halt-status message (after Block, if rendered)
+	Continue    bool             // false: the caller's multi-query loop must stop here
+}
+
+// classifyQueryOutcome applies the ordering rule described on
+// perQueryOutcome to one query's (blk, qErr, ctx) triple. stopped is the
+// surface-specific wording evalHaltStatus should use for the halt message
+// when ctx ended in a user cancel ("query stopped", "run stopped", ...).
+func classifyQueryOutcome(ctx context.Context, queryText string, blk queryResultBlock, qErr error, stopped string) perQueryOutcome {
+	out := perQueryOutcome{Continue: ctx.Err() == nil}
+	switch {
+	case qErr == nil:
+		// runQuery succeeded and blk is a real result — render it
+		// unconditionally. ctx.Err() only decides the trailing halt message
+		// and whether the loop continues.
+		out.RenderBlock = true
+		out.Block = blk
+	case ctx.Err() != nil && errors.Is(qErr, ctx.Err()):
+		// qErr IS the ctx ending (semi-naive's own mid-Transform ctx check
+		// unwound the query) — nothing beyond "ctx ended" to show, so skip
+		// the redundant raw error block and let Halt alone speak for it.
+	default:
+		// A genuine query-level failure (bad query, broken snapshot, ...),
+		// independent of ctx — always rendered, never treated as a halt.
+		out.RenderBlock = true
+		out.Block = queryResultBlock{Query: queryText, Err: qErr.Error()}
+	}
+	if ctx.Err() != nil {
+		out.Halt = evalHaltStatus(ctx, stopped)
+	}
+	return out
 }
 
 // queryResultBlock is one embedded query's rendered outcome: either an

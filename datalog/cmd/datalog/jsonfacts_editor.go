@@ -213,16 +213,23 @@ func (wb *workbench) handleJSONFactsApply(w http.ResponseWriter, r *http.Request
 	ctx, cancel := context.WithTimeout(ctx, evalTimeout)
 	defer cancel()
 
-	resultCh := runApplySchema(wb, sig.SchemaText)
+	resultCh := runApplySchema(ctx, wb, sig.SchemaText)
 
 	select {
 	case <-ctx.Done():
-		_ = stream.Emit(datastar.Elements(view.JSONFactsErrors([]string{
-			"Apply timed out, schema not changed",
-		})))
+		_ = stream.Emit(datastar.Elements(view.JSONFactsErrors([]string{applyHaltMessage(ctx)})))
 		return
 	case res := <-resultCh:
 		if res.err != nil {
+			// res.err may BE ctx.Err() (runApplySchema's own late-arrival
+			// guard lost the race against setSchema and returned it instead
+			// of mutating) — route it through the same halt-status wording
+			// rather than surfacing Go's bare "context canceled"/"context
+			// deadline exceeded" text.
+			if ctx.Err() != nil {
+				_ = stream.Emit(datastar.Elements(view.JSONFactsErrors([]string{applyHaltMessage(ctx)})))
+				return
+			}
 			_ = stream.Emit(datastar.Elements(view.JSONFactsErrors([]string{res.err.Error()})))
 			return
 		}
@@ -231,6 +238,15 @@ func (wb *workbench) handleJSONFactsApply(w http.ResponseWriter, r *http.Request
 			datastar.Elements(view.JSONFactsOutputMessage(fmt.Sprintf("applied: %d predicates loaded", len(res.out.Predicates)))),
 		))
 	}
+}
+
+// applyHaltMessage words Apply's halt line through evalHaltStatus — the
+// single classifier for cancel-vs-timeout wording — so both the select's
+// <-ctx.Done() branch and a resultCh delivery that turns out to just be
+// ctx.Err() read identically, instead of one going through evalHaltStatus
+// and the other leaking Go's bare error text.
+func applyHaltMessage(ctx context.Context) string {
+	return evalHaltStatus(ctx, "Apply stopped") + ", schema not changed"
 }
 
 // applySchemaResult is runApplySchema's result payload.
@@ -245,12 +261,28 @@ type applySchemaResult struct {
 // subsequent publish — not around the whole SSE response, per the task's
 // explicit note. The result (including any panic, translated to an error by
 // runRecovered) is delivered on the returned channel exactly once.
-func runApplySchema(wb *workbench, schemaText string) <-chan applySchemaResult {
+//
+// ctx is the SAME ctx handleJSONFactsApply's select already uses to decide
+// the halt-status wording — it must be the single signal gating both the
+// message and the mutation, not two independently-derived checks. Before
+// this fix, the handler's select could report "Apply timed out/stopped,
+// schema not changed" and return while this goroutine, still blocked on
+// wb.h.mu, went on to call setSchema anyway: a mutation landing after the
+// user was told it didn't happen. The ctx.Err() check below runs AFTER
+// acquiring wb.h.mu (so it observes the freshest possible cancellation, not
+// a stale read taken before waiting for the lock) and BEFORE calling
+// setSchema, so an abandoned Apply — Stop clicked, or the shared budget
+// already spent by the time the mutex is free — never mutates the schema
+// once its ctx has ended, matching what the handler already told the user.
+func runApplySchema(ctx context.Context, wb *workbench, schemaText string) <-chan applySchemaResult {
 	out := make(chan applySchemaResult, 1)
 	var result setSchemaOutput
 	done := runRecovered(func() error {
 		wb.h.mu.Lock()
 		defer wb.h.mu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		var err error
 		// setSchema fires h.onChange (wired to publishSessionChanged by
 		// newWorkbench) on success, so no explicit publish here — a second
