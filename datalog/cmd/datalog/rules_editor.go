@@ -143,7 +143,7 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 	})
 
 	if ctx.Err() != nil {
-		_ = stream.Emit(datastar.Elements(statusFragment(evalHaltStatus(ctx))))
+		_ = stream.Emit(datastar.Elements(statusFragment(evalHaltStatus(ctx, "run stopped"))))
 		return
 	}
 	if applyErr != nil {
@@ -177,7 +177,7 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 		return err
 	})
 	if ctx.Err() != nil {
-		_ = stream.Emit(datastar.Elements(statusFragment(evalHaltStatus(ctx))))
+		_ = stream.Emit(datastar.Elements(statusFragment(evalHaltStatus(ctx, "run stopped"))))
 		return
 	}
 	if wb.gen.Stale(token) {
@@ -211,12 +211,7 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 		var rows [][]datalog.Constant
 		var vars []string
 		qErr := <-runRecovered(func() error {
-			// Hold h.mu only for the snapshot; the Transform below can
-			// run up to the eval timeout and must not freeze the other
-			// panes or the MCP tools sharing this mutex.
-			wb.h.mu.Lock()
-			snap, err := wb.h.sess.snapshotForQuery()
-			wb.h.mu.Unlock()
+			snap, err := wb.h.lockedSnapshot()
 			if err != nil {
 				return err
 			}
@@ -250,17 +245,21 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 
 	status := ""
 	if timedOut {
-		status = evalHaltStatus(ctx)
+		status = evalHaltStatus(ctx, "run stopped")
 	}
 	_ = stream.Emit(datastar.Elements(statusFragment(status)), datastar.Elements(resultsFragment(blocks)))
 }
 
 // evalHaltStatus words the status line for an evaluation ctx that ended
 // early: a user Stop (context.Canceled via /cancel or a closed page) reads
-// differently from the evalTimeout deadline expiring.
-func evalHaltStatus(ctx context.Context) string {
+// differently from the evalTimeout deadline expiring. stopped is the
+// surface-specific wording for the user-cancel case ("run stopped",
+// "query stopped", ...); the timeout wording is shared. This is the single
+// place that classifies ctx.Err() for user-facing halt messages -- new
+// handlers must call it rather than re-deriving the branch inline.
+func evalHaltStatus(ctx context.Context, stopped string) string {
 	if ctx.Err() == context.Canceled {
-		return "run stopped"
+		return stopped
 	}
 	return "evaluation timed out, results may be incomplete"
 }

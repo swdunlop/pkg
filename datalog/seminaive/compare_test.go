@@ -3,6 +3,7 @@ package seminaive_test
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 
 	"swdunlop.dev/pkg/datalog"
@@ -179,4 +180,62 @@ func TestLargeInt64FloatComparisonExact(t *testing.T) {
 			t.Errorf("expected %d > %v to hold exactly, got count=%d", bigInt, bigFloatBelow, count)
 		}
 	})
+}
+
+// TestNaNComparisonUnordered confirms NaN is unordered per IEEE 754: every
+// ordering constraint against a NaN operand is false (in both operand
+// orders), while != holds. NaN can enter through the Go API
+// (datalog.Float(math.NaN())) or a user builtin; an earlier version of
+// compareInt64Float64 placed NaN consistently *above* every int64 (despite
+// a comment claiming the opposite), so `X < N` with N=NaN evaluated true
+// and derived phantom facts.
+func TestNaNComparisonUnordered(t *testing.T) {
+	cases := []struct {
+		name      string
+		rule      string
+		wantMatch bool
+	}{
+		{"int-lt-nan", `q(X) :- f(X), n(N), X < N.`, false},
+		{"int-gt-nan", `q(X) :- f(X), n(N), X > N.`, false},
+		{"int-le-nan", `q(X) :- f(X), n(N), X <= N.`, false},
+		{"int-ge-nan", `q(X) :- f(X), n(N), X >= N.`, false},
+		{"nan-lt-int", `q(X) :- f(X), n(N), N < X.`, false},
+		{"nan-gt-int", `q(X) :- f(X), n(N), N > X.`, false},
+		{"float-lt-nan", `q(X) :- g(X), n(N), X < N.`, false},
+		{"nan-lt-float", `q(X) :- g(X), n(N), N < X.`, false},
+		{"int-ne-nan", `q(X) :- f(X), n(N), X != N.`, true},
+		// All NaN payloads intern to one ID, so "=" between two NaN-valued
+		// variables is true by interned identity -- a deliberate deviation
+		// from IEEE that keeps "=" consistent with joins and deduplication.
+		{"nan-eq-nan", `q(N) :- n(N), n(M), N = M.`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := memory.NewBuilder()
+			b.AddFact(datalog.Fact{Name: "f", Terms: []datalog.Constant{datalog.Integer(5)}})
+			b.AddFact(datalog.Fact{Name: "g", Terms: []datalog.Constant{datalog.Float(5.5)}})
+			b.AddFact(datalog.Fact{Name: "n", Terms: []datalog.Constant{datalog.Float(math.NaN())}})
+			input := b.Build()
+
+			rs, err := syntax.ParseAll(tc.rule)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			tr, err := seminaive.New().Compile(rs)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			output, err := tr.Transform(context.Background(), input)
+			if err != nil {
+				t.Fatalf("transform: %v", err)
+			}
+			count := 0
+			for range output.Facts("q", 1) {
+				count++
+			}
+			if got := count > 0; got != tc.wantMatch {
+				t.Errorf("rule %q: match = %v, want %v", tc.rule, got, tc.wantMatch)
+			}
+		})
+	}
 }

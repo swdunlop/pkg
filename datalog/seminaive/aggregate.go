@@ -3,6 +3,7 @@ package seminaive
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"swdunlop.dev/pkg/datalog"
 	"swdunlop.dev/pkg/datalog/internal/interned"
@@ -79,13 +80,13 @@ func (ev *evaluator) evalAggregates(ctx context.Context, aggRules []syntax.Aggre
 
 		// Compute aggregate for each group. groupsChecked counts groups
 		// processed across all buckets so ctx is sampled every N groups
-		// (queryTuplesPerCheck) rather than on every single one, mirroring
-		// queryInternedFacts' sampling of solutions during the join above.
+		// (evalStepsPerCheck) rather than on every single one, mirroring
+		// the evaluator's countStep sampling during the join above.
 		groupsChecked := 0
 		for _, bucket := range groups {
 			for _, g := range bucket {
 				groupsChecked++
-				if groupsChecked%queryTuplesPerCheck == 0 {
+				if groupsChecked%evalStepsPerCheck == 0 {
 					if err := ctx.Err(); err != nil {
 						return result, err
 					}
@@ -182,109 +183,65 @@ func computeInternedAggregate(
 		return dict.Intern(sumFloat), nil
 
 	case syntax.AggMin:
-		var minInt int64
-		var minFloat float64
-		isInt := true
-		haveVal := false
-		for _, sub := range subs {
-			val, err := resolveInternedAggValue(aggVarName, aggConstID, aggIsConst, sub, dict)
-			if err != nil {
-				return 0, err
-			}
-			switch v := val.(type) {
-			case int64:
-				if !haveVal {
-					minInt = v
-				} else if isInt {
-					if v < minInt {
-						minInt = v
-					}
-				} else {
-					if float64(v) < minFloat {
-						minFloat = float64(v)
-					}
-				}
-			case float64:
-				if !haveVal {
-					minFloat = v
-					isInt = false
-				} else if isInt {
-					// Promote to float64, converting the running int64 min exactly
-					// (the min so far is a single value, so this conversion is
-					// exact for any int64 that fits a float64 range comparison).
-					if float64(minInt) < v {
-						minFloat = float64(minInt)
-					} else {
-						minFloat = v
-					}
-					isInt = false
-				} else {
-					if v < minFloat {
-						minFloat = v
-					}
-				}
-			default:
-				return 0, fmt.Errorf("cannot compute min of non-numeric value: %v", val)
-			}
-			haveVal = true
-		}
-		if isInt {
-			return dict.Intern(minInt), nil
-		}
-		return dict.Intern(minFloat), nil
+		return computeExtremum("min", -1, aggVarName, aggConstID, aggIsConst, subs, dict)
 
 	case syntax.AggMax:
-		var maxInt int64
-		var maxFloat float64
-		isInt := true
-		haveVal := false
-		for _, sub := range subs {
-			val, err := resolveInternedAggValue(aggVarName, aggConstID, aggIsConst, sub, dict)
-			if err != nil {
-				return 0, err
-			}
-			switch v := val.(type) {
-			case int64:
-				if !haveVal {
-					maxInt = v
-				} else if isInt {
-					if v > maxInt {
-						maxInt = v
-					}
-				} else {
-					if float64(v) > maxFloat {
-						maxFloat = float64(v)
-					}
-				}
-			case float64:
-				if !haveVal {
-					maxFloat = v
-					isInt = false
-				} else if isInt {
-					if float64(maxInt) > v {
-						maxFloat = float64(maxInt)
-					} else {
-						maxFloat = v
-					}
-					isInt = false
-				} else {
-					if v > maxFloat {
-						maxFloat = v
-					}
-				}
-			default:
-				return 0, fmt.Errorf("cannot compute max of non-numeric value: %v", val)
-			}
-			haveVal = true
-		}
-		if isInt {
-			return dict.Intern(maxInt), nil
-		}
-		return dict.Intern(maxFloat), nil
+		return computeExtremum("max", 1, aggVarName, aggConstID, aggIsConst, subs, dict)
 
 	default:
 		return 0, fmt.Errorf("unknown aggregate kind: %v", kind)
 	}
+}
+
+// computeExtremum computes min (sign = -1) or max (sign = +1) over a group.
+// The running best is kept as its original int64 or float64 value and every
+// candidate is compared with compareValues, whose mixed int64/float64 path
+// is exact beyond 2^53 -- routing an int64 candidate through float64(v)
+// (as an earlier version did) could return a "minimum" larger than the true
+// minimum and not present in the input at all. Keeping the winner's original
+// value also means an int64 extremum stays an int64 even when floats appear
+// elsewhere in the group. NaN is unordered (compareValues reports !ok), so
+// its position in the group could otherwise silently decide the result;
+// error loudly instead, matching the non-numeric case.
+func computeExtremum(
+	name string, sign int,
+	aggVarName string, aggConstID uint64, aggIsConst bool,
+	subs []interned.InternedSub, dict *interned.Dict,
+) (uint64, error) {
+	var best any
+	for _, sub := range subs {
+		val, err := resolveInternedAggValue(aggVarName, aggConstID, aggIsConst, sub, dict)
+		if err != nil {
+			return 0, err
+		}
+		switch val.(type) {
+		case int64, float64:
+		default:
+			return 0, fmt.Errorf("cannot compute %s of non-numeric value: %v", name, val)
+		}
+		if best == nil {
+			if f, ok := val.(float64); ok && math.IsNaN(f) {
+				return 0, fmt.Errorf("cannot compute %s of NaN", name)
+			}
+			best = val
+			continue
+		}
+		c, ok := compareValues(val, best)
+		if !ok {
+			// int64/float64 mixes always compare; the only unorderable
+			// numeric operand is NaN.
+			return 0, fmt.Errorf("cannot compute %s of NaN", name)
+		}
+		if sign*c > 0 {
+			best = val
+		}
+	}
+	if best == nil {
+		// Groups are built from at least one body solution each, so this
+		// only fires on a caller bug; fail loudly rather than fabricate a 0.
+		return 0, fmt.Errorf("cannot compute %s of an empty group", name)
+	}
+	return dict.Intern(best), nil
 }
 
 func resolveInternedAggValue(

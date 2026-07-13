@@ -98,6 +98,19 @@ type mcpHandlers struct {
 	onChange func()
 }
 
+// lockedSnapshot is the one sanctioned way to read session state for a
+// query: it holds h.mu only long enough to capture a querySnapshot, so the
+// caller can run the snapshot's Compile+Transform (up to the query timeout)
+// lock-free without blocking every other tool call and workbench pane. The
+// query sees the session as of this call; a set_rules/set_schema landing
+// mid-evaluation applies to the next query. New query surfaces must go
+// through this helper rather than touching h.mu/h.sess directly.
+func (h *mcpHandlers) lockedSnapshot() (querySnapshot, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.sess.snapshotForQuery()
+}
+
 // newMCPHandlers opens the data source named by dataDir and constructs the
 // handlers. dataDir is either a directory (confined via dataRoot/os.Root)
 // or a .zip file (confined via fs.ValidPath, since zip.Reader already
@@ -398,14 +411,7 @@ func (h *mcpHandlers) query(ctx context.Context, in queryInput) (queryOutput, er
 	ctx, cancel := context.WithTimeout(ctx, h.timeout)
 	defer cancel()
 
-	// Snapshot under the lock, evaluate outside it: Compile+Transform can
-	// run up to h.timeout, and holding h.mu across it would block every
-	// other tool call and workbench pane for the duration. The query sees
-	// the session as of this point; a set_rules/set_schema landing
-	// mid-evaluation applies to the next query.
-	h.mu.Lock()
-	snap, err := h.sess.snapshotForQuery()
-	h.mu.Unlock()
+	snap, err := h.lockedSnapshot()
 	if err != nil {
 		return queryOutput{}, err
 	}

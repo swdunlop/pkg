@@ -432,11 +432,11 @@ func (t *transformer) fetchExternals(ctx context.Context, dict *interned.Dict, e
 			fact.Pred = predID
 			fact.Arity = pd.ep.arity
 			for j, v := range tuple {
-				nv, err := normalizeUserValue(v)
+				id, err := dict.InternUser(v)
 				if err != nil {
 					return fmt.Errorf("external predicate %s: %w", predName, err)
 				}
-				fact.Values[j] = dict.Intern(nv)
+				fact.Values[j] = id
 			}
 			existing.Add(fact)
 		}

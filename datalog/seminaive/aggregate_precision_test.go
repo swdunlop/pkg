@@ -3,6 +3,7 @@ package seminaive_test
 import (
 	"context"
 	"math"
+	"strings"
 	"testing"
 
 	"swdunlop.dev/pkg/datalog"
@@ -202,5 +203,91 @@ func TestAggregatePlainFloatUnchanged(t *testing.T) {
 		if f != 2.25 {
 			t.Errorf("expected highest = 2.25, got %v", f)
 		}
+	}
+}
+
+// TestAggregateMinMaxExactMixedIntFloat covers min/max over groups mixing
+// float64 and large int64 values. An earlier version compared int64
+// candidates against a float running extremum via float64(v), so min over
+// {1e19, int64max} returned float64(int64max) = 2^63 -- a value larger than
+// the true minimum and not present in the input at all. The extremum must
+// come back as the exact int64 that was in the data.
+func TestAggregateMinMaxExactMixedIntFloat(t *testing.T) {
+	const intMax = int64(math.MaxInt64)
+	const intMin = int64(math.MinInt64)
+
+	cases := []struct {
+		name  string
+		facts []datalog.Constant
+		rule  string
+		want  datalog.Constant
+	}{
+		// 1e19 > int64max, so the exact int64 is the minimum.
+		{"min-float-first", []datalog.Constant{datalog.Float(1e19), datalog.Integer(intMax)},
+			`m(M) :- M = min(X) : v(X).`, datalog.Integer(intMax)},
+		{"min-int-first", []datalog.Constant{datalog.Integer(intMax), datalog.Float(1e19)},
+			`m(M) :- M = min(X) : v(X).`, datalog.Integer(intMax)},
+		// -1e19 < int64min, so the exact int64 is the maximum.
+		{"max-float-first", []datalog.Constant{datalog.Float(-1e19), datalog.Integer(intMin)},
+			`m(M) :- M = max(X) : v(X).`, datalog.Integer(intMin)},
+		{"max-int-first", []datalog.Constant{datalog.Integer(intMin), datalog.Float(-1e19)},
+			`m(M) :- M = max(X) : v(X).`, datalog.Integer(intMin)},
+		// The float side still wins when it should, and stays a float.
+		{"min-float-wins", []datalog.Constant{datalog.Float(-0.5), datalog.Integer(3)},
+			`m(M) :- M = min(X) : v(X).`, datalog.Float(-0.5)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := memory.NewBuilder()
+			for _, c := range tc.facts {
+				b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{c}})
+			}
+			input := b.Build()
+
+			rs, err := syntax.ParseAll(tc.rule)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tr, err := seminaive.New().Compile(rs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			output, err := tr.Transform(context.Background(), input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got []datalog.Constant
+			for row := range output.Facts("m", 1) {
+				got = append(got, row[0])
+			}
+			if len(got) != 1 || got[0] != tc.want {
+				t.Fatalf("got %#v, want exactly [%#v]", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAggregateMinMaxNaNErrors confirms min/max over a group containing NaN
+// fails loudly instead of letting NaN's position in the group silently
+// decide the result (NaN is unordered, so "keep the current best" would
+// return whichever value happened to arrive first).
+func TestAggregateMinMaxNaNErrors(t *testing.T) {
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.Float(math.NaN())}})
+	b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.Integer(1)}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`m(M) :- M = min(X) : v(X).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := seminaive.New().Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.Transform(context.Background(), input); err == nil {
+		t.Fatal("expected an error computing min over a group containing NaN, got nil")
+	} else if !strings.Contains(err.Error(), "NaN") {
+		t.Fatalf("expected the error to mention NaN, got: %v", err)
 	}
 }

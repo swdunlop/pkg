@@ -525,3 +525,92 @@ func TestAggregateRuleVarLimitFailsAtCompile(t *testing.T) {
 		t.Fatalf("expected the error to mention the 16-variable limit, got: %v", err)
 	}
 }
+
+// TestCompileRejectsWideAtoms confirms atoms wider than the interned
+// representation's fixed arity limit (16) are a compile error everywhere an
+// atom can appear -- rule head, rule body, fact, and aggregate rule. An
+// earlier version guarded only memory.Database entry points, so a wide rule
+// head compiled cleanly and panicked with an index-out-of-range inside
+// Transform (interned.HashAndGroundV writing past the [16]uint64 array).
+func TestCompileRejectsWideAtoms(t *testing.T) {
+	wide := func(pred string) string {
+		args := make([]string, 17)
+		for i := range args {
+			args[i] = fmt.Sprintf("%d", i+1)
+		}
+		return pred + "(" + strings.Join(args, ", ") + ")"
+	}
+	cases := []struct {
+		name string
+		src  string
+	}{
+		{"rule-head", wide("w") + " :- q(X)."},
+		{"rule-body", "w(X) :- q(X), " + wide("r") + "."},
+		{"fact", wide("w") + "."},
+		{"agg-body", "w(N) :- N = count : " + wide("r") + "."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rs, err := syntax.ParseAll(tc.src)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			_, err = seminaive.New().Compile(rs)
+			if err == nil {
+				t.Fatal("expected a compile error for an arity-17 atom, got nil")
+			}
+			if !strings.Contains(err.Error(), "arity 17") {
+				t.Fatalf("expected the error to name the offending arity, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestCancelAbortsMidIteration confirms cancellation is observed inside a
+// single fixpoint iteration, not just between iterations. The rule body is
+// a three-way cross product over 100 facts (a million solutions in one
+// iteration); the @boom builtin cancels the context on its first call, and
+// evaluation must abort within the evaluator's sampling window (1024
+// scanned tuples) rather than grinding through the remaining ~million
+// solutions before noticing. Before the fix, evalRules checked ctx only
+// once per iteration, so the workbench Stop button had no effect until the
+// entire iteration completed.
+func TestCancelAbortsMidIteration(t *testing.T) {
+	b := memory.NewBuilder()
+	for i := range 100 {
+		b.AddFact(datalog.Fact{Name: "p", Terms: []datalog.Constant{datalog.Integer(int64(i))}})
+	}
+	input := b.Build()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	calls := 0
+	boom := func(inputs []any) (any, bool) {
+		calls++
+		if calls == 1 {
+			cancel()
+		}
+		return inputs[0], true
+	}
+
+	rs, err := syntax.ParseAll(`r(A, B, C, V) :- p(A), p(B), p(C), @boom(A, V).`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	tr, err := seminaive.New(seminaive.WithBuiltin("@boom", boom)).Compile(rs)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+
+	_, err = tr.Transform(ctx, input)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+	// The builtin runs once per complete body solution. Aborting within the
+	// sampling window keeps the count in the low thousands; finishing the
+	// iteration would run it the full million times.
+	if calls > 100000 {
+		t.Fatalf("evaluation ran %d solutions after cancellation; the iteration was not aborted early", calls)
+	}
+}

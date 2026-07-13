@@ -224,16 +224,16 @@ func checkConstraintV(pred string, terms []interned.CompiledTerm, sub *interned.
 // string-keyed lookups -- mirrors evalBindMulti's use of
 // resolveCompiledTermValue.
 //
-// A BuiltinFunc that returns a value normalizeUserValue rejects (e.g. a bare
-// Go int or bool, or an unsupported type) is a programming error in the
-// builtin, not a data miss -- unlike an (nil, false) return, which just
-// means "no result for these inputs" and is handled by the ok=false path
-// here. evalBindBuiltinV has no error return (it is called from
-// evalBodyRecursiveV's hot recursive loop, which threads no error out
-// either), so a bad type panics with builtinValueError; the panic is
-// recovered at the two callers that do have an error return, evalRules and
-// queryInternedFacts, mirroring the existing queryCancelled sentinel
-// pattern used for ctx-cancellation unwinding.
+// A BuiltinFunc that returns a value Dict.InternUser rejects (e.g. an
+// unsupported type) is a programming error in the builtin, not a data miss
+// -- unlike an (nil, false) return, which just means "no result for these
+// inputs" and is handled by the ok=false path here. evalBindBuiltinV has no
+// error return (it is called from evalBodyRecursiveV's hot recursive loop,
+// which threads no error out either), so a bad type panics with
+// builtinValueError; the panic is recovered by recoverEvalError at the
+// entry points that do have an error return, evalRules and
+// queryInternedFacts, like the evalCancelled sentinel used for
+// ctx-cancellation unwinding.
 func evalBindBuiltinV(item bodyItem, sub *interned.VarSub, dict *interned.Dict, builtins map[string]BuiltinFunc) (uint64, bool) {
 	fn, ok := builtins[item.atom.Pred]
 	if !ok {
@@ -255,15 +255,15 @@ func evalBindBuiltinV(item bodyItem, sub *interned.VarSub, dict *interned.Dict, 
 	if !ok {
 		return 0, false
 	}
-	nv, err := normalizeUserValue(result)
+	id, err := dict.InternUser(result)
 	if err != nil {
 		panic(builtinValueError{pred: item.atom.Pred, err: err})
 	}
-	return dict.Intern(nv), true
+	return id, true
 }
 
-// builtinValueError is panicked by evalBindBuiltin and evalBindMulti when a
-// user-supplied BuiltinFunc/MultiBuiltinFunc yields a value normalizeUserValue
+// builtinValueError is panicked by evalBindBuiltinV and evalBindMulti when a
+// user-supplied BuiltinFunc/MultiBuiltinFunc yields a value Dict.InternUser
 // rejects. It unwinds through evalBodyRecursiveV (which has no error return)
 // to be recovered by a caller that does: evalRules or queryInternedFacts.
 type builtinValueError struct {
@@ -280,6 +280,16 @@ func (e builtinValueError) Error() string {
 // compared numerically rather than rejected outright, so that (for example)
 // an integer literal threshold matches a fact field that happens to decode
 // as a float (or vice versa).
+//
+// NaN is unordered, per IEEE 754: any comparison involving a NaN operand
+// returns ok=false, so ordering constraints (<, >, <=, >=) evaluate false
+// against it and "!=" (which falls back to "true when unorderable") holds.
+// NaN can reach a comparison through the Go API (datalog.Float(math.NaN())
+// facts) or a user builtin returning NaN; the dict interns all NaN payloads
+// to one ID (see interned.Dict), so "=" on two NaNs is true by interned
+// identity before this function is consulted -- a deliberate deviation from
+// IEEE ("NaN != NaN") that keeps equality consistent with interning, joins,
+// and fact deduplication, which all treat the interned NaN as one value.
 func compareValues(lhs, rhs any) (int, bool) {
 	switch l := lhs.(type) {
 	case int64:
@@ -287,11 +297,20 @@ func compareValues(lhs, rhs any) (int, bool) {
 		case int64:
 			return cmp.Compare(l, r), true
 		case float64:
+			if math.IsNaN(r) {
+				return 0, false
+			}
 			return compareInt64Float64(l, r), true
 		}
 	case float64:
+		if math.IsNaN(l) {
+			return 0, false
+		}
 		switch r := rhs.(type) {
 		case float64:
+			if math.IsNaN(r) {
+				return 0, false
+			}
 			return cmp.Compare(l, r), true
 		case int64:
 			return -compareInt64Float64(r, l), true
@@ -306,15 +325,9 @@ func compareValues(lhs, rhs any) (int, bool) {
 
 // compareInt64Float64 compares an int64 and a float64 exactly, without
 // losing precision for int64 magnitudes beyond 2^53 (where float64 can no
-// longer represent every integer exactly). NaN never compares equal, less,
-// or greater in the usual sense; we treat it as unordered by placing it
-// consistently below every int64 so that == is never (incorrectly) claimed
-// and < / > remain false for it, matching float64 NaN comparison semantics
-// as closely as a total order allows.
+// longer represent every integer exactly). r must not be NaN -- NaN is
+// unordered and callers (compareValues) filter it out before ordering.
 func compareInt64Float64(l int64, r float64) int {
-	if math.IsNaN(r) {
-		return -1
-	}
 	rFloor := math.Floor(r)
 	// Compare the integral part of r against l using integer arithmetic when
 	// rFloor is within int64 range; otherwise r's magnitude alone decides.
@@ -460,10 +473,10 @@ type bodyItemKind int
 
 const (
 	bodyItemJoin      bodyItemKind = iota // match atom against facts
-	bodyItemIs                           // evaluate arithmetic expression, bind variable
-	bodyItemCompare                      // check comparison/string constraint
-	bodyItemBind                         // evaluate binding builtin
-	bodyItemBindMulti                    // evaluate multi-result binding builtin
+	bodyItemIs                            // evaluate arithmetic expression, bind variable
+	bodyItemCompare                       // check comparison/string constraint
+	bodyItemBind                          // evaluate binding builtin
+	bodyItemBindMulti                     // evaluate multi-result binding builtin
 )
 
 // compiledExpr is a pre-compiled arithmetic expression using VarSub indices.
@@ -560,12 +573,12 @@ func evalExprValueV(expr compiledExpr, sub *interned.VarSub, dict *interned.Dict
 // bodyItem is a single step in the rule body evaluation sequence.
 type bodyItem struct {
 	kind      bodyItemKind
-	atom      syntax.Atom          // original atom (for is/comparison -- needs Terms/Expr)
+	atom      syntax.Atom           // original atom (for is/comparison -- needs Terms/Expr)
 	ca        interned.CompiledAtom // pre-compiled atom (for joins and negation)
-	cExpr     compiledExpr         // pre-compiled expression (for bodyItemIs)
-	joinIdx   int                  // for bodyItemJoin: index among join items (delta tracking)
-	outVarIdx int8                 // for bodyItemIs/bodyItemBind: VarSub index of output variable (-1 if unused)
-	multiOut  int                  // for bodyItemBindMulti: number of output positions (the atom's last multiOut terms)
+	cExpr     compiledExpr          // pre-compiled expression (for bodyItemIs)
+	joinIdx   int                   // for bodyItemJoin: index among join items (delta tracking)
+	outVarIdx int8                  // for bodyItemIs/bodyItemBind: VarSub index of output variable (-1 if unused)
+	multiOut  int                   // for bodyItemBindMulti: number of output positions (the atom's last multiOut terms)
 }
 
 // compileBody classifies each atom in a rule/query body into a bodyItem,
@@ -644,6 +657,61 @@ type evaluator struct {
 	maxIter       int
 	builtins      map[string]BuiltinFunc
 	multiBuiltins map[string]multiBuiltin
+
+	// ctx and steps implement cancellation for the shared body evaluator.
+	// evalBodyRecursiveV is the innermost hot loop of every pipeline (plain
+	// rules, queries, and aggregate bodies) and threads no error return, so
+	// each entry point (evalRules, queryInternedFacts) stores its ctx here
+	// and countStep samples it every evalStepsPerCheck scanned join tuples,
+	// unwinding via the evalCancelled sentinel to a recoverEvalError defer.
+	// Sampling at the tuple scan -- not once per solution or per iteration --
+	// is what makes a single huge cross-product body (many tuples, few or
+	// many solutions) abort promptly instead of running to completion.
+	ctx   context.Context
+	steps uint
+}
+
+// evalCancelled is a sentinel panicked by evaluator.countStep to unwind
+// evalBodyRecursiveV's recursion on context cancellation without threading
+// an abort value through every recursive call and join loop.
+var evalCancelled = new(int)
+
+// evalStepsPerCheck bounds how often the evaluator samples ctx.Err(): once
+// every N scanned join tuples (and, in evalAggregates, once every N groups),
+// rather than paying a syscall-ish Err() call on every tuple.
+const evalStepsPerCheck = 1024
+
+// countStep counts one unit of evaluation work (a scanned join tuple) and
+// samples ctx every evalStepsPerCheck steps, panicking evalCancelled when
+// the context has ended. Callers must have a recoverEvalError defer between
+// themselves and the recursion (evalRules and queryInternedFacts do).
+func (ev *evaluator) countStep() {
+	ev.steps++
+	if ev.steps%evalStepsPerCheck == 0 {
+		if ev.ctx.Err() != nil {
+			panic(evalCancelled)
+		}
+	}
+}
+
+// recoverEvalError converts the two sentinel panics that unwind
+// evalBodyRecursiveV -- evalCancelled (context ended, see countStep) and
+// builtinValueError (a user builtin returned an unsupported value) -- into
+// ordinary errors at an entry point that has an error return. Any other
+// panic is re-raised. Must be installed with defer at every evaluator entry
+// point that runs the shared recursion.
+func recoverEvalError(ctx context.Context, err *error) {
+	switch r := recover(); r {
+	case nil:
+	case evalCancelled:
+		*err = ctx.Err()
+	default:
+		if bve, ok := r.(builtinValueError); ok {
+			*err = bve
+			return
+		}
+		panic(r)
+	}
 }
 
 // evalRules runs semi-naive evaluation for a set of rules to fixpoint.
@@ -652,15 +720,8 @@ type evaluator struct {
 // a value of an unsupported type (see builtinValueError); the partial
 // results are discarded in any case.
 func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existing interned.InternedFactSet, maxIter int) (factCount int, iterations int, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			if bve, ok := r.(builtinValueError); ok {
-				err = bve
-				return
-			}
-			panic(r)
-		}
-	}()
+	ev.ctx = ctx
+	defer recoverEvalError(ctx, &err)
 
 	emitted := interned.NewLightInternedFactSet()
 	delta := interned.NewLightInternedFactSet()
@@ -848,11 +909,10 @@ func (ev *evaluator) evalBindMulti(item bodyItem, sub *interned.VarSub, next fun
 			return true
 		}
 		for j, t := range outTerms {
-			nv, err := normalizeUserValue(outputs[j])
+			valID, err := ev.dict.InternUser(outputs[j])
 			if err != nil {
 				panic(builtinValueError{pred: item.atom.Pred, err: err})
 			}
-			valID := ev.dict.Intern(nv)
 			if t.VarIdx < 0 {
 				// Constant output position acts as a filter.
 				if t.ConstID != valID {
@@ -979,6 +1039,7 @@ func (ev *evaluator) evalBodyRecursiveV(
 			savedMask := sub.Mask
 			deltaFacts := delta.Get(ca.Pred, ca.Arity)
 			for i := range deltaFacts {
+				ev.countStep()
 				fact := &deltaFacts[i]
 				if !interned.MatchesBound(&dbs, fact) {
 					continue
@@ -1005,6 +1066,7 @@ func (ev *evaluator) evalBodyRecursiveV(
 			savedMask := sub.Mask
 			existScan := existing.Scan(ca.Pred, ca.Arity, &bs)
 			for i := range existScan.Len() {
+				ev.countStep()
 				fact := existScan.Fact(i)
 				if !interned.MatchesBound(&bs, fact) {
 					continue
@@ -1016,6 +1078,7 @@ func (ev *evaluator) evalBodyRecursiveV(
 			}
 			emitScan := emitted.Scan(ca.Pred, ca.Arity, &bs)
 			for i := range emitScan.Len() {
+				ev.countStep()
 				fact := emitScan.Fact(i)
 				if !interned.MatchesBound(&bs, fact) {
 					continue
@@ -1247,18 +1310,6 @@ func exprVarsBound(expr compiledExpr, boundVars uint16) bool {
 	return true
 }
 
-// queryCancelled is a sentinel panicked from queryInternedFacts' emit
-// callback to unwind evalBodyRecursiveV's recursion early on context
-// cancellation, without threading an abort return value through every
-// recursive call and join loop shared with evalRules' hot path.
-var queryCancelled = new(int)
-
-// queryTuplesPerCheck bounds how often queryInternedFacts calls ctx.Err()
-// while draining a body's solutions: once every N emitted candidate rows,
-// mirroring evalRules' once-per-iteration check rather than paying a
-// syscall-ish Err() call on every tuple.
-const queryTuplesPerCheck = 1024
-
 // queryInternedFacts evaluates a query/aggregate-rule body against a single
 // static fact set, returning results as InternedSub for compatibility with
 // aggregate grouping. It shares its atom classification (compileBody), body
@@ -1277,16 +1328,14 @@ const queryTuplesPerCheck = 1024
 // scans memFacts directly, mirroring how evalRules itself falls back to a
 // full existing/emitted scan on iteration 0.
 //
-// A large unconstrained join (e.g. an aggregate body that is itself a
-// multi-way cross product) can spend a long time inside the shared
-// evalBodyRecursiveV recursion without ever returning to a caller that could
-// observe ctx cancellation. evalBodyRecursiveV is also evalRules' innermost
-// hot loop, so it deliberately takes no ctx and gets no per-tuple check.
-// Instead, the emit callback below -- invoked once per complete body
-// solution, not per candidate tuple examined by an inner join loop --
-// samples ctx.Err() every queryTuplesPerCheck solutions and aborts the
-// recursion via a panic/recover pair local to this function.
+// Cancellation rides the evaluator's shared countStep sampling inside
+// evalBodyRecursiveV's join scans (see evaluator.ctx), so a large
+// unconstrained join -- e.g. an aggregate body that is itself a multi-way
+// cross product -- aborts promptly whether or not it is producing solutions.
 func (ev *evaluator) queryInternedFacts(ctx context.Context, body []syntax.Atom, memFacts interned.InternedFactSet) (_ []interned.InternedSub, err error) {
+	ev.ctx = ctx
+	defer recoverEvalError(ctx, &err)
+
 	items, negativeBody, _, varMap := compileBody(body, ev.dict, ev.builtins, ev.multiBuiltins)
 	items = reorderBody(items)
 
@@ -1298,31 +1347,10 @@ func (ev *evaluator) queryInternedFacts(ctx context.Context, body []syntax.Atom,
 	noDelta := interned.InternedFactSet{}
 	noEmitted := interned.InternedFactSet{}
 
-	defer func() {
-		if r := recover(); r != nil {
-			if r == queryCancelled {
-				err = ctx.Err()
-				return
-			}
-			if bve, ok := r.(builtinValueError); ok {
-				err = bve
-				return
-			}
-			panic(r)
-		}
-	}()
-
 	var results []interned.InternedSub
 	var sub interned.VarSub
-	n := 0
 	ev.evalBodyRecursiveV(items, negativeBody, varNames, -1, noDelta, memFacts, noEmitted, &sub, 0, func(vs *interned.VarSub) {
 		results = append(results, varSubToInternedSub(vs, varNames))
-		n++
-		if n%queryTuplesPerCheck == 0 {
-			if err := ctx.Err(); err != nil {
-				panic(queryCancelled)
-			}
-		}
 	})
 	return results, nil
 }

@@ -207,12 +207,7 @@ func (wb *workbench) handleConsoleQuery(w http.ResponseWriter, r *http.Request) 
 		q := ruleset.Queries[i]
 		var blk queryResultBlock
 		qErr := <-runRecovered(func() error {
-			// Hold h.mu only for the snapshot; the Transform below can
-			// run up to evalTimeout and must not freeze the other panes
-			// or the MCP tools sharing this mutex.
-			wb.h.mu.Lock()
-			snap, err := wb.h.sess.snapshotForQuery()
-			wb.h.mu.Unlock()
+			snap, err := wb.h.lockedSnapshot()
 			if err != nil {
 				return err
 			}
@@ -223,11 +218,8 @@ func (wb *workbench) handleConsoleQuery(w http.ResponseWriter, r *http.Request) 
 			return err
 		})
 		if ctx.Err() != nil {
-			msg := "evaluation timed out, results may be incomplete"
-			if ctx.Err() == context.Canceled {
-				msg = "query stopped" // user hit Stop (/cancel), not the deadline
-			}
-			wb.consoleAppend("query", "error", queryEcho(q.String()), html.Text(msg))
+			wb.consoleAppend("query", "error", queryEcho(q.String()),
+				html.Text(evalHaltStatus(ctx, "query stopped")))
 			return
 		}
 		if qErr != nil {

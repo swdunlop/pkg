@@ -203,6 +203,9 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 	var facts []datalog.Fact
 	var rules []syntax.Rule
 	for _, r := range ruleset.Rules {
+		if err := checkRuleArity(r.Head, r.Body); err != nil {
+			return nil, err
+		}
 		if r.IsFact() {
 			facts = append(facts, r.ToFact())
 		} else {
@@ -221,6 +224,9 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 		}
 	}
 	for _, ar := range ruleset.AggRules {
+		if err := checkRuleArity(ar.Head, ar.Body); err != nil {
+			return nil, err
+		}
 		if err := checkAggRuleSafety(ar, e.builtins, e.multiBuiltins, e.externals); err != nil {
 			return nil, err
 		}
@@ -414,6 +420,33 @@ func checkBodySafety(body []syntax.Atom, builtins map[string]BuiltinFunc, multiB
 // checkRuleVarLimit errors when a rule uses more distinct variables than the
 // evaluator's fixed-size substitution supports. Destructuring patterns consume
 // fresh variables for intermediates, so pattern-heavy rules can hit this.
+// checkRuleArity rejects any atom (head, fact, or body literal) wider than
+// interned.MaxFactArity. The interned representation stores fact values and
+// compiled atom terms in fixed [MaxFactArity] arrays, so this is the single
+// compile-time gate that keeps every downstream consumer
+// (CompileAtomV, HashAndGroundV, InternFact, ...) within bounds; without it
+// a wide atom compiles cleanly and panics with an index-out-of-range at
+// Transform time. Queries are covered too: they evaluate by compiling a
+// synthetic rule through this same path.
+func checkRuleArity(head syntax.Atom, body []syntax.Atom) error {
+	check := func(a syntax.Atom) error {
+		if len(a.Terms) > interned.MaxFactArity {
+			return fmt.Errorf("atom %s has arity %d, exceeds maximum %d",
+				a.Pred, len(a.Terms), interned.MaxFactArity)
+		}
+		return nil
+	}
+	if err := check(head); err != nil {
+		return err
+	}
+	for _, a := range body {
+		if err := check(a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func checkRuleVarLimit(head syntax.Atom, body []syntax.Atom) error {
 	vars := map[string]bool{}
 	addTerms := func(terms []datalog.Term) {

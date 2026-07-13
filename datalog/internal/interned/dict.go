@@ -3,6 +3,7 @@ package interned
 import (
 	"cmp"
 	"fmt"
+	"maps"
 	"math"
 	"slices"
 
@@ -38,13 +39,17 @@ type compositeKey string
 // looking terms with different identities, plus a dead index entry per
 // call. All NaN payloads canonicalize to this single zero-field struct
 // value, which does compare equal to itself, so repeated NaN interning
-// hits the index like any other value. NaN is not reachable through the
-// Datalog source language today (the lexer never produces a "nan" float
+// hits the index like any other value. NaN is not producible by the
+// Datalog source language itself (the lexer never produces a "nan" float
 // token, and `is` division-by-zero is guarded to fail rather than produce
-// NaN -- see applyBinOp/applyBinOpFloat in seminaive), but Dict.Intern is
-// also reachable directly via the Go API (e.g. a caller building a
-// datalog.Float(math.NaN()) fact by hand), so the guard sits at this entry
-// point rather than relying on every caller to avoid NaN.
+// NaN -- see applyBinOp/applyBinOpFloat in seminaive), but it can still
+// enter the dict through the Go API (a caller building a
+// datalog.Float(math.NaN()) fact by hand) or a user builtin/external
+// returning math.NaN() via InternUser, so the guard sits at this entry
+// point rather than relying on every caller to avoid NaN. Once interned,
+// NaN is one value with one ID: joins and "=" treat it as equal to itself
+// (interned identity), while ordering comparisons treat it as unordered
+// (see seminaive's compareValues).
 type nanKey struct{}
 
 // indexKey converts a value to the comparable key it is indexed under.
@@ -68,6 +73,12 @@ func indexKey(v any) any {
 // JSON-loaded numbers (always float64) match Datalog integer literals.
 // *datalog.Composite values are hash-consed by canonical encoding. All NaN
 // payloads collapse to one interned value (see nanKey).
+//
+// Intern trusts v to be one of the dict-native types (int64, float64,
+// string, datalog.ID, datalog.Bool, datalog.Null, *datalog.Composite); a
+// value of any other type is stored as-is and only fails much later, when
+// it is read back out. Values produced by user code must enter through
+// InternUser, which validates and converts at the boundary.
 func (d *Dict) Intern(v any) uint64 {
 	v = NormalizeNumeric(v)
 	key := indexKey(v)
@@ -80,25 +91,10 @@ func (d *Dict) Intern(v any) uint64 {
 	return id
 }
 
-// InternConstant interns a typed datalog.Constant, extracting its Go primitive value.
+// InternConstant interns a typed datalog.Constant, extracting its Go
+// primitive value via ConstantToAny -- the one switch over Constant kinds.
 func (d *Dict) InternConstant(c datalog.Constant) uint64 {
-	switch v := c.(type) {
-	case datalog.Float:
-		return d.Intern(float64(v))
-	case datalog.Integer:
-		return d.Intern(int64(v))
-	case datalog.String:
-		return d.Intern(string(v))
-	case datalog.ID:
-		return d.Intern(v)
-	case datalog.Bool:
-		return d.Intern(v)
-	case datalog.Null:
-		return d.Intern(v)
-	case *datalog.Composite:
-		return d.Intern(v)
-	}
-	panic("unknown constant type")
+	return d.Intern(ConstantToAny(c))
 }
 
 // ConstantToAny extracts the Go primitive from a typed datalog.Constant,
@@ -258,9 +254,7 @@ func (d *Dict) Clone() *Dict {
 	values := make([]any, len(d.values))
 	copy(values, d.values)
 	index := make(map[any]uint64, len(d.index))
-	for k, v := range d.index {
-		index[k] = v
-	}
+	maps.Copy(index, d.index)
 	return &Dict{
 		values: values,
 		index:  index,

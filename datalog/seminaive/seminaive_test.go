@@ -1043,8 +1043,8 @@ func TestExternalPredicate(t *testing.T) {
 	// Mock threat intel lookup: given IPs, return categories.
 	threatIntel := func(ctx context.Context, b seminaive.Bindings) iter.Seq[[]any] {
 		data := map[string][]string{
-			"1.2.3.4":    {"malware", "c2"},
-			"10.0.0.1":   {"scanner"},
+			"1.2.3.4":     {"malware", "c2"},
+			"10.0.0.1":    {"scanner"},
 			"192.168.1.1": {},
 		}
 		return func(yield func([]any) bool) {
@@ -1582,7 +1582,7 @@ func TestExternalGoIntNormalizesAndJoins(t *testing.T) {
 	}
 }
 
-// unsupportedExternalValue is a type normalizeUserValue cannot handle,
+// unsupportedExternalValue is a type interned.Dict.InternUser cannot handle,
 // used to verify Transform reports an error naming the offending predicate
 // instead of interning the value raw and panicking later in Facts().
 type unsupportedExternalValue struct{ X int }
