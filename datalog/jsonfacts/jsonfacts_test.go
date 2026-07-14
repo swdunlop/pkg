@@ -1004,3 +1004,62 @@ func TestConfigJSON(t *testing.T) {
 		t.Errorf("expected term name 'x', got %q", cfg2.Declarations[0].Terms[0].Name)
 	}
 }
+
+// TestNormalizeToConstantTwoTo63StaysFloat is the regression test for the
+// platform-dependent float->int64 conversion in normalizeToConstant
+// (jsonfacts/loader.go). A JSONL number beyond the int64 range
+// (9223372036854775808 == 2^63) decodes to float64 exactly 2^63, and a
+// mapping expression forwards that float64 to normalizeToConstant. The old
+// unbounded round-trip guard (int64(val); float64(i) == val) was unsound on
+// arm64: FCVTZS saturates 2^63 to MaxInt64 and float64(MaxInt64) rounds back
+// up to exactly 2^63, so the guard passed and the value silently became
+// Integer(MaxInt64) -- one off and divergent from amd64, which kept it a
+// Float. normalizeToConstant now routes through interned.NormalizeNumeric,
+// which range-checks before converting, so 2^63 stays a Float on every
+// platform.
+func TestNormalizeToConstantTwoTo63StaysFloat(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "big.jsonl", `{"id":9223372036854775808}
+`)
+	writeSchema(t, dir, map[string]any{
+		"sources": []any{
+			map[string]any{
+				"file": "big.jsonl",
+				"mappings": []any{
+					map[string]any{
+						"predicate": "big",
+						"args":      []string{"value.id"},
+					},
+				},
+			},
+		},
+	})
+
+	var cfg jsonfacts.Config
+	if err := cfg.LoadSchemaDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	db, err := cfg.LoadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var rows [][]datalog.Constant
+	for row := range db.Facts("big", 1) {
+		rows = append(rows, row)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 big fact, got %d", len(rows))
+	}
+
+	got, ok := rows[0][0].(datalog.Float)
+	if !ok {
+		t.Fatalf("expected datalog.Float for 2^63, got %T (%v) -- "+
+			"normalizeToConstant collapsed an out-of-range float to int64",
+			rows[0][0], rows[0][0])
+	}
+	const twoTo63 = 9223372036854775808.0
+	if float64(got) != twoTo63 {
+		t.Fatalf("expected Float(2^63) = %v, got %v", twoTo63, got)
+	}
+}

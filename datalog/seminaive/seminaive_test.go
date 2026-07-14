@@ -234,6 +234,172 @@ func TestArithmetic(t *testing.T) {
 	}
 }
 
+// TestIsOverflowErrors confirms that int64 +, -, and * in an is-expression
+// overflow surfaces as a Transform error rather than silently wrapping — the
+// same policy AggSum settles on. Without the fix, MaxInt64+1 wraps to
+// MinInt64 and joins as a phantom fact.
+func TestIsOverflowErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		rule string
+	}{
+		{"add", "r(R) :- v(N), R is N + 1."},
+		{"sub", "r(R) :- v(N), R is N - -1."},
+		{"mul", "r(R) :- v(N), R is N * 2."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := memory.NewBuilder()
+			b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.Integer(math.MaxInt64)}})
+			input := b.Build()
+
+			rs, err := syntax.ParseAll(tc.rule)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tr, err := seminaive.New().Compile(rs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = tr.Transform(context.Background(), input)
+			if err == nil {
+				t.Fatalf("expected an overflow error for %q, got nil", tc.rule)
+			}
+			if !strings.Contains(err.Error(), "overflow") {
+				t.Fatalf("expected overflow wording, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestIsOverflowMinInt64 covers the classic int64 overflow boundaries:
+// MinInt64 - 1 (sub) and MinInt64 * -1 (mul) both overflow, while
+// MaxInt64 + MinInt64 + 1 (add of opposite signs) does not.
+func TestIsOverflowMinInt64(t *testing.T) {
+	t.Run("sub-min", func(t *testing.T) {
+		b := memory.NewBuilder()
+		b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.Integer(math.MinInt64)}})
+		rs, err := syntax.ParseAll(`r(R) :- v(N), R is N - 1.`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr, err := seminaive.New().Compile(rs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tr.Transform(context.Background(), b.Build()); err == nil {
+			t.Fatal("expected overflow error for MinInt64 - 1, got nil")
+		}
+	})
+	t.Run("mul-min-neg-one", func(t *testing.T) {
+		b := memory.NewBuilder()
+		b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.Integer(math.MinInt64)}})
+		rs, err := syntax.ParseAll(`r(R) :- v(N), R is N * -1.`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr, err := seminaive.New().Compile(rs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tr.Transform(context.Background(), b.Build()); err == nil {
+			t.Fatal("expected overflow error for MinInt64 * -1, got nil")
+		}
+	})
+}
+
+// TestIsFloatMod confirms mod with a non-integer float operand binds a result
+// (via math.Mod) instead of silently deriving nothing. Before the fix,
+// `X is 5.5 mod 2` and `X is 5 mod 2.5` yielded zero facts with no error.
+// Whole-number results may intern as Integer via NormalizeNumeric (documented
+// dict behavior), so the check is numeric, not type-asserted.
+func TestIsFloatMod(t *testing.T) {
+	cases := []struct {
+		name    string
+		rule    string
+		factVal datalog.Constant
+		want    float64
+	}{
+		{"float-lhs", "r(R) :- v(N), R is N mod 2.", datalog.Float(5.5), 1.5},
+		{"float-rhs", "r(R) :- v(N), R is 8 mod N.", datalog.Float(2.5), 0.5},
+		{"both-float", "r(R) :- v(N), R is N mod 2.5.", datalog.Float(5.5), 0.5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := memory.NewBuilder()
+			b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{tc.factVal}})
+			input := b.Build()
+
+			rs, err := syntax.ParseAll(tc.rule)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tr, err := seminaive.New().Compile(rs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			output, err := tr.Transform(context.Background(), input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			count := 0
+			for row := range output.Facts("r", 1) {
+				var got float64
+				switch v := row[0].(type) {
+				case datalog.Float:
+					got = float64(v)
+				case datalog.Integer:
+					got = float64(v)
+				default:
+					t.Fatalf("expected numeric result, got %T: %v", row[0], row[0])
+				}
+				if math.Abs(got-tc.want) > 1e-9 {
+					t.Errorf("expected %v, got %v", tc.want, got)
+				}
+				count++
+			}
+			if count != 1 {
+				t.Fatalf("expected 1 r fact, got %d", count)
+			}
+		})
+	}
+}
+
+// TestIsIntModUnchanged confirms the existing integer mod path still works
+// after the float-mod addition and the checked-arithmetic rewrite.
+func TestIsIntModUnchanged(t *testing.T) {
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.Integer(5)}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`r(R) :- v(N), R is N mod 2.`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := seminaive.New().Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for row := range output.Facts("r", 1) {
+		got, ok := row[0].(datalog.Integer)
+		if !ok {
+			t.Fatalf("expected Integer result, got %T: %v", row[0], row[0])
+		}
+		if got != 1 {
+			t.Errorf("expected 1, got %d", got)
+		}
+		count++
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 r fact, got %d", count)
+	}
+}
+
 func TestStringContains(t *testing.T) {
 	b := memory.NewBuilder()
 	b.AddFact(datalog.Fact{Name: "msg", Terms: []datalog.Constant{datalog.String("hello world")}})

@@ -265,6 +265,34 @@ func (e builtinValueError) Error() string {
 	return fmt.Sprintf("builtin %s: %s", e.pred, e.err)
 }
 
+// arithmeticOverflowError is panicked by applyBinOp when an int64 +, -, or *
+// overflows, mirroring the overflow policy AggSum settles on (error rather
+// than silent wrap). It unwinds through evalBodyRecursiveV (which has no
+// error return) to be recovered by recoverEvalError at evalRules or
+// queryInternedFacts, so an over-overflow `is`-atom surfaces as a Transform
+// error instead of deriving a wrapped, wrong value that joins downstream.
+type arithmeticOverflowError struct {
+	op  string
+	a   int64
+	b   int64
+	err error
+}
+
+func (e arithmeticOverflowError) Error() string {
+	return fmt.Sprintf("is-expression %d %s %d: %v", e.a, e.op, e.b, e.err)
+}
+
+// Unwrap exposes the shared errInt64Overflow reason so errors.Is matches
+// both arithmetic overflow surfaces (is-expression and AggSum) without the
+// caller branching on which surface produced the error.
+func (e arithmeticOverflowError) Unwrap() error {
+	return e.err
+}
+
+// errInt64Overflow is the shared overflow reason for the int64 checked-arithmetic
+// helpers, reused by applyBinOp and AggSum so the wording stays consistent.
+var errInt64Overflow = fmt.Errorf("integer overflow: result exceeds int64 range")
+
 // compareValues compares two values, mirroring the int/float mixing that
 // applyBinOp supports for arithmetic. Mixed int64/float64 operands are
 // compared numerically rather than rejected outright, so that (for example)
@@ -404,6 +432,14 @@ func evalExprValue(expr syntax.Expr, sub interned.InternedSub, dict *interned.Di
 	return nil, false
 }
 
+// applyBinOp evaluates a binary arithmetic op on two resolved operand values.
+// Int64 +, -, and * route through the same checked-arithmetic helpers the
+// aggregate path uses (addInt64Checked/subInt64Checked/mulInt64Checked) so the
+// two paths share one overflow policy: overflow panics arithmeticOverflowError,
+// which recoverEvalError converts to a Transform error — matching AggSum's
+// loud failure rather than silently wrapping a wrong value that joins and
+// derives phantom facts. Division/mod by zero returns (nil, false) (no result
+// for these inputs), as before. Float operands dispatch to applyBinOpFloat.
 func applyBinOp(op string, lhs, rhs any) (any, bool) {
 	switch l := lhs.(type) {
 	case int64:
@@ -411,11 +447,23 @@ func applyBinOp(op string, lhs, rhs any) (any, bool) {
 		case int64:
 			switch op {
 			case "+":
-				return l + r, true
+				sum, overflow := addInt64Checked(l, r)
+				if overflow {
+					panic(arithmeticOverflowError{op: op, a: l, b: r, err: errInt64Overflow})
+				}
+				return sum, true
 			case "-":
-				return l - r, true
+				diff, overflow := subInt64Checked(l, r)
+				if overflow {
+					panic(arithmeticOverflowError{op: op, a: l, b: r, err: errInt64Overflow})
+				}
+				return diff, true
 			case "*":
-				return l * r, true
+				prod, overflow := mulInt64Checked(l, r)
+				if overflow {
+					panic(arithmeticOverflowError{op: op, a: l, b: r, err: errInt64Overflow})
+				}
+				return prod, true
 			case "/":
 				if r == 0 {
 					return nil, false
@@ -441,6 +489,11 @@ func applyBinOp(op string, lhs, rhs any) (any, bool) {
 	return nil, false
 }
 
+// applyBinOpFloat evaluates a binary op on two float64 operands. mod uses
+// math.Mod so a non-integer float operand binds a result instead of silently
+// failing (the integer int64 path keeps its own % branch above). +, -, * on
+// floats follow Go's float semantics (no overflow check: float64 overflow is
+// ±Inf, a defined value, not a wrap). Division by zero returns (nil, false).
 func applyBinOpFloat(op string, l, r float64) (any, bool) {
 	switch op {
 	case "+":
@@ -454,6 +507,11 @@ func applyBinOpFloat(op string, l, r float64) (any, bool) {
 			return nil, false
 		}
 		return l / r, true
+	case "mod":
+		if r == 0 {
+			return nil, false
+		}
+		return math.Mod(l, r), true
 	}
 	return nil, false
 }
@@ -719,10 +777,11 @@ func (ev *evaluator) countStep() {
 	}
 }
 
-// recoverEvalError converts the two sentinel panics that unwind
-// evalBodyRecursiveV -- evalCancelled (context ended, see countStep) and
-// builtinValueError (a user builtin returned an unsupported value) -- into
-// ordinary errors at an entry point that has an error return. Any other
+// recoverEvalError converts the sentinel panics that unwind
+// evalBodyRecursiveV -- evalCancelled (context ended, see countStep),
+// builtinValueError (a user builtin returned an unsupported value), and
+// arithmeticOverflowError (an int64 is-expression +, -, or * overflowed) --
+// into ordinary errors at an entry point that has an error return. Any other
 // panic is re-raised. Must be installed with defer at every evaluator entry
 // point that runs the shared recursion.
 func recoverEvalError(ctx context.Context, err *error) {
@@ -735,15 +794,20 @@ func recoverEvalError(ctx context.Context, err *error) {
 			*err = bve
 			return
 		}
+		if aoe, ok := r.(arithmeticOverflowError); ok {
+			*err = aoe
+			return
+		}
 		panic(r)
 	}
 }
 
 // evalRules runs semi-naive evaluation for a set of rules to fixpoint.
 // It returns an error if the fixpoint is not reached within maxIter
-// iterations, the context is cancelled mid-evaluation, or a builtin yields
-// a value of an unsupported type (see builtinValueError); the partial
-// results are discarded in any case.
+// iterations, the context is cancelled mid-evaluation, a builtin yields
+// a value of an unsupported type (see builtinValueError), or an int64
+// is-expression +, -, or * overflows (see arithmeticOverflowError); the
+// partial results are discarded in any case.
 func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existing interned.InternedFactSet, maxIter int) (factCount int, iterations int, err error) {
 	defer recoverEvalError(ctx, &err)
 

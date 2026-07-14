@@ -635,16 +635,25 @@ func (p *parser) parseStatement() (any, error) {
 				aggName := p.current.val
 				kind, ok := parseAggKind(aggName)
 				if ok {
+					// The lookahead genuinely matched the aggregate shape
+					// (Var = aggkind), so parseAggregateBody owns this
+					// region. A non-nil error here is the real defect
+					// (e.g. count takes no term, empty body, stray parens)
+					// and must surface directly — falling through to the
+					// comparison-body parse re-parses Var = aggkind(...)
+					// and dies at a different location, misdirecting the
+					// user. The fallback below is only for a non-aggregate
+					// Var = ident (e.g. R = X), which never reaches here
+					// because parseAggKind returned false.
 					p.advance()
-					aggRule, err := p.parseAggregateBody(head, varTok.val, kind)
-					if err == nil {
-						return aggRule, nil
-					}
+					return p.parseAggregateBody(head, varTok.val, kind)
 				}
 			}
 		}
 
-		// Not an aggregate, restore state and parse as normal rule body.
+		// Not an aggregate (no Var = aggkind shape), restore state and
+		// parse as a normal rule body, which may be a comparison like
+		// R = X.
 		*p.lex = savedLex
 		p.current = savedCurrent
 		p.prev = savedPrev

@@ -571,3 +571,69 @@ func TestParseFreshVarDoesNotCollideWithExplicitAnonName(t *testing.T) {
 		t.Fatalf("expected second term to be a Variable, got %v", q.Body[0].Terms[1])
 	}
 }
+
+// --- Bug 6: aggregate parse errors must surface from parseAggregateBody,
+// not be swallowed and re-reported as misleading comparison-body errors. ---
+
+func TestParseAggregateErrorsSurface(t *testing.T) {
+	// Each of these genuinely matches the aggregate shape (Var = aggkind)
+	// but is malformed. The real defect must surface, not a re-parse of
+	// Var = aggkind(...) as a comparison body that dies at a different spot.
+	cases := []struct {
+		src        string
+		wantSubstr string
+	}{
+		// count takes no term; the '(' after count is where ':' was expected.
+		{`p(R) :- R = count(X) : q(X).`, `expected ':'`},
+		// count with parens is the same defect.
+		{`p(R) :- R = count() : q(X).`, `expected ':'`},
+		// empty aggregate body: the ':' was consumed, then the '.' is where
+		// a predicate name was expected.
+		{`p(R) :- R = sum(X) : .`, `expected predicate name`},
+	}
+	for _, c := range cases {
+		_, err := syntax.ParseStatement(c.src)
+		if err == nil {
+			t.Errorf("%q: expected a parse error, got nil", c.src)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.wantSubstr) {
+			t.Errorf("%q: expected error containing %q, got: %v", c.src, c.wantSubstr, err)
+		}
+		// The error must point at the real defect, not at the '(' of the
+		// aggkind as the old "expected '.', got '('" misdirection did for
+		// the count cases. The swallowed-error bug reported column 18
+		// ("expected '.', got '('") for the count cases; the real error
+		// also lands at column 18 but says "expected ':'" — so we only
+		// assert the wording changed, not the column, since both are at
+		// the aggkind. The empty-body case must land at the '.', not the
+		// aggkind.
+		if strings.Contains(err.Error(), `expected '.', got "("`) {
+			t.Errorf("%q: error regressed to the swallowed comparison-body misdirection: %v", c.src, err)
+		}
+	}
+}
+
+func TestParseAggregateValidStillParses(t *testing.T) {
+	// The fix must not regress the happy path or the non-aggregate
+	// comparison fallback (Var = non-aggkind).
+	valid := `total(P, T) :- T = sum(S) : score(P, S).`
+	result, err := syntax.ParseStatement(valid)
+	if err != nil {
+		t.Fatalf("valid aggregate should parse, got: %v", err)
+	}
+	if _, ok := result.(*syntax.AggregateRule); !ok {
+		t.Fatalf("expected *AggregateRule, got %T", result)
+	}
+
+	// A non-aggregate Var = ident comparison in the body must still fall
+	// through to the comparison-body parse, not be claimed by the
+	// aggregate path.
+	rule, err := syntax.ParseStatement(`p(X) :- q(X), X = X.`)
+	if err != nil {
+		t.Fatalf("non-aggregate comparison should parse, got: %v", err)
+	}
+	if _, ok := rule.(*syntax.Rule); !ok {
+		t.Fatalf("expected *Rule, got %T", rule)
+	}
+}

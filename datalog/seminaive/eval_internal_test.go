@@ -10,11 +10,14 @@ package seminaive
 
 import (
 	"context"
+	"errors"
+	"math"
 	"strings"
 	"testing"
 
 	"swdunlop.dev/pkg/datalog"
 	"swdunlop.dev/pkg/datalog/internal/interned"
+	"swdunlop.dev/pkg/datalog/memory"
 	"swdunlop.dev/pkg/datalog/syntax"
 )
 
@@ -299,5 +302,57 @@ func TestEvalAggregatesRejectsOverArityHead(t *testing.T) {
 		t.Fatalf("expected evalAggregates to return an error for an over-arity aggregate head")
 	} else if !strings.Contains(err.Error(), "exceeds maximum") {
 		t.Fatalf("expected a labeled arity-exceeded error, got %v", err)
+	}
+}
+
+// TestInt64OverflowSharedSentinel confirms both int64 arithmetic overflow
+// paths -- the is-expression path (applyBinOp, which panics
+// arithmeticOverflowError recovered by recoverEvalError) and the AggSum path
+// (which returns an error directly) -- surface errors that satisfy
+// errors.Is(err, errInt64Overflow). The two paths share one overflow reason
+// so a caller can detect "int64 overflow" without branching on which
+// arithmetic surface produced it.
+func TestInt64OverflowSharedSentinel(t *testing.T) {
+	// is-expression path: MaxInt64 + 1 overflows via applyBinOp.
+	{
+		b := memory.NewBuilder()
+		b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.Integer(math.MaxInt64)}})
+		rs, err := syntax.ParseAll(`r(R) :- v(N), R is N + 1.`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr, err := New().Compile(rs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = tr.Transform(context.Background(), b.Build())
+		if err == nil {
+			t.Fatal("is-expression overflow: expected an error, got nil")
+		}
+		if !errors.Is(err, errInt64Overflow) {
+			t.Fatalf("is-expression overflow: errors.Is(err, errInt64Overflow) is false; got %v", err)
+		}
+	}
+
+	// AggSum path: two near-MaxInt64 values sum past the range.
+	{
+		b := memory.NewBuilder()
+		b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.String("a"), datalog.Integer(math.MaxInt64 - 1)}})
+		b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.String("b"), datalog.Integer(math.MaxInt64 - 1)}})
+		rs, err := syntax.ParseAll(`total(T) :- T = sum(X) : v(?, X).`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tr, err := New().Compile(rs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = tr.Transform(context.Background(), b.Build())
+		if err == nil {
+			t.Fatal("AggSum overflow: expected an error, got nil")
+		}
+		if !errors.Is(err, errInt64Overflow) {
+			t.Fatalf("AggSum overflow: errors.Is(err, errInt64Overflow) is false; got %v", err)
+		}
 	}
 }

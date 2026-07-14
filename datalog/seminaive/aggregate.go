@@ -156,7 +156,11 @@ func computeInternedAggregate(
 				if isInt {
 					next, overflow := addInt64Checked(sumInt, v)
 					if overflow {
-						return 0, fmt.Errorf("sum overflows int64: %d + %d", sumInt, v)
+						// Route through the shared errInt64Overflow reason so
+						// both arithmetic paths (is-expressions via applyBinOp
+						// and AggSum here) report one overflow contract and
+						// errors.Is(err, errInt64Overflow) holds for either.
+						return 0, fmt.Errorf("sum: %w: %d + %d", errInt64Overflow, sumInt, v)
 					}
 					sumInt = next
 				} else {
@@ -291,4 +295,29 @@ func addInt64Checked(a, b int64) (sum int64, overflow bool) {
 		return 0, true
 	}
 	return sum, false
+}
+
+// subInt64Checked subtracts b from a, reporting overflow instead of wrapping.
+// Overflow occurs iff a and b differ in sign and the result's sign differs
+// from a's — the mirror of addInt64Checked applied to a + (-b).
+func subInt64Checked(a, b int64) (diff int64, overflow bool) {
+	diff = a - b
+	if (a >= 0) != (b >= 0) && (diff >= 0) != (a >= 0) {
+		return 0, true
+	}
+	return diff, false
+}
+
+// mulInt64Checked multiplies a and b, reporting overflow instead of wrapping.
+// Uses the canonical round-trip check: a non-overflowing product divides back
+// by each factor exactly.
+func mulInt64Checked(a, b int64) (prod int64, overflow bool) {
+	if a == 0 || b == 0 {
+		return 0, false
+	}
+	prod = a * b
+	if prod/a != b {
+		return 0, true
+	}
+	return prod, false
 }

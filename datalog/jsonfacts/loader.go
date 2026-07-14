@@ -14,6 +14,7 @@ import (
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
 	"swdunlop.dev/pkg/datalog"
+	"swdunlop.dev/pkg/datalog/internal/interned"
 	"swdunlop.dev/pkg/datalog/memory"
 )
 
@@ -395,11 +396,27 @@ func normalizeToConstant(v any) datalog.Constant {
 	case int64:
 		return datalog.Integer(val)
 	case float64:
-		i := int64(val)
-		if float64(i) == val {
-			return datalog.Integer(i)
+		// Route through NormalizeNumeric rather than doing our own
+		// int64(val)/float64(i) round-trip: the round-trip guard is
+		// unsound for out-of-range floats because Go's float64->int64
+		// conversion is implementation-defined. On arm64, FCVTZS
+		// saturates 2^63 to MaxInt64 and float64(MaxInt64) rounds back
+		// up to exactly 2^63, so the round-trip passes and the value
+		// silently becomes Integer(MaxInt64) -- one off and divergent
+		// from amd64, which keeps it a Float. NormalizeNumeric
+		// range-checks before converting, so 2^63 stays a Float on
+		// every platform. The value is a typed datalog.Integer before
+		// it reaches the dict, so the dict's own NormalizeNumeric
+		// (which only touches float64) cannot catch it; this must land
+		// here.
+		switch n := interned.NormalizeNumeric(val).(type) {
+		case int64:
+			return datalog.Integer(n)
+		case float64:
+			return datalog.Float(n)
+		default:
+			return datalog.Float(val)
 		}
-		return datalog.Float(val)
 	case float32:
 		return datalog.Float(float64(val))
 	case bool:

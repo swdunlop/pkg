@@ -43,7 +43,8 @@
 //   - Recursive rules with fixpoint iteration
 //   - Negation (stratified)
 //   - Comparison constraints: =, !=, <, >, <=, >=
-//   - Arithmetic via 'is' atoms: +, -, *, /, mod
+//   - Arithmetic via 'is' atoms: +, -, *, /, mod (mod on float operands uses
+//     math.Mod; int64 +, -, * overflow is a Transform error, not a wrap)
 //   - String builtins: @contains, @starts_with, @ends_with, @regex_match
 //   - Aggregates: count, sum, min, max with group-by
 //   - Custom binding builtins via [WithBuiltin]
