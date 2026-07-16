@@ -3,6 +3,7 @@ package jsonfacts_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -808,6 +809,465 @@ func TestWindashMatcher(t *testing.T) {
 	}
 	if matchCount != 2 {
 		t.Errorf("expected 2 wd_contains facts, got %d", matchCount)
+	}
+}
+
+// TestWindashCaseInsensitive confirms that a case-insensitive windash
+// matcher still matches regardless of the input's case, and still reports
+// the original pattern (not the lower-cased or dash/slash-swapped variant),
+// after switching the matcher to use a precomputed lower-cased form instead
+// of re-lowering every pattern per fact scanned.
+func TestWindashCaseInsensitive(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "data.jsonl", `{"cmd":"CMD.EXE /TRANSFER data"}
+{"cmd":"cmd.exe -Transfer data"}
+{"cmd":"notepad.exe"}
+`)
+	writeSchema(t, dir, map[string]any{
+		"sources": []any{
+			map[string]any{
+				"file": "data.jsonl",
+				"mappings": []any{
+					map[string]any{
+						"predicate": "proc",
+						"args":      []string{"value.cmd"},
+					},
+				},
+			},
+		},
+		"matchers": []any{
+			map[string]any{
+				"predicate":        "proc",
+				"term":             0,
+				"windash":          true,
+				"case_insensitive": true,
+				"contains":         []string{"-transfer"},
+			},
+		},
+	})
+
+	var cfg jsonfacts.Config
+	if err := cfg.LoadSchemaDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	db, err := cfg.LoadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	matchCount := 0
+	for row := range db.Facts("ci_wd_contains", 2) {
+		pat := string(row[1].(datalog.String))
+		if pat != "-transfer" {
+			t.Errorf("expected pattern '-transfer', got %q", pat)
+		}
+		matchCount++
+	}
+	if matchCount != 2 {
+		t.Errorf("expected 2 ci_wd_contains facts (mixed-case /TRANSFER and -Transfer), got %d", matchCount)
+	}
+}
+
+// --- Bug: buildGateRegex discarded its compile error, and the
+// contains/starts_with/ends_with match branches treated a nil gate as "match
+// nothing" instead of "no pre-filter" -- so a combined gate pattern large
+// enough to exceed regexp's internal program-size limit silently disabled
+// matching entirely, with no facts emitted and no error. ---
+
+// oversizedGatePatterns builds a pattern list large enough that its combined
+// pre-filter gate regex exceeds regexp's internal program-size limit
+// (regexp.Compile returns "expression too large"), plus a trailing "needle"
+// pattern to actually match against.
+func oversizedGatePatterns() []string {
+	const total = 1 << 25
+	const per = 64
+	pats := make([]string, 0, total/per+1)
+	for i := 0; i < total/per; i++ {
+		pats = append(pats, fmt.Sprintf("%08d", i)+strings.Repeat("x", per-8))
+	}
+	pats = append(pats, "needle")
+	return pats
+}
+
+// TestMatcherGateCompileFailureFallsBackAndWarns covers all three matcher
+// kinds whose pre-filter gate shares the "gate == nil || gate.MatchString(s)"
+// fallback mechanism in applyMatchers (contains, starts_with, ends_with):
+// when the combined gate regex fails to compile, matching must fall back to
+// checking every pattern rather than silently matching nothing. Originally
+// only the contains branch was regression-tested here, so reverting either
+// of the other two branches to "gate != nil && gate.MatchString(s)" (which
+// would silently drop every match once a gate fails to compile) went
+// uncaught.
+func TestMatcherGateCompileFailureFallsBackAndWarns(t *testing.T) {
+	cases := []struct {
+		name    string
+		cmd     string // record value; "needle" must appear per the kind below
+		matcher func(pats []string) jsonfacts.Matcher
+		pred    string
+	}{
+		{
+			name: "contains",
+			cmd:  "run needle now",
+			matcher: func(pats []string) jsonfacts.Matcher {
+				return jsonfacts.Matcher{Predicate: "proc", Term: 0, Contains: pats}
+			},
+			pred: "contains",
+		},
+		{
+			name: "starts_with",
+			cmd:  "needle runs now",
+			matcher: func(pats []string) jsonfacts.Matcher {
+				return jsonfacts.Matcher{Predicate: "proc", Term: 0, StartsWith: pats}
+			},
+			pred: "starts_with",
+		},
+		{
+			name: "ends_with",
+			cmd:  "run now needle",
+			matcher: func(pats []string) jsonfacts.Matcher {
+				return jsonfacts.Matcher{Predicate: "proc", Term: 0, EndsWith: pats}
+			},
+			pred: "ends_with",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pats := oversizedGatePatterns()
+			dataFS := fstest.MapFS{
+				"data.jsonl": {Data: []byte(fmt.Sprintf(`{"cmd":%q}`, tc.cmd) + "\n")},
+			}
+			cfg := jsonfacts.Config{
+				Sources: []jsonfacts.Source{{
+					File:     "data.jsonl",
+					Mappings: []jsonfacts.Mapping{{Predicate: "proc", Args: []string{"value.cmd"}}},
+				}},
+				Matchers: []jsonfacts.Matcher{tc.matcher(pats)},
+			}
+			var warnings []error
+			cfg.OnMatcherWarning = func(err error) { warnings = append(warnings, err) }
+
+			db, err := cfg.LoadFS(dataFS)
+			if err != nil {
+				t.Fatalf("LoadFS: %v", err)
+			}
+			if len(warnings) == 0 {
+				t.Error("expected OnMatcherWarning to fire when the combined gate regex fails to compile")
+			}
+
+			matchCount := 0
+			for range db.Facts(tc.pred, 2) {
+				matchCount++
+			}
+			if matchCount == 0 {
+				t.Errorf("matcher emitted no %s facts when its pre-filter gate failed to compile; "+
+					"a gate is only a speedup and must fall back to checking every pattern, not to matching nothing", tc.pred)
+			}
+		})
+	}
+}
+
+// TestRegexGateFlagLeak is a regression test for the combined regex_match
+// gate joining raw (non-quoted) patterns with "|" directly: an inline flag
+// like "(?-i)" in one pattern changed how every later alternate in the same
+// combined expression parsed, so the gate rejected a string its own,
+// individually-compiled pattern would accept -- silently suppressing a real
+// match. Wrapping each alternate in its own non-capturing group scopes the
+// inline flag to just that alternate.
+func TestRegexGateFlagLeak(t *testing.T) {
+	dataFS := fstest.MapFS{
+		"data.jsonl": {Data: []byte(`{"cmd":"foo"}` + "\n")},
+	}
+	cfg := jsonfacts.Config{
+		Sources: []jsonfacts.Source{{
+			File:     "data.jsonl",
+			Mappings: []jsonfacts.Mapping{{Predicate: "proc", Args: []string{"value.cmd"}}},
+		}},
+		Matchers: []jsonfacts.Matcher{{
+			Predicate: "proc", Term: 0, CaseInsensitive: true,
+			// The first pattern's "(?-i)" must not affect the second
+			// pattern's case-insensitive match against "foo".
+			RegexMatch: []string{`a(?-i)b`, `FOO`},
+		}},
+	}
+	db, err := cfg.LoadFS(dataFS)
+	if err != nil {
+		t.Fatalf("LoadFS: %v", err)
+	}
+	count := 0
+	for range db.Facts("ci_regex_match", 2) {
+		count++
+	}
+	if count == 0 {
+		t.Error("expected ci_regex_match for FOO vs foo; the gate's inline-flag leak suppressed it")
+	}
+}
+
+// --- Bug: a JSONL line with trailing garbage after a valid JSON value
+// ("{...} GARBAGE") silently loaded only the leading value and dropped the
+// garbage with no error. ---
+
+func TestTrailingGarbageAfterJSONValueErrors(t *testing.T) {
+	dataFS := fstest.MapFS{
+		"data.jsonl": {Data: []byte(`{"cmd":"a"} THIS IS NOT JSON` + "\n")},
+	}
+	cfg := jsonfacts.Config{
+		Sources: []jsonfacts.Source{{
+			File:     "data.jsonl",
+			Mappings: []jsonfacts.Mapping{{Predicate: "proc", Args: []string{"value.cmd"}}},
+		}},
+	}
+	_, err := cfg.LoadFS(dataFS)
+	if err == nil {
+		t.Fatal("expected an error for trailing garbage after a JSON value on a JSONL line, got nil")
+	}
+	if !strings.Contains(err.Error(), "line 1") {
+		t.Errorf("expected the error to report line 1, got: %v", err)
+	}
+}
+
+// --- Bug: a whitespace-only JSONL line aborted the entire load with a bare
+// "EOF" error (there is no JSON value on a blank line to decode), instead of
+// being skipped like a truly empty line already was. ---
+
+func TestWhitespaceOnlyLineSkipped(t *testing.T) {
+	dataFS := fstest.MapFS{
+		"data.jsonl": {Data: []byte("{\"cmd\":\"a\"}\n   \n{\"cmd\":\"b\"}\n")},
+	}
+	cfg := jsonfacts.Config{
+		Sources: []jsonfacts.Source{{
+			File:     "data.jsonl",
+			Mappings: []jsonfacts.Mapping{{Predicate: "proc", Args: []string{"value.cmd"}}},
+		}},
+	}
+	db, err := cfg.LoadFS(dataFS)
+	if err != nil {
+		t.Fatalf("expected a whitespace-only line to be skipped, not abort the load: %v", err)
+	}
+	count := 0
+	for range db.Facts("proc", 1) {
+		count++
+	}
+	if count != 2 {
+		t.Errorf("expected 2 proc facts (whitespace-only line skipped), got %d", count)
+	}
+}
+
+// --- Bug: a UTF-8 byte order mark (EF BB BF) is not Unicode whitespace, so
+// bytes.TrimSpace does not strip it. A line containing only a BOM therefore
+// reached the JSON decoder as non-blank and aborted the load with a decode
+// error instead of being skipped like any other blank line, and a BOM
+// prepended to the first line (immediately before a valid JSON object, as
+// some JSONL producers emit) made that record fail to decode too. ---
+
+func TestBOMOnlyLineSkipped(t *testing.T) {
+	dataFS := fstest.MapFS{
+		"data.jsonl": {Data: []byte("{\"cmd\":\"a\"}\n\xEF\xBB\xBF\n{\"cmd\":\"b\"}\n")},
+	}
+	cfg := jsonfacts.Config{
+		Sources: []jsonfacts.Source{{
+			File:     "data.jsonl",
+			Mappings: []jsonfacts.Mapping{{Predicate: "proc", Args: []string{"value.cmd"}}},
+		}},
+	}
+	db, err := cfg.LoadFS(dataFS)
+	if err != nil {
+		t.Fatalf("expected a BOM-only line to be skipped, not abort the load: %v", err)
+	}
+	count := 0
+	for range db.Facts("proc", 1) {
+		count++
+	}
+	if count != 2 {
+		t.Errorf("expected 2 proc facts (BOM-only line skipped), got %d", count)
+	}
+}
+
+func TestLeadingBOMBeforeFirstRecord(t *testing.T) {
+	dataFS := fstest.MapFS{
+		"data.jsonl": {Data: []byte("\xEF\xBB\xBF{\"cmd\":\"a\"}\n{\"cmd\":\"b\"}\n")},
+	}
+	cfg := jsonfacts.Config{
+		Sources: []jsonfacts.Source{{
+			File:     "data.jsonl",
+			Mappings: []jsonfacts.Mapping{{Predicate: "proc", Args: []string{"value.cmd"}}},
+		}},
+	}
+	db, err := cfg.LoadFS(dataFS)
+	if err != nil {
+		t.Fatalf("expected a leading BOM before the first record not to abort the load: %v", err)
+	}
+	count := 0
+	for range db.Facts("proc", 1) {
+		count++
+	}
+	if count != 2 {
+		t.Errorf("expected 2 proc facts (leading BOM stripped from the first record), got %d", count)
+	}
+}
+
+// --- Bug: a mapping's filter/arg expression that fails to evaluate (e.g. a
+// field-name typo) silently dropped the record's fact with no indication
+// why. OnMappingError mirrors OnTypeError, giving a caller a hook to observe
+// these otherwise-silent drops. ---
+
+func TestOnMappingErrorFiresOnArgEvalError(t *testing.T) {
+	dataFS := fstest.MapFS{
+		"data.jsonl": {Data: []byte(`{"cmd":"a"}` + "\n")},
+	}
+	cfg := jsonfacts.Config{
+		Sources: []jsonfacts.Source{{
+			File: "data.jsonl",
+			Mappings: []jsonfacts.Mapping{{
+				Predicate: "proc",
+				// Indexing past the end of a string is a runtime error in
+				// expr (unlike a missing map key, which just yields nil),
+				// so this reliably fails to evaluate.
+				Args: []string{"value.cmd[5]"},
+			}},
+		}},
+	}
+	var mappingErrs []error
+	cfg.OnMappingError = func(err error) { mappingErrs = append(mappingErrs, err) }
+
+	db, err := cfg.LoadFS(dataFS)
+	if err != nil {
+		t.Fatalf("LoadFS: %v", err)
+	}
+	if len(mappingErrs) == 0 {
+		t.Error("expected OnMappingError to fire for the arg expression evaluation failure")
+	}
+	count := 0
+	for range db.Facts("proc", 1) {
+		count++
+	}
+	if count != 0 {
+		t.Errorf("expected 0 proc facts (arg eval failed), got %d", count)
+	}
+}
+
+func TestOnMappingErrorFiresOnFilterEvalError(t *testing.T) {
+	dataFS := fstest.MapFS{
+		"data.jsonl": {Data: []byte(`{"cmd":"a"}` + "\n")},
+	}
+	cfg := jsonfacts.Config{
+		Sources: []jsonfacts.Source{{
+			File: "data.jsonl",
+			Mappings: []jsonfacts.Mapping{{
+				Predicate: "proc",
+				Args:      []string{"value.cmd"},
+				// Indexing past the end of a string is a runtime error in
+				// expr, so this filter reliably fails to evaluate.
+				Filter: "value.cmd[5] == \"z\"",
+			}},
+		}},
+	}
+	var mappingErrs []error
+	cfg.OnMappingError = func(err error) { mappingErrs = append(mappingErrs, err) }
+
+	db, err := cfg.LoadFS(dataFS)
+	if err != nil {
+		t.Fatalf("LoadFS: %v", err)
+	}
+	if len(mappingErrs) == 0 {
+		t.Error("expected OnMappingError to fire for the filter expression evaluation failure")
+	}
+	count := 0
+	for range db.Facts("proc", 1) {
+		count++
+	}
+	if count != 0 {
+		t.Errorf("expected 0 proc facts (filter eval failed), got %d", count)
+	}
+}
+
+// --- Bug: neither of the above tests actually covered the case the
+// OnMappingError doc comment advertised as its motivating example: a
+// field-name typo. expr-lang does not raise an error for a map field access
+// that misses -- value.usrname against a record whose only field is
+// "username" simply evaluates to nil, not an error -- so an arg expression
+// with a typo silently emitted a fact with a Null term, and a filter
+// expression with a typo (value.usrname == "bob") silently evaluated to a
+// real `false` some of the time but, used bare (no comparison), coerced to
+// false at the VM level via expr.AsBool() with no observable signal at all.
+// These are the exact typo scenarios OnMappingError needs to catch. ---
+
+func TestOnMappingErrorFiresOnArgFieldNameTypo(t *testing.T) {
+	dataFS := fstest.MapFS{
+		"data.jsonl": {Data: []byte(`{"username":"alice"}` + "\n")},
+	}
+	cfg := jsonfacts.Config{
+		Sources: []jsonfacts.Source{{
+			File: "data.jsonl",
+			Mappings: []jsonfacts.Mapping{{
+				Predicate: "user",
+				// "usrname" is a typo for the record's actual field,
+				// "username". expr-lang evaluates a missing map key to nil
+				// without erroring, so this must be caught some other way.
+				Args: []string{"value.usrname"},
+			}},
+		}},
+	}
+	var mappingErrs []error
+	cfg.OnMappingError = func(err error) { mappingErrs = append(mappingErrs, err) }
+
+	db, err := cfg.LoadFS(dataFS)
+	if err != nil {
+		t.Fatalf("LoadFS: %v", err)
+	}
+	if len(mappingErrs) == 0 {
+		t.Fatal("expected OnMappingError to fire for the arg field-name typo (value.usrname evaluating to nil)")
+	}
+
+	// The Null term is still emitted -- this is about observability, not a
+	// behavior change.
+	count := 0
+	for terms := range db.Facts("user", 1) {
+		count++
+		if _, ok := terms[0].(datalog.Null); !ok {
+			t.Errorf("expected the mistyped arg to still emit a Null term, got %#v", terms[0])
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected 1 user fact with a Null term, got %d", count)
+	}
+}
+
+func TestOnMappingErrorFiresOnFilterFieldNameTypo(t *testing.T) {
+	dataFS := fstest.MapFS{
+		"data.jsonl": {Data: []byte(`{"username":"alice"}` + "\n")},
+	}
+	cfg := jsonfacts.Config{
+		Sources: []jsonfacts.Source{{
+			File: "data.jsonl",
+			Mappings: []jsonfacts.Mapping{{
+				Predicate: "user",
+				Args:      []string{"value.username"},
+				// Same typo, used bare as a filter: no comparison operator
+				// around it, so the filter's actual runtime result is nil
+				// itself (not a bool derived from comparing against nil),
+				// exercising the non-bool-result path rather than the
+				// nil-comparison-happens-to-be-false path.
+				Filter: "value.usrname",
+			}},
+		}},
+	}
+	var mappingErrs []error
+	cfg.OnMappingError = func(err error) { mappingErrs = append(mappingErrs, err) }
+
+	db, err := cfg.LoadFS(dataFS)
+	if err != nil {
+		t.Fatalf("LoadFS: %v", err)
+	}
+	if len(mappingErrs) == 0 {
+		t.Fatal("expected OnMappingError to fire for the filter field-name typo (value.usrname evaluating to non-bool nil)")
+	}
+	count := 0
+	for range db.Facts("user", 1) {
+		count++
+	}
+	if count != 0 {
+		t.Errorf("expected 0 user facts (filter evaluated to nil, treated as no-match), got %d", count)
 	}
 }
 

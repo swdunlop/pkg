@@ -190,6 +190,59 @@ func TestDesugaredRuleStringReparses(t *testing.T) {
 	}
 }
 
+// --- Bug: {} desugared to no constraint atoms at all, so it matched any
+// value (not just objects), unlike [] which correctly emits @json_len. ---
+
+func TestEmptyObjectPatternConstrainsType(t *testing.T) {
+	r := parseRule(t, `none(P) :- ev(P, {}).`)
+	want := `ev(P, ?0), @json_type(?0, "object")`
+	if got := bodyString(r); got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}
+
+func TestEmptyObjectPatternNested(t *testing.T) {
+	// {} must still constrain when nested inside another pattern, not just
+	// at the top level of an atom's argument.
+	r := parseRule(t, `x(N) :- ev(P, {meta: {}}), meta(P, N).`)
+	want := `ev(P, ?0), @json_get(?0, "meta", ?1), @json_type(?1, "object"), meta(P, N)`
+	if got := bodyString(r); got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}
+
+// --- Bug: array patterns silently accepted elements with no comma
+// separator, e.g. [X Y] parsed the same as [X, Y]. ---
+
+func TestArrayPatternRequiresComma(t *testing.T) {
+	_, err := syntax.ParseStatement(`q(X) :- p([X Y]).`)
+	if err == nil {
+		t.Fatal("expected a parse error for a missing comma in an array pattern, got nil")
+	}
+	if !strings.Contains(err.Error(), "','") {
+		t.Errorf("expected the error to mention the missing comma, got: %v", err)
+	}
+}
+
+func TestArrayPatternWithCommaStillParses(t *testing.T) {
+	// Control: the comma-separated form must still work.
+	r := parseRule(t, `q(X, Y) :- p([X, Y]).`)
+	want := `p(?0), @json_get(?0, 0, X), @json_get(?0, 1, Y), @json_len(?0, 2)`
+	if got := bodyString(r); got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}
+
+// Object patterns require commas between fields too; confirm that already
+// works (a missing comma there falls through to "expected '}'", which is a
+// correct rejection even though the message differs from the array case).
+func TestObjectPatternMissingCommaRejected(t *testing.T) {
+	_, err := syntax.ParseStatement(`q(X, Y) :- p({a: X b: Y}).`)
+	if err == nil {
+		t.Fatal("expected a parse error for a missing comma in an object pattern, got nil")
+	}
+}
+
 func TestFreshVarsDoNotCollideWithAnon(t *testing.T) {
 	r := parseRule(t, `x(A) :- p(?, {k: A}), q(?).`)
 	// All parser-generated variables must be distinct.

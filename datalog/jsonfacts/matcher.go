@@ -1,6 +1,7 @@
 package jsonfacts
 
 import (
+	"fmt"
 	"net/netip"
 	"regexp"
 	"strings"
@@ -45,10 +46,14 @@ type compiledMatcher struct {
 	cidrIPGate      *regexp.Regexp
 }
 
-// windashEntry maps a match variant back to its original pattern for emission.
+// windashEntry maps a match variant back to its original pattern for
+// emission. matchLower is precomputed at compile time (rather than
+// lower-cased per fact scanned) since a case-insensitive windash matcher
+// otherwise re-lowers every pattern for every fact it checks.
 type windashEntry struct {
-	match    string
-	original string
+	match      string
+	matchLower string
+	original   string
 }
 
 // matchPred builds a predicate name with modifier prefixes.
@@ -79,9 +84,9 @@ func expandWindash(pattern string) (string, bool) {
 func buildWindashEntries(patterns []string) []windashEntry {
 	var entries []windashEntry
 	for _, p := range patterns {
-		entries = append(entries, windashEntry{match: p, original: p})
+		entries = append(entries, windashEntry{match: p, matchLower: strings.ToLower(p), original: p})
 		if alt, ok := expandWindash(p); ok {
-			entries = append(entries, windashEntry{match: alt, original: p})
+			entries = append(entries, windashEntry{match: alt, matchLower: strings.ToLower(alt), original: p})
 		}
 	}
 	return entries
@@ -95,7 +100,17 @@ func windashMatchPatterns(entries []windashEntry) []string {
 	return out
 }
 
-func compileMatchers(matchers []Matcher) ([]compiledMatcher, error) {
+// compileMatchers compiles matcher configs into their runtime form. onWarning,
+// if non-nil, is called for each non-fatal issue encountered while compiling
+// pre-filter gates -- currently, a combined gate regex that fails to compile
+// (e.g. because it exceeds regexp's internal program-size limit for a very
+// large pattern list). A gate is only a prefilter: matching still runs the
+// real per-pattern checks (strings.Contains, strings.HasPrefix, ...), so a
+// gate that fails to build must fall back to "no prefilter" (checking every
+// fact) rather than either silently matching nothing or aborting the whole
+// load, both of which would be wrong for a component whose only job is an
+// optional speedup.
+func compileMatchers(matchers []Matcher, onWarning func(error)) ([]compiledMatcher, error) {
 	compiled := make([]compiledMatcher, len(matchers))
 	for i, mc := range matchers {
 		cm := compiledMatcher{
@@ -110,13 +125,27 @@ func compileMatchers(matchers []Matcher) ([]compiledMatcher, error) {
 
 		ci := mc.CaseInsensitive
 
+		warnGate := func(kind string, err error) {
+			if onWarning == nil {
+				return
+			}
+			onWarning(fmt.Errorf("matcher %d (%s): %s pre-filter regex failed to compile, falling back to unfiltered matching: %w", i, mc.Predicate, kind, err))
+		}
+
 		if len(mc.Contains) > 0 {
 			cm.containsPatterns = mc.Contains
+			var patterns []string
 			if mc.Windash {
 				cm.containsWindash = buildWindashEntries(mc.Contains)
-				cm.containsGate = buildGateRegex(windashMatchPatterns(cm.containsWindash), "", "", ci)
+				patterns = windashMatchPatterns(cm.containsWindash)
 			} else {
-				cm.containsGate = buildGateRegex(mc.Contains, "", "", ci)
+				patterns = mc.Contains
+			}
+			gate, err := buildGateRegex(patterns, "", "", ci)
+			if err != nil {
+				warnGate("contains", err)
+			} else {
+				cm.containsGate = gate
 			}
 			if ci {
 				cm.containsLower = lowerAll(mc.Contains)
@@ -124,11 +153,18 @@ func compileMatchers(matchers []Matcher) ([]compiledMatcher, error) {
 		}
 		if len(mc.StartsWith) > 0 {
 			cm.startsWithPatterns = mc.StartsWith
+			var patterns []string
 			if mc.Windash {
 				cm.startsWithWindash = buildWindashEntries(mc.StartsWith)
-				cm.startsWithGate = buildGateRegex(windashMatchPatterns(cm.startsWithWindash), "^(?:", ")", ci)
+				patterns = windashMatchPatterns(cm.startsWithWindash)
 			} else {
-				cm.startsWithGate = buildGateRegex(mc.StartsWith, "^(?:", ")", ci)
+				patterns = mc.StartsWith
+			}
+			gate, err := buildGateRegex(patterns, "^(?:", ")", ci)
+			if err != nil {
+				warnGate("starts_with", err)
+			} else {
+				cm.startsWithGate = gate
 			}
 			if ci {
 				cm.startsWithLower = lowerAll(mc.StartsWith)
@@ -136,7 +172,12 @@ func compileMatchers(matchers []Matcher) ([]compiledMatcher, error) {
 		}
 		if len(mc.EndsWith) > 0 {
 			cm.endsWithPatterns = mc.EndsWith
-			cm.endsWithGate = buildGateRegex(mc.EndsWith, "(?:", ")$", ci)
+			gate, err := buildGateRegex(mc.EndsWith, "(?:", ")$", ci)
+			if err != nil {
+				warnGate("ends_with", err)
+			} else {
+				cm.endsWithGate = gate
+			}
 			if ci {
 				cm.endsWithLower = lowerAll(mc.EndsWith)
 			}
@@ -154,15 +195,30 @@ func compileMatchers(matchers []Matcher) ([]compiledMatcher, error) {
 				}
 				cm.regexMatchCompiled[j] = re
 			}
-			combined := strings.Join(mc.RegexMatch, "|")
+			// Each alternate is wrapped in its own non-capturing group
+			// before joining: without this, an inline flag such as
+			// "(?-i)" in one pattern is not scoped to that pattern -- it
+			// changes how every later alternate in the combined
+			// alternation parses (Go's regexp/syntax, like Perl, scopes an
+			// inline flag to the rest of its *enclosing group*, which
+			// without wrapping is the whole combined expression). A
+			// prefilter gate must never reject a string that the real,
+			// individually-compiled pattern (regexMatchCompiled, compiled
+			// and applied to each pattern separately above) would accept.
+			wrapped := make([]string, len(mc.RegexMatch))
+			for j, p := range mc.RegexMatch {
+				wrapped[j] = "(?:" + p + ")"
+			}
+			combined := strings.Join(wrapped, "|")
 			if ci {
 				combined = "(?i)" + combined
 			}
 			re, err := regexp.Compile(combined)
 			if err != nil {
-				re = nil
+				warnGate("regex_match", err)
+			} else {
+				cm.regexMatchGate = re
 			}
-			cm.regexMatchGate = re
 		}
 
 		var allBase64 []base64Variant
@@ -178,7 +234,12 @@ func compileMatchers(matchers []Matcher) ([]compiledMatcher, error) {
 			for _, bv := range allBase64 {
 				allSearch = append(allSearch, bv.searchStrings...)
 			}
-			cm.base64Gate = buildGateRegex(allSearch, "", "", false)
+			gate, err := buildGateRegex(allSearch, "", "", false)
+			if err != nil {
+				warnGate("base64", err)
+			} else {
+				cm.base64Gate = gate
+			}
 		}
 
 		if len(mc.CIDR) > 0 {
@@ -199,7 +260,16 @@ func compileMatchers(matchers []Matcher) ([]compiledMatcher, error) {
 	return compiled, nil
 }
 
-func buildGateRegex(patterns []string, prefix, suffix string, caseInsensitive bool) *regexp.Regexp {
+// buildGateRegex builds a combined pre-filter regex matching any of patterns.
+// Every pattern is regexp.QuoteMeta'd, so none of them can contribute an
+// unescaped '(', '|', or '?' that would let one alternate's syntax bleed
+// into another's -- unlike the raw (non-literal) patterns joined for the
+// regex_match gate, this join is safe without per-alternate grouping. The
+// error return must not be discarded by the caller: a gate is only a
+// prefilter, so a compile failure (e.g. exceeding regexp's internal
+// program-size limit for a very large pattern list) should fall back to no
+// prefilter rather than silently matching nothing.
+func buildGateRegex(patterns []string, prefix, suffix string, caseInsensitive bool) (*regexp.Regexp, error) {
 	quoted := make([]string, len(patterns))
 	for i, p := range patterns {
 		quoted[i] = regexp.QuoteMeta(p)
@@ -208,8 +278,7 @@ func buildGateRegex(patterns []string, prefix, suffix string, caseInsensitive bo
 	if caseInsensitive {
 		e = "(?i)" + e
 	}
-	re, _ := regexp.Compile(e)
-	return re
+	return regexp.Compile(e)
 }
 
 func lowerAll(ss []string) []string {
@@ -220,9 +289,11 @@ func lowerAll(ss []string) []string {
 	return out
 }
 
-// applyMatchers scans facts for matching predicates and emits derived match facts.
-func applyMatchers(facts []datalog.Fact, matchers []Matcher) ([]datalog.Fact, error) {
-	compiled, err := compileMatchers(matchers)
+// applyMatchers scans facts for matching predicates and emits derived match
+// facts. onWarning, if non-nil, receives non-fatal issues encountered while
+// compiling matcher pre-filter gates; see compileMatchers.
+func applyMatchers(facts []datalog.Fact, matchers []Matcher, onWarning func(error)) ([]datalog.Fact, error) {
+	compiled, err := compileMatchers(matchers, onWarning)
 	if err != nil {
 		return nil, err
 	}
@@ -272,11 +343,17 @@ func applyMatchers(facts []datalog.Fact, matchers []Matcher) ([]datalog.Fact, er
 			}
 
 			// --- Contains ---
-			if cm.containsGate != nil && cm.containsGate.MatchString(s) {
+			// A nil gate means "no pre-filter compiled" (either there was
+			// nothing to gate on, or the combined gate regex failed to
+			// build and compileMatchers already reported that via
+			// onWarning) -- it must never be treated as "match nothing",
+			// since the gate is only a speedup over the per-pattern checks
+			// below, not a correctness requirement.
+			if cm.containsGate == nil || cm.containsGate.MatchString(s) {
 				if cm.containsWindash != nil {
 					for _, we := range cm.containsWindash {
 						if cm.caseInsensitive {
-							if strings.Contains(sLower, strings.ToLower(we.match)) {
+							if strings.Contains(sLower, we.matchLower) {
 								emit(cm.containsPred, s, we.original)
 							}
 						} else {
@@ -301,11 +378,11 @@ func applyMatchers(facts []datalog.Fact, matchers []Matcher) ([]datalog.Fact, er
 			}
 
 			// --- StartsWith ---
-			if cm.startsWithGate != nil && cm.startsWithGate.MatchString(s) {
+			if cm.startsWithGate == nil || cm.startsWithGate.MatchString(s) {
 				if cm.startsWithWindash != nil {
 					for _, we := range cm.startsWithWindash {
 						if cm.caseInsensitive {
-							if strings.HasPrefix(sLower, strings.ToLower(we.match)) {
+							if strings.HasPrefix(sLower, we.matchLower) {
 								emit(cm.startsWithPred, s, we.original)
 							}
 						} else {
@@ -330,7 +407,7 @@ func applyMatchers(facts []datalog.Fact, matchers []Matcher) ([]datalog.Fact, er
 			}
 
 			// --- EndsWith ---
-			if cm.endsWithGate != nil && cm.endsWithGate.MatchString(s) {
+			if cm.endsWithGate == nil || cm.endsWithGate.MatchString(s) {
 				if cm.caseInsensitive {
 					for j, p := range cm.endsWithPatterns {
 						if strings.HasSuffix(sLower, cm.endsWithLower[j]) {

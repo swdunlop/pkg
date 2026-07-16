@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"swdunlop.dev/pkg/datalog"
 )
@@ -15,6 +16,7 @@ const (
 	tokEOF                tokenKind = iota
 	tokError                        // unrecognized or incomplete token; val holds the offending text
 	tokUnterminatedString           // "... with no closing quote before EOF; pos is where the string started
+	tokInvalidEscape                // "...\x..." with a malformed or unknown escape; val holds a message
 	tokIdent                        // identifier (predicate name or variable, depending on context)
 	tokAnon                         // ? (anonymous variable)
 	tokString                       // "quoted string"
@@ -317,19 +319,75 @@ func (l *lexer) readString() token {
 			return token{kind: tokUnterminatedString, val: l.input[start:l.pos], pos: start}
 		}
 		if b == '\\' && l.pos < len(l.input) {
+			escStart := l.pos - 1
 			next := l.advance()
 			switch next {
 			case 'n':
 				buf.WriteByte('\n')
 			case 't':
 				buf.WriteByte('\t')
+			case 'r':
+				buf.WriteByte('\r')
+			case 'a':
+				buf.WriteByte('\a')
+			case 'b':
+				buf.WriteByte('\b')
+			case 'f':
+				buf.WriteByte('\f')
+			case 'v':
+				buf.WriteByte('\v')
 			case '\\':
 				buf.WriteByte('\\')
 			case '"':
 				buf.WriteByte('"')
+			case 'x':
+				// \xHH: exactly two hex digits, a raw byte. This is what
+				// strconv.Quote (and so datalog.String.String, which prints
+				// with %q) emits for a byte that is not valid, printable
+				// UTF-8 -- including bytes >= 0x80 that are themselves
+				// invalid UTF-8, so writing the raw byte back (rather than
+				// encoding it as a rune) is required to round-trip a String
+				// that holds invalid UTF-8.
+				v, ok := l.readHexDigits(2)
+				if !ok {
+					return token{kind: tokInvalidEscape, val: `\x escape requires 2 hex digits`, pos: escStart}
+				}
+				buf.WriteByte(byte(v))
+			case 'u':
+				// \uNNNN: exactly four hex digits naming a Unicode code point.
+				v, ok := l.readHexDigits(4)
+				if !ok {
+					return token{kind: tokInvalidEscape, val: `\u escape requires 4 hex digits`, pos: escStart}
+				}
+				r := rune(v)
+				if !utf8.ValidRune(r) {
+					return token{kind: tokInvalidEscape, val: fmt.Sprintf(`\u%04x is not a valid unicode code point`, v), pos: escStart}
+				}
+				buf.WriteRune(r)
+			case 'U':
+				// \UNNNNNNNN: exactly eight hex digits naming a Unicode code point.
+				v, ok := l.readHexDigits(8)
+				if !ok {
+					return token{kind: tokInvalidEscape, val: `\U escape requires 8 hex digits`, pos: escStart}
+				}
+				if v > utf8.MaxRune {
+					return token{kind: tokInvalidEscape, val: fmt.Sprintf(`\U%08x exceeds the maximum unicode code point`, v), pos: escStart}
+				}
+				r := rune(v)
+				if !utf8.ValidRune(r) {
+					return token{kind: tokInvalidEscape, val: fmt.Sprintf(`\U%08x is not a valid unicode code point`, v), pos: escStart}
+				}
+				buf.WriteRune(r)
 			default:
-				buf.WriteByte('\\')
-				buf.WriteByte(next)
+				// Every other backslash sequence is rejected rather than
+				// passed through literally: silently keeping "\q" as the two
+				// characters '\' 'q' means a value containing a real "\q"
+				// and a value containing an unrecognized escape both parse
+				// to the same string, and it lets any escape this lexer
+				// doesn't know about corrupt round-tripped values (bug: a
+				// datalog.String printed via %q and re-parsed must produce
+				// the original value byte-for-byte).
+				return token{kind: tokInvalidEscape, val: fmt.Sprintf(`unknown escape sequence \%c`, next), pos: escStart}
 			}
 			continue
 		}
@@ -339,6 +397,37 @@ func (l *lexer) readString() token {
 	// the position where the string started so callers can find the
 	// dangling '"' rather than pairing it with a later, unrelated quote.
 	return token{kind: tokUnterminatedString, val: l.input[start:l.pos], pos: start}
+}
+
+// readHexDigits reads exactly n hexadecimal digits starting at l.pos and
+// returns their value, advancing l.pos past them. ok is false (and l.pos is
+// left unchanged) if fewer than n hex digits are available.
+func (l *lexer) readHexDigits(n int) (uint32, bool) {
+	if l.pos+n > len(l.input) {
+		return 0, false
+	}
+	var v uint32
+	for i := 0; i < n; i++ {
+		h, ok := hexDigitVal(l.input[l.pos+i])
+		if !ok {
+			return 0, false
+		}
+		v = v<<4 | uint32(h)
+	}
+	l.pos += n
+	return v, true
+}
+
+func hexDigitVal(b byte) (uint32, bool) {
+	switch {
+	case b >= '0' && b <= '9':
+		return uint32(b - '0'), true
+	case b >= 'a' && b <= 'f':
+		return uint32(b-'a') + 10, true
+	case b >= 'A' && b <= 'F':
+		return uint32(b-'A') + 10, true
+	}
+	return 0, false
 }
 
 func (l *lexer) readNumber() token {
@@ -420,18 +509,48 @@ func (p *parser) expect(kind tokenKind) (token, error) {
 	return p.advance(), nil
 }
 
+// expectStatementEnd is like expect, but for the token that terminates a
+// statement (the '.' closing a fact/rule/aggregate, or the '?' closing a
+// query). It resets the lexer's expression-context tracking before lexing
+// the token that follows, so that tracking -- which canEndExpr consults to
+// decide whether a following '-' is a subtraction operator or a numeric
+// sign -- cannot leak across a statement boundary.
+//
+// Without this, "p(1)? -2 < X?" fails to parse: the lexer only ever tracks
+// the kind of the immediately preceding token, and tokAnon (the query
+// terminator '?') is also the token kind used for an anonymous variable
+// inside an expression, which canEndExpr says can end an expression. So the
+// '-' immediately after the first query's terminating '?' was read as a
+// binary minus rather than a numeric sign, even though nothing survives
+// from the finished statement to subtract from. A fresh statement must
+// always start in the same "start of expression" context as the very
+// beginning of the input.
+func (p *parser) expectStatementEnd(kind tokenKind) (token, error) {
+	if isErrorTok(p.current.kind) {
+		return token{}, p.errorTok(p.current)
+	}
+	if p.current.kind != kind {
+		return token{}, p.errorf(p.current.pos, "expected %v, got %q", kindName(kind), p.current.val)
+	}
+	p.lex.hasPrev = false
+	return p.advance(), nil
+}
+
 // isErrorTok reports whether a token kind represents a lexical error that
 // should short-circuit parsing with a positioned error.
 func isErrorTok(k tokenKind) bool {
-	return k == tokError || k == tokUnterminatedString
+	return k == tokError || k == tokUnterminatedString || k == tokInvalidEscape
 }
 
 // errorTok reports a lexer error token (an unrecognized/incomplete
-// character sequence, or an unterminated string) as a positioned parse
-// error.
+// character sequence, an unterminated string, or a malformed string escape)
+// as a positioned parse error.
 func (p *parser) errorTok(tok token) error {
-	if tok.kind == tokUnterminatedString {
+	switch tok.kind {
+	case tokUnterminatedString:
 		return p.errorf(tok.pos, "unterminated string")
+	case tokInvalidEscape:
+		return p.errorf(tok.pos, "%s", tok.val)
 	}
 	return p.errorf(tok.pos, "unrecognized character %q", tok.val)
 }
@@ -587,11 +706,15 @@ func (p *parser) parseStatement() (any, error) {
 		if err := p.validateHeadAtom(head, headPos); err != nil {
 			return nil, err
 		}
-		p.advance()
+		if _, err := p.expectStatementEnd(tokDot); err != nil {
+			return nil, err
+		}
 		return &Rule{Head: head}, nil
 	case tokAnon:
 		// single-atom query: atom?
-		p.advance()
+		if _, err := p.expectStatementEnd(tokAnon); err != nil {
+			return nil, err
+		}
 		return &Query{Body: append([]Atom{head}, headGetters...)}, nil
 	case tokComma:
 		// multi-atom query: atom, atom, ...?
@@ -605,7 +728,7 @@ func (p *parser) parseStatement() (any, error) {
 			atoms = append(atoms, a)
 			atoms = append(atoms, p.takeGetters()...)
 		}
-		if _, err := p.expect(tokAnon); err != nil {
+		if _, err := p.expectStatementEnd(tokAnon); err != nil {
 			return nil, err
 		}
 		return &Query{Body: atoms}, nil
@@ -664,7 +787,7 @@ func (p *parser) parseStatement() (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := p.expect(tokDot); err != nil {
+	if _, err := p.expectStatementEnd(tokDot); err != nil {
 		return nil, err
 	}
 	return &Rule{Head: head, Body: body}, nil
@@ -714,7 +837,7 @@ func (p *parser) parseAggregateBody(head Atom, resultVar string, kind AggregateK
 	if err != nil {
 		return nil, err
 	}
-	if _, err := p.expect(tokDot); err != nil {
+	if _, err := p.expectStatementEnd(tokDot); err != nil {
 		return nil, err
 	}
 	return &AggregateRule{
@@ -903,6 +1026,19 @@ func (p *parser) parseObjectPattern(obj datalog.Term) error {
 	if _, err := p.expect(tokLBrace); err != nil {
 		return err
 	}
+	if p.current.kind == tokRBrace {
+		// {} has no fields to desugar into @json_get getters, but it must
+		// still constrain obj to actually be an object -- otherwise it
+		// desugars to no constraint atoms at all and matches any value,
+		// the same way [] would match any value if it didn't emit
+		// @json_len(obj, 0) below. @json_type is the general is-a-kind
+		// builtin (@json_type(V, "object"|"array"|"string"|...)), so reuse
+		// it here rather than inventing a dedicated is-object builtin.
+		p.getters = append(p.getters, Atom{
+			Pred:  "@json_type",
+			Terms: []datalog.Term{obj, datalog.String("object")},
+		})
+	}
 	for p.current.kind != tokRBrace {
 		var key string
 		switch p.current.kind {
@@ -968,6 +1104,14 @@ func (p *parser) parseArrayPattern(obj datalog.Term) error {
 				return err
 			}
 			rest = t
+		case tokRBracket:
+			// loop condition below ends the loop; nothing to consume.
+		default:
+			// Anything else (e.g. a second element with no separating
+			// comma, as in [X Y]) must be rejected rather than silently
+			// accepted as the next element -- an omitted comma is a typo,
+			// not an alternate array syntax.
+			return p.errorf(p.current.pos, "expected ',', '|', or ']' in array pattern, got %q", p.current.val)
 		}
 	}
 	if _, err := p.expect(tokRBracket); err != nil {

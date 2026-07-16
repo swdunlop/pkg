@@ -637,3 +637,130 @@ func TestParseAggregateValidStillParses(t *testing.T) {
 		t.Fatalf("expected *Rule, got %T", rule)
 	}
 }
+
+// --- Bug: a statement terminator ('.' or '?') must reset the lexer's
+// sign-disambiguation state, so a following '-' at the start of the next
+// statement is always read as a numeric sign, never leaked-in subtraction. ---
+
+func TestParseMinusAfterQueryTerminatorIsSign(t *testing.T) {
+	// This must parse exactly like the standalone form below: '-2' is a
+	// negative literal, not "(garbage) - 2".
+	if _, err := syntax.ParseAll(`-2 < X?`); err != nil {
+		t.Fatalf("standalone '-2 < X?' should parse, got: %v", err)
+	}
+	rs, err := syntax.ParseAll(`p(1)? -2 < X?`)
+	if err != nil {
+		t.Fatalf("'-2 < X?' after another query's '?' terminator should parse, got: %v", err)
+	}
+	if len(rs.Queries) != 2 {
+		t.Fatalf("expected 2 queries, got %d: %+v", len(rs.Queries), rs)
+	}
+	second := rs.Queries[1]
+	if len(second.Body) != 1 || second.Body[0].Pred != "<" {
+		t.Fatalf("expected second query body to be a single '<' comparison, got %+v", second.Body)
+	}
+	lhs, ok := second.Body[0].Terms[0].(datalog.Integer)
+	if !ok || int64(lhs) != -2 {
+		t.Errorf("expected Integer(-2) on the left of '<', got %#v", second.Body[0].Terms[0])
+	}
+}
+
+func TestParseMinusAfterFactTerminatorIsSign(t *testing.T) {
+	// Same bug, but for a fact's '.' terminator instead of a query's '?'.
+	rs, err := syntax.ParseAll(`p(1). q(X) :- X is -2 + 1.`)
+	if err != nil {
+		t.Fatalf("negative literal after a fact's '.' terminator should parse, got: %v", err)
+	}
+	if len(rs.Rules) != 2 {
+		t.Fatalf("expected 2 rules, got %d: %+v", len(rs.Rules), rs)
+	}
+}
+
+// --- Bug: String.String() prints the full %q escape set (\r, \x00, \uNNNN,
+// \a, \b, \f, \v, ...), but the parser only decoded a small subset and
+// silently kept unrecognized escapes as literal backslash-sequences,
+// corrupting any print -> re-parse round trip of a value containing one of
+// the escapes it didn't know. ---
+
+func TestStringEscapeRoundTrip(t *testing.T) {
+	cases := []string{
+		"\r",
+		"\x00",
+		"\a\b\f\v",
+		"line1\nline2\ttabbed",
+		"\x7f",       // DEL, not printable -> \x7f
+		" ",          // line separator, not printable -> \u escape
+		"\U0001F600", // astral-plane rune -> \U escape
+		"mixed \r\n \x01 é end",
+		"",
+		"plain ascii, no escapes needed",
+	}
+	for _, orig := range cases {
+		rule := syntax.Rule{Head: syntax.Atom{Pred: "p", Terms: []datalog.Term{datalog.String(orig)}}}
+		text := rule.String()
+		res, err := syntax.ParseStatement(text)
+		if err != nil {
+			t.Errorf("%q: printed as %s, reparse failed: %v", orig, text, err)
+			continue
+		}
+		r, ok := res.(*syntax.Rule)
+		if !ok {
+			t.Errorf("%q: expected *Rule, got %T", orig, res)
+			continue
+		}
+		got, ok := r.Head.Terms[0].(datalog.String)
+		if !ok {
+			t.Errorf("%q: expected datalog.String, got %T", orig, r.Head.Terms[0])
+			continue
+		}
+		if string(got) != orig {
+			t.Errorf("round trip changed value: printed %s, got %q, want %q", text, string(got), orig)
+		}
+	}
+}
+
+func TestStringEscapeDecoding(t *testing.T) {
+	cases := []struct {
+		src  string
+		want string
+	}{
+		{`"\a"`, "\a"},
+		{`"\b"`, "\b"},
+		{`"\f"`, "\f"},
+		{`"\v"`, "\v"},
+		{`"\r"`, "\r"},
+		{`"\x00"`, "\x00"},
+		{`"\x41"`, "A"},
+		{`"A"`, "A"},
+		{`"\U00000041"`, "A"},
+		{`" "`, " "},
+	}
+	for _, c := range cases {
+		res, err := syntax.ParseStatement(`p(` + c.src + `).`)
+		if err != nil {
+			t.Errorf("%s: unexpected parse error: %v", c.src, err)
+			continue
+		}
+		r := res.(*syntax.Rule)
+		got, ok := r.Head.Terms[0].(datalog.String)
+		if !ok || string(got) != c.want {
+			t.Errorf("%s: got %#v, want String(%q)", c.src, r.Head.Terms[0], c.want)
+		}
+	}
+}
+
+func TestStringEscapeRejectsMalformed(t *testing.T) {
+	cases := []string{
+		`"\x1"`,        // too few hex digits
+		`"\xzz"`,       // not hex digits
+		`"\u12"`,       // too few hex digits
+		`"\q"`,         // unknown escape
+		`"\U00110000"`, // eight hex digits, but exceeds the maximum unicode code point
+	}
+	for _, src := range cases {
+		_, err := syntax.ParseStatement(`p(` + src + `).`)
+		if err == nil {
+			t.Errorf("%s: expected a parse error for a malformed escape, got nil", src)
+		}
+	}
+}

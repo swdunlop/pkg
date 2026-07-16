@@ -1,8 +1,10 @@
 package syntax_test
 
 import (
+	"reflect"
 	"testing"
 
+	"swdunlop.dev/pkg/datalog"
 	"swdunlop.dev/pkg/datalog/syntax"
 )
 
@@ -22,6 +24,58 @@ func renderRuleset(rs syntax.Ruleset) []string {
 	}
 	for _, q := range rs.Queries {
 		out = append(out, q.String())
+	}
+	return out
+}
+
+// printedStmt pairs a statement's re-printed textual form with the ordered
+// list of string-literal term values ("value fidelity") it carries, so a
+// round trip can check not just that the printed form re-parses (as
+// renderRuleset's callers already do), but that the values themselves
+// survived the print->reparse trip unchanged. Without this, a bug in
+// String()'s escaping (or the lexer's decoding of it) that corrupts a
+// string's contents but still produces syntactically valid, re-parseable
+// output would go undetected by parse->print->parse alone -- the fuzzer only
+// ever asserted re-parseability, not that the re-parsed value matched.
+type printedStmt struct {
+	src  string
+	strs []string
+}
+
+// collectAtomStrings gathers every datalog.String term appearing directly in
+// atoms, in order. Composite/pattern terms are not walked: the parser
+// desugars destructuring patterns into fresh ?N variables and getter atoms
+// before Terms is populated (see renderRuleset's doc comment), so top-level
+// atom terms are the only place a literal string can appear here.
+func collectAtomStrings(atoms []syntax.Atom) []string {
+	var out []string
+	for _, a := range atoms {
+		for _, t := range a.Terms {
+			if s, ok := t.(datalog.String); ok {
+				out = append(out, string(s))
+			}
+		}
+	}
+	return out
+}
+
+func renderRulesetWithStrings(rs syntax.Ruleset) []printedStmt {
+	var out []printedStmt
+	for _, r := range rs.Rules {
+		strs := collectAtomStrings([]syntax.Atom{r.Head})
+		strs = append(strs, collectAtomStrings(r.Body)...)
+		out = append(out, printedStmt{src: r.String(), strs: strs})
+	}
+	for _, ar := range rs.AggRules {
+		strs := collectAtomStrings([]syntax.Atom{ar.Head})
+		if s, ok := ar.AggTerm.(datalog.String); ok {
+			strs = append(strs, string(s))
+		}
+		strs = append(strs, collectAtomStrings(ar.Body)...)
+		out = append(out, printedStmt{src: ar.String(), strs: strs})
+	}
+	for _, q := range rs.Queries {
+		out = append(out, printedStmt{src: q.String(), strs: collectAtomStrings(q.Body)})
 	}
 	return out
 }
@@ -158,19 +212,37 @@ func FuzzParseAll(f *testing.F) {
 		}
 
 		// Every re-printed statement must itself be valid, re-parseable
-		// Datalog: parse -> print -> parse must not fail.
-		for _, src := range renderRuleset(rs) {
-			rs2, err := syntax.ParseAll(src)
+		// Datalog: parse -> print -> parse must not fail, and every
+		// string-literal term it carries must survive the trip unchanged
+		// (value fidelity, not just re-parseability).
+		for _, ps := range renderRulesetWithStrings(rs) {
+			rs2, err := syntax.ParseAll(ps.src)
 			if err != nil {
-				t.Fatalf("re-parse of printed statement failed: %q: %v\noriginal input: %q", src, err, input)
+				t.Fatalf("re-parse of printed statement failed: %q: %v\noriginal input: %q", ps.src, err, input)
+			}
+			ps2s := renderRulesetWithStrings(rs2)
+			// ps.src is the printed form of exactly one statement, so
+			// re-parsing it should yield exactly one statement back; if it
+			// doesn't, the re-parseability check above already caught
+			// anything fatal, so just skip the value comparison rather than
+			// guessing which of several statements to compare against.
+			if len(ps2s) == 1 && !reflect.DeepEqual(ps.strs, ps2s[0].strs) {
+				t.Fatalf("string-literal values changed across print->reparse: original %q, reprinted %q, want strings %#v, got %#v\noriginal input: %q",
+					input, ps.src, ps.strs, ps2s[0].strs, input)
 			}
 			// Re-printing again should not itself fail to reprint or panic,
-			// and should produce a re-parseable form as well (checks
-			// stability of the desugared/normalized form under repeated
-			// print/parse cycles).
-			for _, src2 := range renderRuleset(rs2) {
-				if _, err := syntax.ParseAll(src2); err != nil {
-					t.Fatalf("second re-parse failed: %q: %v\nfirst reprint: %q\noriginal input: %q", src2, err, src, input)
+			// and should produce a re-parseable form (with unchanged string
+			// values) as well (checks stability of the desugared/normalized
+			// form under repeated print/parse cycles).
+			for _, ps2 := range ps2s {
+				rs3, err := syntax.ParseAll(ps2.src)
+				if err != nil {
+					t.Fatalf("second re-parse failed: %q: %v\nfirst reprint: %q\noriginal input: %q", ps2.src, err, ps.src, input)
+				}
+				ps3s := renderRulesetWithStrings(rs3)
+				if len(ps3s) == 1 && !reflect.DeepEqual(ps2.strs, ps3s[0].strs) {
+					t.Fatalf("string-literal values changed across second print->reparse: first reprint %q, second reprint %q, want strings %#v, got %#v\noriginal input: %q",
+						ps2.src, ps3s[0].src, ps2.strs, ps3s[0].strs, input)
 				}
 			}
 		}

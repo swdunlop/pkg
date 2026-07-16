@@ -22,6 +22,39 @@ type Config struct {
 	// OnTypeError is called when a loaded fact's terms don't match the declared types.
 	// When nil, no type checking is performed during loading.
 	OnTypeError func(error) `json:"-"`
+
+	// OnMappingError is called when a mapping's filter or arg expression
+	// behaves unexpectedly for a JSONL record (the same way OnTypeError
+	// surfaces facts that loaded but don't match the schema, this surfaces
+	// records a mapping quietly dropped or produced a suspicious term for).
+	// It fires for three distinct situations, all reported as plain errors
+	// naming the expression, the record, and (for the filter case) the
+	// actual result:
+	//   - a filter or arg expression that fails to evaluate outright (a
+	//     genuine expr runtime error), which drops the mapping's fact for
+	//     the record;
+	//   - a filter that evaluates to anything other than a literal true/false
+	//     (including nil), which is treated as "no match" and also drops the
+	//     fact -- notably, expr-lang does not error on a map field access
+	//     that misses (e.g. value.usrname against a record with only
+	//     "username"), it simply yields nil, so a field-name typo in a
+	//     filter would otherwise silently and permanently exclude matching
+	//     records with no indication why;
+	//   - an arg that evaluates to nil, for the same field-name-typo reason;
+	//     the resulting fact still gets a Null term for that arg (unchanged
+	//     behavior), this only adds observability.
+	// When nil, all of the above are ignored and the record/arg is handled
+	// exactly as if a caller had wired an OnMappingError that does nothing,
+	// i.e. as before this hook existed.
+	OnMappingError func(error) `json:"-"`
+
+	// OnMatcherWarning is called when a matcher's combined pre-filter gate
+	// regex fails to compile (e.g. a very large contains_from pattern list
+	// exceeding regexp's internal program-size limit) and matching falls
+	// back to checking every fact without that speedup. The fallback is
+	// always correct (the gate is only a prefilter), so this is a warning,
+	// not an error; when nil, such fallbacks are silent.
+	OnMatcherWarning func(error) `json:"-"`
 }
 
 // Source describes a single JSONL file and how to map its lines to facts.

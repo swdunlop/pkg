@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"regexp"
@@ -34,7 +35,7 @@ func (cfg *Config) LoadFS(fsys fs.FS) (*memory.Database, error) {
 	var facts []datalog.Fact
 	counter := &idCounter{}
 	for _, src := range cfg.Sources {
-		srcFacts, err := loadSource(src, fsys, counter)
+		srcFacts, err := loadSource(src, fsys, counter, cfg.OnMappingError)
 		if err != nil {
 			return nil, fmt.Errorf("source %s: %w", src.File, err)
 		}
@@ -42,7 +43,7 @@ func (cfg *Config) LoadFS(fsys fs.FS) (*memory.Database, error) {
 	}
 
 	if len(cfg.Matchers) > 0 {
-		derived, err := applyMatchers(facts, cfg.Matchers)
+		derived, err := applyMatchers(facts, cfg.Matchers, cfg.OnMatcherWarning)
 		if err != nil {
 			return nil, fmt.Errorf("matchers: %w", err)
 		}
@@ -76,6 +77,10 @@ func (cfg *Config) LoadFS(fsys fs.FS) (*memory.Database, error) {
 	return builder.Build(), nil
 }
 
+// utf8BOM is the UTF-8 encoding of U+FEFF (byte order mark), which some
+// JSONL producers prepend to a file. See its use in loadSource.
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
+
 // idCounter generates monotonic synthetic IDs for fresh_id() calls.
 type idCounter struct {
 	next uint64
@@ -87,16 +92,38 @@ func (c *idCounter) freshID() datalog.ID {
 	return id
 }
 
-// compiledMapping holds pre-compiled expr programs for a mapping.
+// compiledMapping holds pre-compiled expr programs for a mapping. argSrcs and
+// filterSrc retain the original expression text solely so OnMappingError
+// messages can name the offending expression (the compiled *vm.Program does
+// not retain it).
 type compiledMapping struct {
 	predicate  string
 	args       []*vm.Program
+	argSrcs    []string
 	filter     *vm.Program // nil if no filter
+	filterSrc  string
 	imperative *vm.Program // non-nil for imperative mode
 }
 
-// loadSource reads a single JSONL source from fsys and returns all generated facts.
-func loadSource(src Source, fsys fs.FS, counter *idCounter) ([]datalog.Fact, error) {
+// loadSource reads a single JSONL source from fsys and returns all generated
+// facts. onMappingError, if non-nil, is called for each record where a
+// mapping's filter or arg expression:
+//   - fails to evaluate outright (a genuine expr runtime error, e.g. indexing
+//     past the end of a string), which drops that mapping's fact for the
+//     record;
+//   - is a filter that evaluates to something other than a literal bool
+//     (including nil), which is treated as "don't match" and also drops the
+//     fact -- expr-lang does not error when a map field access like
+//     value.foo misses, it simply yields nil, so a field-name typo in a
+//     filter would otherwise silently and permanently exclude every record
+//     with no indication why;
+//   - is an arg that evaluates to nil, which still emits a Null term for
+//     that arg (unchanged behavior -- nothing in this package relies on a
+//     *missing* field's arg evaluating to nil as an intentional
+//     "optional field" mechanism; see doc.go), but is now reported since it
+//     is otherwise indistinguishable from a genuine field-name typo.
+
+func loadSource(src Source, fsys fs.FS, counter *idCounter, onMappingError func(error)) ([]datalog.Fact, error) {
 	var facts []datalog.Fact
 
 	assertFn := func(pred string, args []any) {
@@ -125,7 +152,21 @@ func loadSource(src Source, fsys fs.FS, counter *idCounter) ([]datalog.Fact, err
 	for scanner.Scan() {
 		lineNum++
 		line := scanner.Bytes()
-		if len(line) == 0 {
+		// Strip a leading UTF-8 BOM (U+FEFF encodes as EF BB BF), which
+		// bytes.TrimSpace does not treat as whitespace since it is not one.
+		// Stripping it from every line (not just the first) handles both a
+		// BOM at the very start of the file, preceding a valid JSON object
+		// on the same line, and the degenerate case of a line containing
+		// only a BOM, which without this falls through to the JSON decoder
+		// below and aborts the whole load with a decode error instead of
+		// being skipped like any other blank line.
+		line = bytes.TrimPrefix(line, utf8BOM)
+		if len(bytes.TrimSpace(line)) == 0 {
+			// Empty or whitespace-only lines are not data; json.Decoder
+			// would report a bare "EOF" for one (there is no JSON value to
+			// decode), which previously aborted the entire load instead of
+			// just skipping the blank line, as blank lines between JSONL
+			// records are normally expected to be harmless.
 			continue
 		}
 
@@ -134,6 +175,15 @@ func loadSource(src Source, fsys fs.FS, counter *idCounter) ([]datalog.Fact, err
 		var obj map[string]any
 		if err := dec.Decode(&obj); err != nil {
 			return nil, fmt.Errorf("line %d: %w", lineNum, err)
+		}
+		// A JSONL line must contain exactly one JSON value: confirm nothing
+		// follows it (other than whitespace, which dec.Token skips), the
+		// same way canon.ParseComposite checks for trailing data after
+		// decoding a single composite. Without this, "{...} GARBAGE" quietly
+		// loads only the leading object and drops the trailing garbage with
+		// no indication the line was malformed.
+		if _, err := dec.Token(); err != io.EOF {
+			return nil, fmt.Errorf("line %d: unexpected data after JSON value", lineNum)
 		}
 		resolveNumbers(obj)
 
@@ -149,7 +199,28 @@ func loadSource(src Source, fsys fs.FS, counter *idCounter) ([]datalog.Fact, err
 
 			if cm.filter != nil {
 				result, err := expr.Run(cm.filter, runEnv)
-				if err != nil || result != true {
+				if err != nil {
+					if onMappingError != nil {
+						onMappingError(fmt.Errorf("%s: line %d: mapping %d predicate %q: filter %q: %w", src.File, lineNum, mi, cm.predicate, cm.filterSrc, err))
+					}
+					continue
+				}
+				b, ok := result.(bool)
+				if !ok {
+					// expr-lang does not error on a map field access that
+					// misses (e.g. value.usrname against a record with only
+					// "username") -- it yields nil, which combined with a
+					// comparison the schema author never intended can look
+					// like "no match" for reasons that have nothing to do
+					// with the record's data. Any non-bool result (nil or
+					// otherwise) is reported rather than silently treated as
+					// false, since a filter is defined to yield a bool.
+					if onMappingError != nil {
+						onMappingError(fmt.Errorf("%s: line %d: mapping %d predicate %q: filter %q evaluated to non-bool result %#v (%T) instead of true/false for record %v; record skipped", src.File, lineNum, mi, cm.predicate, cm.filterSrc, result, result, obj))
+					}
+					continue
+				}
+				if !b {
 					continue
 				}
 			}
@@ -159,8 +230,24 @@ func loadSource(src Source, fsys fs.FS, counter *idCounter) ([]datalog.Fact, err
 			for j, prog := range cm.args {
 				result, err := expr.Run(prog, runEnv)
 				if err != nil {
+					if onMappingError != nil {
+						onMappingError(fmt.Errorf("%s: line %d: mapping %d predicate %q: arg %d %q: %w", src.File, lineNum, mi, cm.predicate, j, cm.argSrcs[j], err))
+					}
 					skip = true
 					break
+				}
+				if result == nil {
+					// Same field-name-typo hazard as the filter case above:
+					// a missing map key evaluates to nil without an expr
+					// error, so this is otherwise indistinguishable from a
+					// genuine typo. Unlike the filter case, there is no
+					// evidence anything relies on a missing field's arg
+					// intentionally producing a Null term (see doc.go), so
+					// this only adds observability -- the Null term below is
+					// still emitted, matching prior behavior.
+					if onMappingError != nil {
+						onMappingError(fmt.Errorf("%s: line %d: mapping %d predicate %q: arg %d %q evaluated to nil for record %v; emitting a Null term", src.File, lineNum, mi, cm.predicate, j, cm.argSrcs[j], obj))
+					}
 				}
 				terms[j] = normalizeToConstant(result)
 			}
@@ -244,13 +331,28 @@ func compileMappings(mappings []Mapping, counter *idCounter, assertFn func(strin
 				return nil, fmt.Errorf("compiling arg expr %q for %s: %w", argExpr, m.Predicate, err)
 			}
 			cm.args = append(cm.args, prog)
+			cm.argSrcs = append(cm.argSrcs, argExpr)
 		}
 		if m.Filter != "" {
-			prog, err := expr.Compile(m.Filter, expr.Env(env), expr.AsBool())
+			// Deliberately not compiled with expr.AsBool(): since env's
+			// "value" field types are all `any` (the JSONL record is decoded
+			// into map[string]any), expr's compile-time checker cannot
+			// statically reject a dynamically-typed filter, so AsBool()'s
+			// only real effect here is at runtime -- and there, when the
+			// expression's actual result is nil (e.g. a missing-field access
+			// with no comparison around it), the VM silently coerces it to
+			// the zero value for bool (false) rather than surfacing it,
+			// which is exactly the silent-typo hazard this package's
+			// OnMappingError hook exists to catch. Compiling without
+			// AsBool() gets the raw result back (nil is nil, not false) so
+			// the runtime check below can tell a genuine `false` from a
+			// missing/malformed result.
+			prog, err := expr.Compile(m.Filter, expr.Env(env))
 			if err != nil {
 				return nil, fmt.Errorf("compiling filter %q for %s: %w", m.Filter, m.Predicate, err)
 			}
 			cm.filter = prog
+			cm.filterSrc = m.Filter
 		}
 		compiled[i] = cm
 	}
