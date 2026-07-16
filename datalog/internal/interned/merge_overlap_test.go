@@ -95,6 +95,44 @@ func TestMergePartialOverlap(t *testing.T) {
 	}
 }
 
+// TestMergeWholesaleAdoptionIsByReferenceNotCopy pins Merge's documented
+// move semantics for the wholesale-adoption path: when the destination has
+// no facts yet for a (pred,arity) key, Merge does NOT copy the source's
+// facts -- it adopts the source's underlying storage by reference. A fact
+// appended to the source's factChunks after Merge (simulating a caller that
+// violates the "don't mutate other after Merge" contract) becomes visible
+// through the destination too, because they share the same backing slice
+// header via the *factChunks pointer. This is deliberate (see the Merge doc
+// comment) for the semi-naive fixpoint's hot path, which relies on exactly
+// this aliasing and an ordering invariant (seminaive/eval.go) rather than a
+// copy. If Merge is ever changed to copy on this path instead, this test
+// should be updated to assert the opposite (no visibility of the later
+// append) rather than deleted, so the change of contract is intentional and
+// visible in the diff.
+func TestMergeWholesaleAdoptionIsByReferenceNotCopy(t *testing.T) {
+	const pred = 7
+	dst := NewInternedFactSet()
+
+	src := NewLightInternedFactSet()
+	f1 := mkFact(pred, 1, 2, 3)
+	src.Add(f1)
+
+	dst.Merge(src) // dst has no facts for (pred,3): wholesale adoption by reference.
+
+	// Mutating src's factChunks after Merge (via the low-level append the
+	// dict-shared *factChunks exposes) must be visible through dst too,
+	// proving the adoption is a reference, not a copy. AddUnchecked is used
+	// directly on src rather than dst to simulate a caller that (incorrectly,
+	// per the documented contract) keeps writing to `other` post-Merge.
+	f2 := mkFact(pred, 4, 5, 6)
+	src.AddUnchecked(f2, InternedFactHash(f2))
+
+	facts := dst.Get(pred, 3)
+	if len(facts) != 2 {
+		t.Fatalf("expected the post-Merge append to src to be visible through dst (shared backing storage), got %d facts: %v", len(facts), facts)
+	}
+}
+
 // TestMergeWholesaleAdoptedIndexStaysConsistent is the regression test for
 // Merge's single index-maintenance mechanism: a (pred,arity) key fs has
 // never seen is adopted wholesale (fs.ByPred[k] = ofc), and that path must

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"sort"
 )
 
 // Empty is a Database with no declarations, no facts, nothing to query.
@@ -125,29 +126,80 @@ func (typ TermType) CheckTerm(t Term) bool {
 	return typ.CheckConstant(c)
 }
 
-// DeclarationSet indexes declarations by predicate name for type checking.
-type DeclarationSet map[string]Declaration
+// declKey indexes a DeclarationSet by predicate name AND arity, matching how
+// the fact store itself is keyed (see internal/interned.PredArityI). Keying
+// by name alone would let a second declaration for the same name but a
+// different arity (e.g. p/1 then p/2) silently overwrite -- or, with the
+// first-wins rule below, silently lose to -- the first one, so the loader
+// would reject valid records under the dropped arity and CheckAtom would
+// fail compilation for rules that legitimately use it.
+type declKey struct {
+	Name  string
+	Arity int
+}
 
-// NewDeclarationSet builds a DeclarationSet from declarations.
+// DeclarationSet indexes declarations by predicate name AND arity (see
+// [declKey]) for type checking. A predicate may have a distinct declaration
+// per arity it is used at; declaring name/1 does not affect checking for
+// name/2, and vice versa, and both are independently enforced.
+//
+// A (name, arity) pair with no matching declaration but with a declaration
+// for the same name at a DIFFERENT arity is an arity mismatch (CheckFact and
+// CheckAtom report it as such). A name with no declaration at any arity is
+// simply unchecked. This is also the only "no schema" state: a
+// Declaration{Name: "p"} with nil/empty Terms registers as the schema for
+// p/0 (an empty term list, i.e. arity 0) like any other declaration -- it
+// does not exempt every arity of p from checking. A caller that wants "p
+// exists but I don't want its arity checked" (e.g. seminaive's rule-head
+// bookkeeping, which registers a bare Declaration{Name: r.Head.Pred} purely
+// so the predicate shows up in Database.Declarations() for schema
+// display/encoding -- see seminaive/transformer.go) must not feed that
+// declaration into a DeclarationSet used for CheckFact/CheckAtom: doing so
+// would flag every non-zero arity of the rule as a mismatch.
+type DeclarationSet map[declKey]Declaration
+
+// NewDeclarationSet builds a DeclarationSet from declarations, keyed by
+// (name, arity). The first declaration seen for a given (name, arity) wins;
+// later ones with the same name and arity are ignored. Declarations for the
+// same name at different arities are independent and both kept.
 func NewDeclarationSet(decls iter.Seq[Declaration]) DeclarationSet {
 	ds := DeclarationSet{}
 	for d := range decls {
-		if _, exists := ds[d.Name]; !exists {
-			ds[d.Name] = d
+		k := declKey{d.Name, len(d.Terms)}
+		if _, exists := ds[k]; !exists {
+			ds[k] = d
 		}
 	}
 	return ds
 }
 
-// CheckFact validates that a fact's terms match the declared types and arity.
-// Returns nil if no declaration exists or if all checks pass.
-func (ds DeclarationSet) CheckFact(f Fact) error {
-	d, ok := ds[f.Name]
-	if !ok || len(d.Terms) == 0 {
-		return nil
+// declaredArities returns the sorted, distinct arities that have a
+// declaration under name, or nil if name has none. Used only to build a
+// helpful arity-mismatch message when an exact (name, arity) lookup misses
+// but the name is declared under some other arity -- see [DeclarationSet].
+func (ds DeclarationSet) declaredArities(name string) []int {
+	var arities []int
+	for k := range ds {
+		if k.Name == name {
+			arities = append(arities, k.Arity)
+		}
 	}
-	if len(f.Terms) != len(d.Terms) {
-		return fmt.Errorf("predicate %s: expected arity %d, got %d", f.Name, len(d.Terms), len(f.Terms))
+	sort.Ints(arities)
+	return arities
+}
+
+// CheckFact validates that a fact's terms match the declared types and
+// arity. Returns nil if no declaration exists anywhere for f.Name, or if a
+// declaration exists for f's exact (name, arity) and all its checks pass.
+// Returns an arity-mismatch error if f.Name is declared but only at other
+// arities; see [DeclarationSet].
+func (ds DeclarationSet) CheckFact(f Fact) error {
+	d, ok := ds[declKey{f.Name, len(f.Terms)}]
+	if !ok {
+		if arities := ds.declaredArities(f.Name); len(arities) > 0 {
+			return fmt.Errorf("predicate %s: expected arity %v, got %d", f.Name, arities, len(f.Terms))
+		}
+		return nil
 	}
 	for i, td := range d.Terms {
 		if !td.Type.CheckConstant(f.Terms[i]) {
@@ -157,15 +209,18 @@ func (ds DeclarationSet) CheckFact(f Fact) error {
 	return nil
 }
 
-// CheckAtom validates that an atom's constant terms match declared types and arity.
-// Variables are not checked. Returns nil if no declaration exists.
+// CheckAtom validates that an atom's constant terms match declared types and
+// arity. Variables are not checked. Returns nil if no declaration exists
+// anywhere for pred, or if a declaration exists for the exact (pred,
+// len(terms)) and all its checks pass. Returns an arity-mismatch error if
+// pred is declared but only at other arities; see [DeclarationSet].
 func (ds DeclarationSet) CheckAtom(pred string, terms []Term) error {
-	d, ok := ds[pred]
-	if !ok || len(d.Terms) == 0 {
+	d, ok := ds[declKey{pred, len(terms)}]
+	if !ok {
+		if arities := ds.declaredArities(pred); len(arities) > 0 {
+			return fmt.Errorf("predicate %s: expected arity %v, got %d", pred, arities, len(terms))
+		}
 		return nil
-	}
-	if len(terms) != len(d.Terms) {
-		return fmt.Errorf("predicate %s: expected arity %d, got %d", pred, len(d.Terms), len(terms))
 	}
 	for i, td := range d.Terms {
 		if !td.Type.CheckTerm(terms[i]) {

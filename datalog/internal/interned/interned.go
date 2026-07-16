@@ -552,9 +552,32 @@ func (fs InternedFactSet) colIndexFor(k PredArityI, col int) *colIndex {
 	return ci
 }
 
-// Merge copies all facts from other into fs. Existing column indexes stay
-// valid (facts are append-only) and catch up on next Scan; no column index
+// Merge moves all facts from other into fs -- it is NOT a copy for every
+// (pred,arity) key. When fs has no facts yet for a key, Merge adopts other's
+// *factChunks for that key by reference (fs.ByPred[k] = ofc below); when fs
+// already holds facts for the key, each of other's facts is copied in
+// individually via dfc.append(f). Existing column indexes stay valid either
+// way (facts are append-only) and catch up on next Scan; no column index
 // maintenance is needed here.
+//
+// Because the wholesale-adoption path shares other's *factChunks by
+// reference rather than copying, other must not be mutated (via Add,
+// AddUnchecked, or another Merge into it) after being passed to Merge --
+// doing so would also mutate the corresponding entries now living in fs.
+// Reading other afterward is fine as long as it is never written to again.
+// This is safe today only because of how seminaive/eval.go's semi-naive
+// fixpoint loop sequences it: `existing.Merge(emitted)` runs, THEN
+// `delta = emitted` aliases the very same (now also fs-owned) factChunks
+// into delta, THEN `emitted = interned.NewLightInternedFactSet()` swaps in a
+// fresh set for the next iteration's writes -- so the old `emitted` (now
+// `delta`) is only ever read from that point on, never appended to (see
+// seminaive/eval.go around the evalRules fixpoint loop). A copy here would
+// remove that fragility, but Merge runs once per fixpoint iteration in the
+// semi-naive evaluator's hot path, so copying every wholesale-adopted fact
+// on every iteration would be a measurable allocation/cost regression for
+// no behavioral benefit while the ordering invariant holds; if a future
+// caller can't preserve that invariant, it must Clone() other before
+// merging, or this adoption branch must switch to a real copy.
 //
 // Index maintenance uses exactly one mechanism: every fact that ends up
 // stored in fs, whether adopted wholesale or appended one at a time, has
@@ -579,6 +602,9 @@ func (fs InternedFactSet) Merge(other InternedFactSet) {
 	for k, ofc := range other.ByPred {
 		dfc := fs.ByPred[k]
 		if dfc == nil {
+			// Adoption by reference, not a copy -- see the Merge doc comment
+			// above for the caller contract this depends on (other must not
+			// be mutated again after this call).
 			fs.ByPred[k] = ofc
 			for _, f := range ofc.facts {
 				fs.Index[InternedFactHash(f)] = struct{}{}
