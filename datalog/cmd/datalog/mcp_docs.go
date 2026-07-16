@@ -1,5 +1,7 @@
 package main
 
+import "time"
+
 // This file collects the model-facing documentation strings for the MCP
 // tool surface (datalog mcp). They are load-bearing API docs: a model that
 // has never seen this project must be able to author a working jsonfacts
@@ -224,8 +226,15 @@ aggregate-rule heads). On failure, returns the parser or compiler error
 verbatim, including line:column and the offending source line - use it to
 locate and fix the problem, then resubmit the whole document.`
 
-// mcpQueryDescription documents the query tool.
-const mcpQueryDescription = `Evaluate one Datalog query against the current schema + rules + loaded
+// mcpQueryDescription documents the query tool. It takes the server's
+// actual per-query timeout rather than hardcoding a number: `datalog mcp`
+// defaults to 60s but is operator-configurable via --timeout, while
+// `datalog serve`'s /mcp mount has no such flag and always runs under the
+// same 5s evalTimeout as the rest of the web UI (Run/Apply/agent query) —
+// a single fixed claim in the doc text would be wrong for whichever mode
+// didn't match it. See registerTools' call site.
+func mcpQueryDescription(timeout time.Duration) string {
+	return `Evaluate one Datalog query against the current schema + rules + loaded
 data, and return matching rows plus per-stratum evaluation stats. This is
 the last step of the workflow loop: sample_input -> set_schema (check fact
 counts) -> set_rules (check parse/compile errors) -> query (check results
@@ -266,15 +275,16 @@ the facts don't exist.
 hard cap 1000 - values above the cap are silently clamped, not rejected).
 The query still evaluates to completion regardless of limit; "total" is
 the true row count and "truncated" reports whether rows were cut off in
-the response. Evaluation runs under a server-configured timeout (see the
---timeout flag the operator started the server with; default 60s) - a
-runaway recursive rule will time out rather than hang the session.
+the response. Evaluation runs under this server's configured timeout,
+` + timeout.String() + ` - a runaway recursive rule will time out rather than
+hang the session.
 
 "stats" reports one entry per evaluation stratum: which predicates it
 covers, how many rules/aggregates/facts were involved, how many fixpoint
 iterations it took, and how long it took (duration_ms). Use this to
 diagnose a rule that never reaches a fixpoint (hits the iteration cap) or
 that is unexpectedly slow.`
+}
 
 // mcpListPredicatesDescription documents list_predicates.
 const mcpListPredicatesDescription = `List every predicate currently known to the session: predicates loaded

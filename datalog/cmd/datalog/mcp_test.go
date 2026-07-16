@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"iter"
 	"os"
 	"path/filepath"
@@ -252,6 +253,63 @@ sources:
 		if p.Name == "event" {
 			t.Errorf("list_predicates: found %q after set_schema should have been rejected", p.Name)
 		}
+	}
+}
+
+// newMCPHandlers loads startup rule files through session.loadProgram,
+// which — unlike the REPL's own loadProgram (repl.go) — has nowhere to run
+// or print embedded '?' queries: mcp mode's stdout is the JSON-RPC channel,
+// and serve mode has no console this early in startup. Silently dropping
+// them was the bug; newMCPHandlers must now warn on stderr, naming the file
+// and how many queries it ignored.
+func TestNewMCPHandlers_WarnsOnEmbeddedQueriesInRuleFiles(t *testing.T) {
+	dir := t.TempDir()
+	rulesPath := filepath.Join(dir, "rules.dl")
+	mustWriteFile(t, rulesPath, "foo(1).\nfoo(2).\nbar(X) :- foo(X).\nfoo(X)?\nbar(X)?\n")
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = w
+
+	h, closeFn, err := newMCPHandlers(dir, "", []string{rulesPath}, 5*time.Second)
+
+	os.Stderr = origStderr
+	w.Close()
+	var buf strings.Builder
+	if _, cerr := io.Copy(&buf, r); cerr != nil {
+		t.Fatalf("reading captured stderr: %v", cerr)
+	}
+
+	if err != nil {
+		t.Fatalf("newMCPHandlers: %v", err)
+	}
+	defer closeFn()
+
+	got := buf.String()
+	if !strings.Contains(got, rulesPath) {
+		t.Errorf("warning does not name the rules file %s: %q", rulesPath, got)
+	}
+	if !strings.Contains(got, "2") {
+		t.Errorf("warning does not report the 2 ignored queries: %q", got)
+	}
+
+	// The rules themselves still loaded normally (only the queries were
+	// dropped) — bar/1 must be a known predicate.
+	out, err := h.listPredicates(listPredicatesInput{})
+	if err != nil {
+		t.Fatalf("list_predicates: %v", err)
+	}
+	found := false
+	for _, p := range out.Predicates {
+		if p.Name == "bar" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("bar/1 rule from the rules file did not load")
 	}
 }
 
@@ -552,6 +610,287 @@ func TestQuery_DoesNotHoldLockDuringTransform(t *testing.T) {
 	}
 }
 
+// -- fact cap: mid-evaluation WithFactLimit enforcement ---------------------
+//
+// These three tests build handlers through newMCPHandlers (not
+// newTestHandlers, which builds a bare &session{} with no engineOpts) so the
+// session carries newMCPHandlers' default engineOpts —
+// []seminaive.Option{seminaive.WithFactLimit(factCap)} — exactly like
+// `datalog mcp`/`datalog serve` do in production. That default is what
+// closes the hole below; a handler built the newTestHandlers way would not
+// exercise it at all.
+
+// TestQuery_ZeroRulesCrossProductExceedsFactCap is the adversarial
+// validation's exact repro: a session with NO rules skips runQuery's base-
+// ruleset stage entirely (session.go: "nothing to derive: the EDB snapshot
+// IS the whole fixpoint"), so the only Transform that ever runs is the
+// synthetic _q_ stage built from the query body itself — and, before every
+// session.engineOpts carried WithFactLimit(factCap) by default, nothing
+// capped that stage at all. A 3-way self-join over 15 facts derived
+// 15^3 = 3375 _q_ rows with no error. It must now halt with a "rule too
+// broad" error instead.
+func TestQuery_ZeroRulesCrossProductExceedsFactCap(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 15)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("newMCPHandlers: %v", err)
+	}
+	defer closeFn()
+
+	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+		t.Fatalf("set_schema: %v", err)
+	}
+
+	out, err := h.query(context.Background(), queryInput{
+		Query: `event(A, B, C), event(D, E, F), event(G, H, I)?`,
+	})
+	if err == nil {
+		t.Fatalf("query: expected a fact-cap error, got %d rows (want the 15^3=3375 cross product rejected)", out.Total)
+	}
+	if !strings.Contains(err.Error(), "rule too broad") {
+		t.Errorf("query: error %q does not use the familiar \"rule too broad\" wording", err.Error())
+	}
+}
+
+// TestQuery_RulesBaseStageExceedsFactCap covers the OTHER query stage: a
+// session ruleset (not the query body) that blows the cap. Unlike the
+// zero-rules case above, this exercises runQuery's base-ruleset stage
+// (session.go's "default:" branch), which computes the ruleset's fixpoint
+// before the query's own synthetic _q_ rule ever runs against it — this is
+// the stage checkQueryFactCap used to guard post-hoc; WithFactLimit now
+// halts it mid-Transform instead.
+func TestQuery_RulesBaseStageExceedsFactCap(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 40) // cross product: 40*40 = 1600 > factCap (1000)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("newMCPHandlers: %v", err)
+	}
+	defer closeFn()
+
+	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+		t.Fatalf("set_schema: %v", err)
+	}
+	if _, err := h.setRules(setRulesInput{Source: "pair(A,B) :- event(A,_,_), event(B,_,_).\n"}); err != nil {
+		t.Fatalf("set_rules: %v", err)
+	}
+
+	out, err := h.query(context.Background(), queryInput{Query: `pair(X, Y)?`})
+	if err == nil {
+		t.Fatalf("query: expected a fact-cap error from the base ruleset stage, got %d rows", out.Total)
+	}
+	if !strings.Contains(err.Error(), "rule too broad") {
+		t.Errorf("query: error %q does not use the familiar \"rule too broad\" wording", err.Error())
+	}
+}
+
+// TestQuery_UnderCapStillSucceeds is the control: a query comfortably under
+// factCap must still return its full, correct result through a handler that
+// carries the same default WithFactLimit(factCap) the two tests above rely
+// on to fail — proving the cap's threshold, not just its existence.
+func TestQuery_UnderCapStillSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 5)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("newMCPHandlers: %v", err)
+	}
+	defer closeFn()
+
+	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+		t.Fatalf("set_schema: %v", err)
+	}
+
+	// 5*5 = 25 rows, well under factCap (1000).
+	out, err := h.query(context.Background(), queryInput{Query: `event(A, B, C), event(D, E, F)?`})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if out.Total != 25 {
+		t.Fatalf("query: total = %d, want 25", out.Total)
+	}
+}
+
+// -- derived fixpoint cache: query write-back -------------------------------
+//
+// These cover the query handler's write-back of a cold-path base fixpoint
+// into session.derivedDB (mcp.go's cacheDerivedQuery, called from query()),
+// mirroring rules_editor.go's Run write-back. Before this write-back existed,
+// snap.runQuery's cold path computed the base fixpoint into a querySnapshot
+// value that was simply discarded after the call, so two consecutive queries
+// with no mutation between them each recomputed the whole base ruleset from
+// scratch — TestQuery_PopulatesAndReusesDerivedCache is written to fail
+// without the fix (session.derivedDB stays nil after a successful
+// rules-based query).
+
+// TestQuery_PopulatesAndReusesDerivedCache asserts a rules-based MCP query
+// populates session.derivedDB (with gen left unchanged — the write-back
+// never bumps gen, only mutators do), and that a second identical query
+// reuses it rather than recomputing: the cache pointer must be identical
+// before and after the second call, since a cache hit never re-enters
+// cacheDerivedQuery's write-back at all (lockedSnapshot's cold flag in
+// query() only calls it when snap.derived arrived nil).
+func TestQuery_PopulatesAndReusesDerivedCache(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 5)
+	h, done := newTestHandlers(t, dir)
+	defer done()
+
+	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+		t.Fatalf("set_schema: %v", err)
+	}
+	if _, err := h.setRules(setRulesInput{Source: `derived(X) :- event(X, _, _).` + "\n"}); err != nil {
+		t.Fatalf("set_rules: %v", err)
+	}
+
+	genBefore := h.sess.gen
+	if h.sess.derivedDB != nil {
+		t.Fatal("derivedDB should be nil before any query (set_rules clears it)")
+	}
+
+	if _, err := h.query(context.Background(), queryInput{Query: `derived(X)?`}); err != nil {
+		t.Fatalf("query (first): %v", err)
+	}
+	if h.sess.derivedDB == nil {
+		t.Fatal("query: expected derivedDB to be populated by the base fixpoint's write-back, got nil")
+	}
+	if h.sess.gen != genBefore {
+		t.Errorf("query: gen changed from %d to %d; write-back must not bump gen", genBefore, h.sess.gen)
+	}
+	cached := h.sess.derivedDB
+
+	if _, err := h.query(context.Background(), queryInput{Query: `derived(X)?`}); err != nil {
+		t.Fatalf("query (second): %v", err)
+	}
+	if h.sess.derivedDB != cached {
+		t.Error("query: second query's derivedDB pointer changed; expected the cached fixpoint to be reused, not recomputed")
+	}
+}
+
+// TestQuery_CachedDerivedExcludesSyntheticQueryPredicate asserts the cached
+// base fixpoint never contains the synthetic _q_ predicate runQuery builds
+// per query: querySnapshot.runQuery populates qs.derived with the BASE
+// ruleset's fixpoint before it ever compiles/runs the _q_ stage, so this
+// holds by construction, but is worth pinning directly given how easy it
+// would be for a future change to instead cache runQuery's final output.
+func TestQuery_CachedDerivedExcludesSyntheticQueryPredicate(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 5)
+	h, done := newTestHandlers(t, dir)
+	defer done()
+
+	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+		t.Fatalf("set_schema: %v", err)
+	}
+	if _, err := h.setRules(setRulesInput{Source: `derived(X) :- event(X, _, _).` + "\n"}); err != nil {
+		t.Fatalf("set_rules: %v", err)
+	}
+
+	if _, err := h.query(context.Background(), queryInput{Query: `derived(X)?`}); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if h.sess.derivedDB == nil {
+		t.Fatal("query: expected derivedDB to be populated")
+	}
+	for name := range h.sess.derivedDB.Predicates() {
+		if name == "_q_" {
+			t.Fatal("cached derivedDB contains the synthetic _q_ predicate; only the base fixpoint must be cached")
+		}
+	}
+}
+
+// TestQuery_StaleWriteBackDropped covers the gen guard: a query that pauses
+// mid-Transform on its cold path (via a blocking external predicate) races a
+// concurrent set_rules that lands before the paused query's base Transform
+// returns. set_rules bumps session.gen and clears derivedDB as usual; the
+// paused query's write-back, computed against the OLD generation, must be
+// silently dropped rather than resurrecting a fixpoint for a ruleset that no
+// longer exists — mirroring runApplyRulesDocument's `gen == snapGen` guard
+// (rules_editor.go).
+func TestQuery_StaleWriteBackDropped(t *testing.T) {
+	h, done := newTestHandlers(t, t.TempDir())
+	defer done()
+
+	inTransform := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	h.sess.engineOpts = []seminaive.Option{
+		seminaive.WithExternal("slow", 1, func(ctx context.Context, _ seminaive.Bindings) iter.Seq[[]any] {
+			return func(yield func([]any) bool) {
+				once.Do(func() { close(inTransform) })
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+				yield([]any{"done"})
+			}
+		}),
+	}
+	if _, err := h.setRules(setRulesInput{Source: `r(X) :- slow(X).` + "\n"}); err != nil {
+		t.Fatalf("set_rules (initial): %v", err)
+	}
+
+	queryDone := make(chan error, 1)
+	go func() {
+		_, err := h.query(context.Background(), queryInput{Query: `r(X)?`})
+		queryDone <- err
+	}()
+
+	<-inTransform // the query's cold-path base stage is now blocked in slow(X)
+
+	// Race a mutation in: bumps gen and clears derivedDB before the paused
+	// query's base Transform ever returns.
+	if _, err := h.setRules(setRulesInput{Source: `s(X) :- slow(X).` + "\n"}); err != nil {
+		t.Fatalf("set_rules (racing): %v", err)
+	}
+
+	close(release) // let the paused query's base Transform finish
+	if err := <-queryDone; err != nil {
+		t.Fatalf("query: %v", err)
+	}
+
+	if h.sess.derivedDB != nil {
+		t.Error("query: stale write-back landed after a racing set_rules; derivedDB should still be nil")
+	}
+}
+
+// TestQuery_CacheRefusesOverFactCapBase asserts checkFactCap's total-size
+// policy applies to the write-back exactly as it does to Run's
+// (rules_editor.go): a base fixpoint whose total fact count exceeds factCap
+// must not be cached, even though the query itself succeeds. Zero rules
+// (base stage skipped, base = the raw EDB snapshot verbatim) plus a large
+// already-loaded dataset is what forces this apart from WithFactLimit, which
+// only counts facts newly DERIVED during a Transform call and so never fires
+// here at all (see checkFactCap's doc comment in sandbox.go): the query
+// itself (`event("h7", Pid, Cmd)?`) derives exactly one _q_ fact, well under
+// factCap, so it succeeds — but the 1500-fact base it would otherwise cache
+// exceeds factCap on its own.
+func TestQuery_CacheRefusesOverFactCapBase(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 1500)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, 5*time.Second)
+	if err != nil {
+		t.Fatalf("newMCPHandlers: %v", err)
+	}
+	defer closeFn()
+
+	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+		t.Fatalf("set_schema: %v", err)
+	}
+
+	out, err := h.query(context.Background(), queryInput{Query: `event("h7", Pid, Cmd)?`})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if out.Total != 1 {
+		t.Fatalf("query: total = %d, want 1", out.Total)
+	}
+	if h.sess.derivedDB != nil {
+		t.Error("query: expected an over-factCap base fixpoint to be refused by the write-back, but derivedDB was populated")
+	}
+}
+
 // -- list_predicates / sample_facts ----------------------------------------
 
 func TestSampleFacts_Limit(t *testing.T) {
@@ -654,6 +993,79 @@ func TestSampleFacts_DerivedPredicate(t *testing.T) {
 		}
 	}
 	t.Fatal("list_predicates: derived predicate missing from listing")
+}
+
+// list_predicates and sample_facts read counts through memory.Database's
+// PredicateCounts/FactCount (O(1) per predicate) rather than scanning every
+// fact of every predicate, per doc/features/mcp-server.md review item 7.
+// PredicateCounts keys on (name, arity) pairs, not name alone — this guards
+// the keying: an overloaded predicate name at two arities must report each
+// arity's own count, not merge or swap them.
+func TestListPredicates_OverloadedArityCounts(t *testing.T) {
+	dir := t.TempDir()
+	h, done := newTestHandlers(t, dir)
+	defer done()
+
+	src := `
+tag("x").
+tag("a", "b").
+tag("c", "d").
+tag("e", "f").
+`
+	if _, err := h.setRules(setRulesInput{Source: src}); err != nil {
+		t.Fatalf("set_rules: %v", err)
+	}
+	evaluated, err := h.sess.evaluate(context.Background())
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	h.sess.derivedDB = evaluated
+
+	out, err := h.listPredicates(listPredicatesInput{})
+	if err != nil {
+		t.Fatalf("list_predicates: %v", err)
+	}
+	got := map[int]int{}
+	for _, p := range out.Predicates {
+		if p.Name == "tag" {
+			got[p.Arity] = p.Facts
+		}
+	}
+	if got[1] != 1 {
+		t.Errorf("tag/1 facts = %d, want 1", got[1])
+	}
+	if got[2] != 3 {
+		t.Errorf("tag/2 facts = %d, want 3", got[2])
+	}
+
+	one, err := h.sampleFacts(sampleFactsInput{Predicate: "tag", Arity: 1})
+	if err != nil {
+		t.Fatalf("sample_facts tag/1: %v", err)
+	}
+	if one.Total != 1 {
+		t.Errorf("sample_facts tag/1: total = %d, want 1", one.Total)
+	}
+	two, err := h.sampleFacts(sampleFactsInput{Predicate: "tag", Arity: 2})
+	if err != nil {
+		t.Fatalf("sample_facts tag/2: %v", err)
+	}
+	if two.Total != 3 {
+		t.Errorf("sample_facts tag/2: total = %d, want 3", two.Total)
+	}
+}
+
+// The query tool's description must report the timeout the server was
+// actually started with, not a fixed number that only matches one of the
+// two /mcp-serving binary modes (`datalog mcp`'s operator-configurable
+// --timeout, default 60s, vs `datalog serve`'s fixed 5s evalTimeout).
+func TestMCPQueryDescription_MatchesConfiguredTimeout(t *testing.T) {
+	got := mcpQueryDescription(5 * time.Second)
+	if !strings.Contains(got, "5s") {
+		t.Errorf("query tool description does not mention the configured 5s timeout:\n%s", got)
+	}
+	if strings.Contains(got, "60s") {
+		t.Errorf("query tool description still hardcodes 60s even though this server is configured for 5s")
+	}
 }
 
 // -- sample_input -----------------------------------------------------------

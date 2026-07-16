@@ -87,13 +87,28 @@ func (wb *workbench) emitDataFile(stream datastar.Stream, file string, offset in
 
 	nextOffset := offset + len(rows)
 	selFile, selRow, selValid := wb.currentSelection()
-	body := view.DataTableBody(file, rows, nextOffset, hasMore, selFile, selRow, selValid)
 
-	opts := []datastar.ElementsOption{datastar.Selector("#data-table-body")}
-	if offset > 0 {
-		opts = append(opts, datastar.Mode("append"))
+	if offset == 0 {
+		// Two fragments: the row list, and the sibling Load More control —
+		// the control lives OUTSIDE the ul (view.DataBrowser's shell) so
+		// later appends can never bury it mid-list.
+		_ = stream.Emit(
+			datastar.Elements(view.DataTableBody(file, rows, selFile, selRow, selValid), datastar.Selector("#data-table-body")),
+			datastar.Elements(view.DataLoadMore(file, nextOffset, hasMore)),
+		)
+		return
 	}
-	_ = stream.Emit(datastar.Elements(body, opts...))
+
+	// Load More (offset > 0): append just the new rows into the existing
+	// list and replace the Load More control with a fresh one, rather than
+	// appending the whole DataTableBody fragment — that used to nest a
+	// duplicate #data-table-body <ul> inside itself and leave the stale
+	// (re-fetchable at the old offset) Load More button live alongside the
+	// new one (mirrors fact_browser.go's handleFacts).
+	_ = stream.Emit(
+		datastar.Elements(view.DataRows(file, rows, selFile, selRow, selValid), datastar.Selector("#data-table-body"), datastar.Mode("append")),
+		datastar.Elements(view.DataLoadMore(file, nextOffset, hasMore)),
+	)
 }
 
 // readDataChunk opens ref (already confined) through wb.h.fsys and returns

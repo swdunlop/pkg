@@ -28,6 +28,14 @@ type session struct {
 	rules    []syntax.Rule
 	aggRules []syntax.AggregateRule
 
+	// engineOpts is threaded into every seminaive.Engine this session's
+	// methods build (setRules/setRulesWithQueries's trial Compile,
+	// evaluate/evaluateSnapshot, runQuery's two stages). newMCPHandlers
+	// (mcp.go) sets it once at construction to
+	// []seminaive.Option{seminaive.WithFactLimit(factCap)} (sandbox.go), so
+	// every Transform this session ever runs — including both of a query's
+	// stages — halts mid-evaluation once it derives more than factCap new
+	// facts, rather than materializing an unbounded result first.
 	engineOpts []seminaive.Option
 
 	// Data source configured via setDataSource.
@@ -55,6 +63,18 @@ type session struct {
 	// loadData) clears it, so a stale Run's derived facts never survive an
 	// unapplied edit.
 	derivedDB datalog.Database
+
+	// gen counts invalidations of derivedDB: incremented by every mutator
+	// that changes what evaluate() would produce (setSchema, setRules,
+	// setRulesWithQueries, loadProgram, loadData — the same five call sites
+	// that already nil derivedDB out, below). querySnapshot captures gen
+	// alongside derivedDB (see snapshotForQuery) so a caller that computes a
+	// fresh fixpoint lock-free (querySnapshot.runQuery's cold path) can
+	// later write it back into derivedDB only if gen is unchanged since —
+	// i.e. nothing invalidated the session while the Transform was running
+	// without the lock held. See mcp.go's query handler, the one writer of
+	// this cache outside the mutators themselves.
+	gen uint64
 }
 
 // setDataSource configures the session to load facts from a jsonfacts config.
@@ -92,6 +112,7 @@ func (s *session) loadData() error {
 	s.schemaText = string(data)
 	s.dataDB = db
 	s.derivedDB = nil
+	s.gen++
 	return nil
 }
 
@@ -153,26 +174,26 @@ func parseConfigFormat(data []byte, format string) (jsonfacts.Config, error) {
 // confinement, since the operator authors the config themselves).
 type confineRef func(ref string) (string, error)
 
-// setSchema replaces the session's jsonfacts configuration atomically: it
-// parses the config from raw text plus a format hint ("yaml" or "json",
-// empty defaults to yaml), validates every file reference the config makes
-// (each source's file and every matcher's *_from pattern file) through
-// confine, resolves *_from pattern files itself (LoadFS does not do this;
-// only LoadSchemaFS does, and set_schema submissions are not schema-dir
-// files), loads the data via fsys, and only then mutates session state. On
-// any error, the session is left exactly as it was before the call — the
-// model's replacement schema either fully replaces the old one or not at
-// all, per the design's atomic-replacement requirement (mcp-server.md).
-func (s *session) setSchema(text string, format string, fsys fs.FS, confine confineRef) error {
+// prepareSchema performs setSchema's expensive, session-independent work:
+// parsing the config, validating every file reference through confine,
+// resolving *_from pattern files, and loading the data via fsys. It touches
+// no session state at all, so a caller that shares the session across
+// goroutines (mcpHandlers.setSchema in mcp.go) can run this WITHOUT holding
+// its lock, taking the lock only for the cheap field swap setSchema (or the
+// caller itself) performs afterward — the fix for set_schema holding h.mu
+// across a full data reload. Returns the parsed config and loaded database
+// on success; on any error, nothing has been touched yet, so there is
+// nothing for a caller to unwind.
+func prepareSchema(text string, format string, fsys fs.FS, confine confineRef) (jsonfacts.Config, *memory.Database, error) {
 	cfg, err := parseConfigFormat([]byte(text), format)
 	if err != nil {
-		return err
+		return jsonfacts.Config{}, nil, err
 	}
 
 	if confine != nil {
 		for i, src := range cfg.Sources {
 			if _, err := confine(src.File); err != nil {
-				return fmt.Errorf("source %d: file %q: %w", i, src.File, err)
+				return jsonfacts.Config{}, nil, fmt.Errorf("source %d: file %q: %w", i, src.File, err)
 			}
 		}
 		for i := range cfg.Matchers {
@@ -185,7 +206,7 @@ func (s *session) setSchema(text string, format string, fsys fs.FS, confine conf
 					continue
 				}
 				if _, err := confine(ref); err != nil {
-					return fmt.Errorf("matcher %d: file %q: %w", i, ref, err)
+					return jsonfacts.Config{}, nil, fmt.Errorf("matcher %d: file %q: %w", i, ref, err)
 				}
 			}
 		}
@@ -195,18 +216,36 @@ func (s *session) setSchema(text string, format string, fsys fs.FS, confine conf
 	// does not do this, and an MCP-submitted config is not a schema-dir
 	// file, so nothing else will resolve them before matching runs.
 	if err := cfg.ResolveFromFS(fsys); err != nil {
-		return err
+		return jsonfacts.Config{}, nil, err
 	}
 
 	db, err := cfg.LoadFS(fsys)
 	if err != nil {
-		return fmt.Errorf("loading data: %w", err)
+		return jsonfacts.Config{}, nil, fmt.Errorf("loading data: %w", err)
 	}
+	return cfg, db, nil
+}
 
+// setSchema replaces the session's jsonfacts configuration atomically: it
+// delegates the parsing/confinement/loading work to prepareSchema, then
+// commits the result to session state in one shot. On any error, the
+// session is left exactly as it was before the call — the model's
+// replacement schema either fully replaces the old one or not at all, per
+// the design's atomic-replacement requirement (mcp-server.md). Callers that
+// need prepareSchema's expensive part to run without holding a shared lock
+// (mcpHandlers.setSchema) should call prepareSchema directly instead and
+// commit the four fields below together under their own lock — see that
+// method's doc comment for the TOCTOU reasoning.
+func (s *session) setSchema(text string, format string, fsys fs.FS, confine confineRef) error {
+	cfg, db, err := prepareSchema(text, format, fsys, confine)
+	if err != nil {
+		return err
+	}
 	s.cfg = cfg
 	s.schemaText = text
 	s.dataDB = db
 	s.derivedDB = nil
+	s.gen++
 	return nil
 }
 
@@ -237,6 +276,7 @@ func (s *session) setRules(source string) error {
 	s.aggRules = ruleset.AggRules
 	s.rulesText = source
 	s.derivedDB = nil
+	s.gen++
 	return nil
 }
 
@@ -266,6 +306,7 @@ func (s *session) setRulesWithQueries(source string) ([]syntax.Query, error) {
 	s.aggRules = ruleset.AggRules
 	s.rulesText = source
 	s.derivedDB = nil
+	s.gen++
 	return ruleset.Queries, nil
 }
 
@@ -286,6 +327,7 @@ func (s *session) loadProgram(src string) ([]syntax.Query, error) {
 	}
 	s.aggRules = append(s.aggRules, ruleset.AggRules...)
 	s.derivedDB = nil
+	s.gen++
 	return ruleset.Queries, nil
 }
 
@@ -314,17 +356,57 @@ func (s *session) buildDB() (*memory.Database, error) {
 // minus the synthetic head — callers that want a snapshot of "what does the
 // current ruleset actually derive," not just one query's answer, call this
 // instead and cache the result themselves (see derivedDB, evaluatedDB).
+// Callers that must not hold the session's lock across the Transform (Run —
+// see snapshotForEvaluate's doc comment) should call snapshotForEvaluate and
+// evaluateSnapshot directly instead of this method.
 func (s *session) evaluate(ctx context.Context) (datalog.Database, error) {
-	ruleset := syntax.Ruleset{Rules: s.rules, AggRules: s.aggRules}
-	t, err := seminaive.New(s.engineOpts...).Compile(ruleset)
+	ruleset, engineOpts, db, _, err := s.snapshotForEvaluate()
 	if err != nil {
 		return nil, err
 	}
-	db, err := s.buildDB()
+	return evaluateSnapshot(ctx, ruleset, engineOpts, db)
+}
+
+// snapshotForEvaluate captures the state evaluate() needs — the ruleset,
+// engine options, the EDB snapshot, and the generation counter — so a caller
+// can run the expensive Compile+Transform (evaluateSnapshot) with no lock
+// held, mirroring prepareSchema/setSchema's split (mcp.go's setSchema: the
+// fix for set_schema previously holding h.mu across a full data reload).
+// Run (rules_editor.go's handleRulesRun) is this pattern's other caller: it
+// previously held wb.h.mu across evaluate's entire Transform, freezing every
+// page load, SSE connect, and MCP call for up to evalTimeout. gen is
+// session.gen as of this snapshot; a caller that wants to write a freshly
+// computed result back into derivedDB should only do so if the session's
+// CURRENT gen still equals the gen returned here — otherwise a set_schema/
+// set_rules/loadData landed while the Transform ran lock-free, and the
+// result reflects a ruleset/schema/data that no longer exists (same
+// reasoning as querySnapshot's gen field). Callers that share the session
+// across goroutines must hold their lock around this call only.
+func (s *session) snapshotForEvaluate() (ruleset syntax.Ruleset, engineOpts []seminaive.Option, db *memory.Database, gen uint64, err error) {
+	db, err = s.buildDB()
+	if err != nil {
+		return syntax.Ruleset{}, nil, nil, 0, err
+	}
+	return syntax.Ruleset{Rules: s.rules, AggRules: s.aggRules}, s.engineOpts, db, s.gen, nil
+}
+
+// evaluateSnapshot is evaluate's lock-free half: Compile+Transform against
+// an already-captured snapshot (snapshotForEvaluate), safe to run with no
+// session lock held at all. engineOpts carries seminaive.WithFactLimit(factCap)
+// (set once in newMCPHandlers — see session.engineOpts), so Transform halts
+// mid-evaluation with a seminaive.FactLimitError if the ruleset derives too
+// many facts; translateFactLimit reworks that into checkFactCap's familiar
+// "rule too broad" wording before it reaches a caller.
+func evaluateSnapshot(ctx context.Context, ruleset syntax.Ruleset, engineOpts []seminaive.Option, db *memory.Database) (datalog.Database, error) {
+	t, err := seminaive.New(engineOpts...).Compile(ruleset)
 	if err != nil {
 		return nil, err
 	}
-	return t.Transform(ctx, db)
+	out, err := t.Transform(ctx, db)
+	if err != nil {
+		return nil, translateFactLimit(err)
+	}
+	return out, nil
 }
 
 // evaluatedDB returns derivedDB if a successful evaluate() has populated it
@@ -354,11 +436,27 @@ func (s *session) evaluatedDB() (datalog.Database, error) {
 // sees the session as of snapshot time; mutations landing mid-query apply
 // to the next query, which is the only coherent ordering for the race
 // anyway.
+//
+// derived and gen exist so runQuery can skip re-deriving every IDB
+// predicate on each call (doc/features/mcp-server.md review item 6): derived
+// is session.derivedDB as of snapshot time (nil if the session has no valid
+// cached fixpoint — cleared by every mutator that invalidates it), and gen
+// is session.gen at the same moment. runQuery's cold path (derived == nil)
+// computes the ruleset's fixpoint once and stores it back into THIS
+// querySnapshot's derived field (see its pointer receiver); a caller that
+// wants to publish that fresh fixpoint back to the session for later
+// queries to reuse (mcp.go's query handler) may do so after the call
+// returns, but only if the session's CURRENT gen still equals the gen
+// captured here — otherwise something invalidated the session while this
+// query's Transform ran lock-free, and writing back would resurrect a
+// fixpoint computed against a ruleset/schema/data that no longer exists.
 type querySnapshot struct {
 	rules      []syntax.Rule
 	aggRules   []syntax.AggregateRule
 	engineOpts []seminaive.Option
 	db         *memory.Database
+	derived    datalog.Database
+	gen        uint64
 }
 
 // snapshotForQuery captures the state runQuery reads. Callers that share
@@ -375,6 +473,8 @@ func (s *session) snapshotForQuery() (querySnapshot, error) {
 		aggRules:   s.aggRules,
 		engineOpts: s.engineOpts,
 		db:         db,
+		derived:    s.derivedDB,
+		gen:        s.gen,
 	}, nil
 }
 
@@ -392,8 +492,33 @@ func (s *session) runQuery(ctx context.Context, q *syntax.Query) (rows [][]datal
 }
 
 // runQuery is runQuery's evaluation half: everything after the snapshot,
-// safe to run with no lock held.
-func (qs querySnapshot) runQuery(ctx context.Context, q *syntax.Query) (rows [][]datalog.Constant, vars []string, stats []seminaive.StratumStats, err error) {
+// safe to run with no lock held. It has a pointer receiver — not because it
+// needs one for the query itself, but so its cold path (see below) can
+// leave the freshly-derived fixpoint in qs.derived for the caller to
+// inspect afterward (qs is always an addressable local at every call site,
+// so this is source-compatible with every existing caller).
+//
+// Evaluation is split into two stages so a query never re-derives every IDB
+// predicate when the session already has (doc/features/mcp-server.md review
+// item 6): first, ensure qs.derived holds the ruleset's full fixpoint —
+// reusing it as-is if the caller's snapshot already had one (a Run/Apply
+// already computed it, or an earlier query on this same generation cached
+// it), otherwise compiling and evaluating qs.rules/qs.aggRules against
+// qs.db exactly once here. Second, compile and evaluate ONLY the synthetic
+// _q_ rule against that fixpoint — cheap, since every predicate the query
+// body references is already materialized. A session with no rules at all
+// skips stage one entirely (qs.db is already the whole fixpoint), matching
+// the pre-fix single-Transform cost exactly for that common case.
+//
+// Both stages' engine options come from qs.engineOpts, which carries
+// seminaive.WithFactLimit(factCap) by default (set once in newMCPHandlers —
+// see session.engineOpts' doc comment): each stage's own Transform halts
+// mid-evaluation with a seminaive.FactLimitError if IT derives too many new
+// facts, translated to the familiar "rule too broad" wording below. This
+// covers the synthetic _q_ stage too, which previously had no cap of its
+// own at all — a zero-rule session (stage one skipped, base = qs.db
+// verbatim) left the query's own cross product completely uncapped.
+func (qs *querySnapshot) runQuery(ctx context.Context, q *syntax.Query) (rows [][]datalog.Constant, vars []string, stats []seminaive.StratumStats, err error) {
 	vars = extractNamedVars(q.Body)
 
 	// Build synthetic rule: _q_(Var1, ..., VarN) :- body.
@@ -406,21 +531,57 @@ func (qs querySnapshot) runQuery(ctx context.Context, q *syntax.Query) (rows [][
 		Body: q.Body,
 	}
 
-	allRules := make([]syntax.Rule, len(qs.rules)+1)
-	copy(allRules, qs.rules)
-	allRules[len(qs.rules)] = synth
+	var baseStats []seminaive.StratumStats
+	base := qs.derived
+	if base == nil {
+		switch {
+		case len(qs.rules) == 0 && len(qs.aggRules) == 0:
+			// Nothing to derive: the EDB snapshot IS the whole fixpoint.
+			base = qs.db
+		default:
+			baseRuleset := syntax.Ruleset{Rules: qs.rules, AggRules: qs.aggRules}
+			baseOpts := append(qs.engineOpts[:len(qs.engineOpts):len(qs.engineOpts)],
+				seminaive.WithProfile(func(ss []seminaive.StratumStats) { baseStats = ss }))
+			bt, cerr := seminaive.New(baseOpts...).Compile(baseRuleset)
+			if cerr != nil {
+				return nil, vars, nil, cerr
+			}
+			base, err = bt.Transform(ctx, qs.db)
+			if err != nil {
+				// WithFactLimit (baseOpts, from qs.engineOpts) is enforced
+				// right where a rule can actually blow the working set up —
+				// the ruleset's OWN derivation, counted from zero for this
+				// Transform call — not against the query's raw input
+				// snapshot: a query against a legitimately large
+				// already-loaded dataset must still run to completion
+				// (review item 1's fix must not reject item 1's own
+				// regression test, a 1500-fact base read with zero rules).
+				return nil, vars, nil, translateFactLimit(err)
+			}
+		}
+		// Leave the freshly-derived fixpoint where the caller (if it holds
+		// the session's lock, e.g. mcp.go's query handler) can find it and
+		// cache it back into session.derivedDB for later queries — see this
+		// method's doc comment and querySnapshot.derived's.
+		qs.derived = base
+	}
 
-	ruleset := syntax.Ruleset{Rules: allRules, AggRules: qs.aggRules}
 	opts := append(qs.engineOpts[:len(qs.engineOpts):len(qs.engineOpts)],
 		seminaive.WithProfile(func(ss []seminaive.StratumStats) { stats = ss }))
-	t, err := seminaive.New(opts...).Compile(ruleset)
+	t, err := seminaive.New(opts...).Compile(syntax.Ruleset{Rules: []syntax.Rule{synth}})
 	if err != nil {
 		return nil, vars, nil, err
 	}
 
-	output, err := t.Transform(ctx, qs.db)
+	output, err := t.Transform(ctx, base)
+	stats = append(baseStats, stats...)
 	if err != nil {
-		return nil, vars, stats, err
+		// WithFactLimit applies here too (opts, from qs.engineOpts): this is
+		// the fix for the previously-uncapped hole — a zero-rule session
+		// skips the base stage above entirely, so this synthetic _q_
+		// Transform is the ONLY evaluation a cross-product query like
+		// `event(A,B,C), event(D,E,F), event(G,H,I)?` ever runs through.
+		return nil, vars, stats, translateFactLimit(err)
 	}
 
 	for row := range output.Facts("_q_", len(vars)) {

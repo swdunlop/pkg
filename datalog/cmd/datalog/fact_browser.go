@@ -10,6 +10,7 @@ import (
 	"github.com/swdunlop/html-go/datastar"
 	"swdunlop.dev/pkg/datalog"
 	"swdunlop.dev/pkg/datalog/cmd/datalog/view"
+	"swdunlop.dev/pkg/datalog/memory"
 )
 
 // factsPageSize is the number of facts paged per request, per
@@ -165,13 +166,13 @@ func renderPredicates(sess *session) (base, derived html.Content) {
 
 	db, err := sess.evaluatedDB()
 	if err == nil {
-		for name, arity := range db.Predicates() {
-			k := key{name, arity}
-			n := 0
-			for range db.Facts(name, arity) {
-				n++
+		// evaluatedDB always yields a *memory.Database under the hood (see
+		// mcp.go's listPredicates); PredicateCounts gives each count in O(1)
+		// instead of scanning every fact of every predicate under wb.h.mu.
+		if mdb, ok := db.(*memory.Database); ok {
+			for pa, n := range mdb.PredicateCounts() {
+				counts[key{pa.Name, pa.Arity}] = n
 			}
-			counts[k] = n
 		}
 	}
 

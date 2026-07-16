@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bufio"
 	"context"
 	stdflag "flag"
 	"fmt"
@@ -18,6 +19,9 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"swdunlop.dev/pkg/datalog"
+	"swdunlop.dev/pkg/datalog/jsonfacts"
+	"swdunlop.dev/pkg/datalog/memory"
+	"swdunlop.dev/pkg/datalog/seminaive"
 	"swdunlop.dev/pkg/datalog/syntax"
 )
 
@@ -65,6 +69,15 @@ func runMCP(args []string) {
 
 	srv := server.NewMCPServer("datalog", "0.1.0",
 		server.WithInstructions(mcpServerInstructions),
+		// WithRecovery: a panic in any tool handler (network hiccup in an
+		// external predicate, a nil-pointer bug, ...) must not take down the
+		// stdio server mid-conversation — the process serves this one
+		// long-lived session for the whole agent conversation, so a crash
+		// here is unrecoverable for every OTHER tool call too, not just the
+		// one that panicked. This option is the query path's ONLY panic
+		// guard — h.query runs Transform inline with no runRecovered of its
+		// own, unlike the web handlers.
+		server.WithRecovery(),
 	)
 	h.registerTools(srv)
 
@@ -111,6 +124,41 @@ func (h *mcpHandlers) lockedSnapshot() (querySnapshot, error) {
 	return h.sess.snapshotForQuery()
 }
 
+// cacheDerivedQuery writes a freshly computed base fixpoint (the query
+// handler's cold-path Transform — see querySnapshot.runQuery's doc comment,
+// and lockedSnapshot's caller in query()) back into session.derivedDB, so a
+// later query against the same generation can reuse it instead of
+// recomputing the whole base ruleset from scratch. This is query's half of
+// the write-back rules_editor.go's Run path already performs after its own
+// evaluateSnapshot call: same gen guard, same cap policy.
+//
+// base is never the synthetic _q_ stage's output — runQuery's cold path
+// populates querySnapshot.derived with the base ruleset's fixpoint BEFORE
+// running the _q_ stage, so what lands here has no _q_ facts in it by
+// construction. snapGen is the gen captured when the snapshot was taken
+// (querySnapshot.gen, itself session.gen as of lockedSnapshot); if the
+// session's current gen no longer matches, a set_rules/set_schema/loadData
+// landed while this query's Transform ran lock-free, and base reflects a
+// ruleset/schema/data that no longer exists, so the write-back is silently
+// dropped — mirroring runApplyRulesDocument's `wb.h.sess.gen == snapGen`
+// guard (rules_editor.go). A base fixpoint that fails checkFactCap
+// (sandbox.go) is refused rather than cached, exactly as the Run/startup
+// paths already refuse to cache one: a query must not be able to cache what
+// Run would refuse.
+func (h *mcpHandlers) cacheDerivedQuery(base datalog.Database, snapGen uint64) {
+	if base == nil {
+		return
+	}
+	if err := checkFactCap(base); err != nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.sess.gen == snapGen {
+		h.sess.derivedDB = base
+	}
+}
+
 // newMCPHandlers opens the data source named by dataDir and constructs the
 // handlers. dataDir is either a directory (confined via dataRoot/os.Root)
 // or a .zip file (confined via fs.ValidPath, since zip.Reader already
@@ -152,7 +200,17 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, timeout time
 		closeFn = root.Close
 	}
 
-	sess := &session{}
+	// WithFactLimit(factCap) (sandbox.go) is the default engine option for
+	// every seminaive.Engine this session's methods build — set here, once,
+	// rather than at each of the several Compile call sites (session.go's
+	// setRules/setRulesWithQueries/evaluateSnapshot/runQuery, rules_editor.go's
+	// handleRulesCheck), so a query's two Transform stages (the base ruleset
+	// and the synthetic _q_ rule) and every other evaluation path share one
+	// mid-evaluation cap with no risk of a new call site forgetting it. Both
+	// `datalog mcp` (runMCP) and `datalog serve` (newWorkbench) build their
+	// session through this constructor, so both get the cap; the bare REPL
+	// (repl.go's newREPL) is a separate, uncapped surface not in scope here.
+	sess := &session{engineOpts: []seminaive.Option{seminaive.WithFactLimit(factCap)}}
 
 	if configPath != "" {
 		data, err := os.ReadFile(configPath)
@@ -177,9 +235,21 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, timeout time
 			closeFn()
 			return nil, nil, fmt.Errorf("reading rules %s: %w", rf, err)
 		}
-		if _, err := sess.loadProgram(string(data)); err != nil {
+		queries, err := sess.loadProgram(string(data))
+		if err != nil {
 			closeFn()
 			return nil, nil, fmt.Errorf("loading rules %s: %w", rf, err)
+		}
+		// Unlike the REPL's loadProgram (repl.go), which runs embedded '?'
+		// queries and prints their results, mcp/serve mode has nowhere to
+		// print to: stdio's stdout is the JSON-RPC channel, and serve has no
+		// console yet at this point in startup. Silently dropping them was
+		// the bug — warn by name instead, so an operator who pasted a REPL
+		// script wholesale learns why those queries never ran rather than
+		// wondering why nothing happened.
+		if len(queries) > 0 {
+			fmt.Fprintf(os.Stderr, "datalog: %s: %d embedded query statement(s) ignored "+
+				"(startup rule files load rules only; use the query tool to run queries)\n", rf, len(queries))
 		}
 		rulesText.Write(data)
 	}
@@ -200,9 +270,11 @@ func (h *mcpHandlers) registerTools(srv *server.MCPServer) {
 			mcp.WithDescription(mcpSetSchemaDescription),
 			mcp.WithInputSchema[setSchemaInput](),
 		),
+		// No h.mu here: like query, setSchema manages its own locking,
+		// holding it only around the cheap field swap — the expensive
+		// parse/confine/load work (prepareSchema) runs lock-free first. See
+		// setSchema's doc comment.
 		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in setSchemaInput) (setSchemaOutput, error) {
-			h.mu.Lock()
-			defer h.mu.Unlock()
 			return h.setSchema(in)
 		}),
 	)
@@ -219,7 +291,7 @@ func (h *mcpHandlers) registerTools(srv *server.MCPServer) {
 	)
 	srv.AddTool(
 		mcp.NewTool("query",
-			mcp.WithDescription(mcpQueryDescription),
+			mcp.WithDescription(mcpQueryDescription(h.timeout)),
 			mcp.WithInputSchema[queryInput](),
 		),
 		// No h.mu here: query manages the lock itself, holding it only for
@@ -256,9 +328,10 @@ func (h *mcpHandlers) registerTools(srv *server.MCPServer) {
 			mcp.WithDescription(mcpSampleInputDescription),
 			mcp.WithInputSchema[sampleInputInput](),
 		),
+		// No h.mu here: sample_input only ever reads h.fsys/h.confine, both
+		// immutable after construction (never reassigned), and touches no
+		// session state at all — see sampleInput's doc comment.
 		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in sampleInputInput) (sampleInputOutput, error) {
-			h.mu.Lock()
-			defer h.mu.Unlock()
 			return h.sampleInput(in)
 		}),
 	)
@@ -282,18 +355,47 @@ type setSchemaOutput struct {
 	Warnings   []string         `json:"warnings,omitempty"`
 }
 
+// setSchema runs the expensive parse/confine/*_from-resolve/load work
+// (session.prepareSchema) BEFORE taking h.mu, then holds the lock only for
+// the field swap, buildDB, and onChange — a query, another tool call, or a
+// workbench pane render no longer blocks for the duration of a full data
+// reload (the mechanism this fixes: set_schema previously held h.mu across
+// the whole call). Two set_schema calls racing each other each run their
+// own prepareSchema independently and then swap in whichever finishes last;
+// every field that swap touches (cfg, schemaText, dataDB, derivedDB) comes
+// from the SAME prepareSchema result and is assigned in one lock
+// acquisition, so last-swap-wins still leaves the session internally
+// coherent — never a schemaText from one submission paired with a dataDB
+// from another.
 func (h *mcpHandlers) setSchema(in setSchemaInput) (setSchemaOutput, error) {
-	if err := h.sess.setSchema(in.Schema, in.Format, h.fsys, h.confine); err != nil {
+	cfg, db, err := prepareSchema(in.Schema, in.Format, h.fsys, h.confine)
+	if err != nil {
 		return setSchemaOutput{}, err
 	}
-	db, err := h.sess.buildDB()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.applySchemaLocked(in.Schema, cfg, db)
+}
+
+// applySchemaLocked swaps a prepareSchema result into the session and fires
+// onChange. Callers must hold h.mu; the schema editor's Apply path takes the
+// lock itself so it can check its context for a Stop between acquiring the
+// lock and committing the swap.
+func (h *mcpHandlers) applySchemaLocked(schemaText string, cfg jsonfacts.Config, db *memory.Database) (setSchemaOutput, error) {
+	h.sess.cfg = cfg
+	h.sess.schemaText = schemaText
+	h.sess.dataDB = db
+	h.sess.derivedDB = nil
+	h.sess.gen++
+	full, err := h.sess.buildDB()
 	if err != nil {
 		return setSchemaOutput{}, err
 	}
 	if h.onChange != nil {
 		h.onChange()
 	}
-	return setSchemaOutput{Predicates: countPredicates(db)}, nil
+	return setSchemaOutput{Predicates: countPredicates(full)}, nil
 }
 
 // countPredicates enumerates every predicate/arity pair in db and counts
@@ -333,6 +435,9 @@ type setRulesOutput struct {
 	Predicates []string `json:"predicates"`
 }
 
+// setRules requires the caller to hold h.mu — unlike h.query, which manages
+// its own locking via lockedSnapshot/cacheDerivedQuery, its safety lives
+// entirely in the tool-handler wrapper that locks around it.
 func (h *mcpHandlers) setRules(in setRulesInput) (setRulesOutput, error) {
 	if err := h.sess.setRules(in.Source); err != nil {
 		return setRulesOutput{}, err
@@ -415,19 +520,28 @@ func (h *mcpHandlers) query(ctx context.Context, in queryInput) (queryOutput, er
 	if err != nil {
 		return queryOutput{}, err
 	}
+	// cold records whether this snapshot arrived with no cached fixpoint
+	// (session.derivedDB was nil as of lockedSnapshot), i.e. whether
+	// runQuery's cold path is about to compute one and leave it in
+	// snap.derived (querySnapshot.runQuery's pointer-receiver doc comment).
+	// Only in that case is there anything new worth writing back below —
+	// a snapshot that already had snap.derived populated reused the
+	// session's existing cache, and re-writing the same value back would
+	// just be a redundant checkFactCap + lock round trip.
+	cold := snap.derived == nil
 
 	rows, vars, stats, err := snap.runQuery(ctx, q)
 	if err != nil {
 		return queryOutput{}, err
 	}
+	if cold {
+		h.cacheDerivedQuery(snap.derived, snap.gen)
+	}
 
 	n := len(rows)
-	serialize := n
-	if serialize > limit {
-		serialize = limit
-	}
+	serialize := min(n, limit)
 	outRows := make([][]any, serialize)
-	for i := 0; i < serialize; i++ {
+	for i := range serialize {
 		row := make([]any, len(rows[i]))
 		for j, c := range rows[i] {
 			row[j] = constantToJSON(c)
@@ -561,19 +675,23 @@ func (h *mcpHandlers) listPredicates(_ listPredicatesInput) (listPredicatesOutpu
 	if err != nil {
 		return listPredicatesOutput{}, err
 	}
+	// evaluatedDB always yields a *memory.Database under the hood (buildDB
+	// returns one directly; evaluate's Transform wraps its result via
+	// interned.Memory.Wrap, which also produces one) — asserting here lets
+	// PredicateCounts replace a full scan-and-count with the fact-set's O(1)
+	// per-predicate lengths (doc/features/mcp-server.md review item 7).
+	mdb, ok := db.(*memory.Database)
+	if !ok {
+		return listPredicatesOutput{}, fmt.Errorf("list_predicates: internal error: unexpected database type %T", db)
+	}
 
 	type key struct {
 		name  string
 		arity int
 	}
 	counts := map[key]int{}
-	for name, arity := range db.Predicates() {
-		counts[key{name, arity}] = 0
-	}
-	for k := range counts {
-		for range db.Facts(k.name, k.arity) {
-			counts[k]++
-		}
+	for pa, n := range mdb.PredicateCounts() {
+		counts[key{pa.Name, pa.Arity}] = n
 	}
 	// IDB predicates: rule and aggregate-rule heads not already covered by
 	// loaded (EDB) facts.
@@ -638,18 +756,25 @@ func (h *mcpHandlers) sampleFacts(in sampleFactsInput) (sampleFactsOutput, error
 	if err != nil {
 		return sampleFactsOutput{}, err
 	}
+	mdb, ok := db.(*memory.Database)
+	if !ok {
+		return sampleFactsOutput{}, fmt.Errorf("sample_facts: internal error: unexpected database type %T", db)
+	}
+	// FactCount is O(1) (a fact-slice length), so Total no longer requires
+	// scanning past limit just to keep counting; the Facts range below now
+	// stops as soon as it has enough rows instead of exhausting the predicate.
+	total := mdb.FactCount(in.Predicate, in.Arity)
 
 	var out [][]any
-	total := 0
 	for row := range db.Facts(in.Predicate, in.Arity) {
-		total++
-		if len(out) < limit {
-			jsonRow := make([]any, len(row))
-			for i, c := range row {
-				jsonRow[i] = constantToJSON(c)
-			}
-			out = append(out, jsonRow)
+		if len(out) >= limit {
+			break
 		}
+		jsonRow := make([]any, len(row))
+		for i, c := range row {
+			jsonRow[i] = constantToJSON(c)
+		}
+		out = append(out, jsonRow)
 	}
 	return sampleFactsOutput{Facts: out, Total: total, Truncated: total > len(out)}, nil
 }
@@ -678,6 +803,17 @@ type sampleInputOutput struct {
 	Truncated  bool     `json:"truncated,omitempty"`
 }
 
+// sampleInput reads h.fsys and h.confine only — both are immutable after
+// newMCPHandlers/newWorkbench construction (never reassigned, per
+// mcpHandlers' field docs) and it touches no session state, so unlike the
+// other tool handlers it needs no h.mu at all (see registerTools). File
+// contents are streamed with a bufio.Reader rather than slurped whole via
+// io.ReadAll: a data file can be arbitrarily large, and the old
+// implementation held the entire file in memory (while ALSO holding h.mu,
+// blocking every other tool call) just to return a handful of lines.
+// Streaming still reads to EOF to report the file's true TotalLines (see
+// TestSampleInput_OffsetAndLimit), but only ever keeps "limit" lines'
+// worth of bytes in memory at once, not the whole file.
 func (h *mcpHandlers) sampleInput(in sampleInputInput) (sampleInputOutput, error) {
 	if in.File == "" {
 		var files []string
@@ -697,6 +833,10 @@ func (h *mcpHandlers) sampleInput(in sampleInputInput) (sampleInputOutput, error
 		return sampleInputOutput{Files: files}, nil
 	}
 
+	if in.Offset < 0 {
+		return sampleInputOutput{}, fmt.Errorf("sample_input: offset must be >= 0, got %d", in.Offset)
+	}
+
 	ref, err := h.confine(in.File)
 	if err != nil {
 		return sampleInputOutput{}, err
@@ -713,20 +853,27 @@ func (h *mcpHandlers) sampleInput(in sampleInputInput) (sampleInputOutput, error
 		limit = defaultSampleInputLimit
 	}
 
-	data, err := io.ReadAll(f)
-	if err != nil {
-		return sampleInputOutput{}, err
-	}
-
 	var lines []string
 	lineNum := 0
-	if len(data) > 0 {
-		text := strings.TrimSuffix(string(data), "\n")
-		for _, line := range strings.Split(text, "\n") {
+	r := bufio.NewReader(f)
+	for {
+		chunk, rerr := r.ReadString('\n')
+		// ReadString only ever returns an empty chunk together with a
+		// non-nil error (there is nothing left to count); any non-empty
+		// chunk — including a final newline-less partial line at EOF — is
+		// one more line, counted and (if in [offset, offset+limit)) kept.
+		if chunk != "" {
+			line := strings.TrimSuffix(strings.TrimSuffix(chunk, "\n"), "\r")
 			if lineNum >= in.Offset && len(lines) < limit {
-				lines = append(lines, truncateLine(strings.TrimSuffix(line, "\r")))
+				lines = append(lines, truncateLine(line))
 			}
 			lineNum++
+		}
+		if rerr != nil {
+			if rerr != io.EOF {
+				return sampleInputOutput{}, fmt.Errorf("reading %s: %w", in.File, rerr)
+			}
+			break
 		}
 	}
 

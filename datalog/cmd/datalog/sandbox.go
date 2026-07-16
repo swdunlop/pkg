@@ -2,12 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"swdunlop.dev/pkg/datalog"
+	"swdunlop.dev/pkg/datalog/seminaive"
 )
 
 // evalTimeout bounds Run, Apply, and agent query calls (doc/features/web-ui.md
@@ -18,11 +19,16 @@ const evalTimeout = 5 * time.Second
 
 // factCap is the hard per-evaluation output-fact limit (doc/features/web-ui.md):
 // hitting it halts evaluation and reports "rule too broad" rather than
-// letting a combinatorial ruleset run away. seminaive has no mid-evaluation
-// hook to enforce this during Transform (checked via `go doc`; see
-// checkFactCap's doc for the resulting post-hoc approach) — WithMaxIterations
-// bounds fixpoint iterations, not output cardinality, and there is no
-// per-stratum or per-fact callback to abort from mid-Transform.
+// letting a combinatorial ruleset run away. Every seminaive.Engine the
+// workbench builds is constructed with seminaive.WithFactLimit(factCap) (see
+// session.engineOpts, set once in newMCPHandlers and threaded through every
+// Compile call — evaluateSnapshot, runQuery's two stages, and the trial
+// compiles in handleRulesCheck/setRules), so the cap is enforced DURING
+// Transform: evaluation halts with a seminaive.FactLimitError the moment the
+// derived-fact count crosses factCap, rather than after a runaway cross
+// product has already materialized every tuple and exhausted memory.
+// translateFactLimit turns that typed error into the same "rule too broad"
+// wording checkFactCap below used to produce post-hoc.
 const factCap = 1000
 
 // jobs is the Global Cancel cancel-set (doc/notes/datastar.md §9): each
@@ -105,17 +111,23 @@ func runRecovered(fn func() error) <-chan error {
 	return done
 }
 
-// checkFactCap counts db's total facts across every predicate and reports
-// an error identifying the ruleset as too broad if the count exceeds
-// factCap. This is a post-Transform check, not a mid-evaluation halt:
-// `go doc swdunlop.dev/pkg/datalog/seminaive` exposes WithMaxIterations
-// (bounds fixpoint iterations) and WithProfile (post-hoc per-stratum
-// stats), but no option or hook that aborts Transform once output
-// cardinality crosses a threshold while it's still running. Enforcing the
-// cap mid-evaluation would need a new seminaive.Option (e.g. a per-stratum
-// fact-count callback that Transform consults after each iteration) — out
-// of scope here per the task's instruction not to modify seminaive; noted
-// for a follow-up engine change.
+// checkFactCap counts db's total facts across every predicate — base facts
+// loaded from the input source PLUS everything derived — and reports an
+// error identifying the ruleset as too broad if that total exceeds factCap.
+// This measures something WithFactLimit does not and so is NOT subsumed by
+// it: WithFactLimit (wired into every session.engineOpts, see factCap's doc
+// comment) only counts facts derived DURING one Transform call, deliberately
+// excluding whatever was already loaded, so a query against a large but
+// legitimate already-loaded dataset still runs to completion. checkFactCap's
+// total-size check exists for a different purpose — deciding whether Run's
+// result is small enough to cache into session.derivedDB (rules_editor.go's
+// handleRulesRun) or to keep resident after startup evaluation (serve.go's
+// newWorkbench) — where what matters is how much this evaluation will hold
+// in memory as the workbench's cached "derived" view, not just how much of
+// it this one Transform call newly computed. It remains a post-Transform
+// check (there is no cheaper way to size a whole database), called only
+// after Transform has already succeeded — WithFactLimit's mid-evaluation
+// halt still bounds peak allocation during that Transform itself.
 func checkFactCap(db datalog.Database) error {
 	total := 0
 	for name, arity := range db.Predicates() {
@@ -129,25 +141,20 @@ func checkFactCap(db datalog.Database) error {
 	return nil
 }
 
-// generation is a monotonically increasing counter used for stale
-// suppression (doc/features/web-ui.md): a newer evaluation supersedes an
-// in-flight one, and only the result for the latest editor content is
-// patched. Handlers call Next() when starting an evaluation and pass the
-// returned token to Current() when the result is ready; if the token no
-// longer matches, the result is discarded rather than patched.
-type generation struct {
-	n atomic.Uint64
+// translateFactLimit rewords a seminaive.FactLimitError (matchable via
+// errors.As — see WithFactLimit's doc comment in seminaive/engine.go) into
+// the same "rule too broad ... halting" phrasing checkFactCap's post-hoc
+// check used, so a caller can't tell from the message alone which mechanism
+// caught the runaway ruleset: the mid-evaluation halt and the old post-hoc
+// check are meant to read identically to the human or agent on the other
+// end. err is returned unchanged if it does not wrap a FactLimitError.
+// Callers wrap every Transform call whose error can reach a user-facing
+// surface (evaluateSnapshot, runQuery's two stages) with this.
+func translateFactLimit(err error) error {
+	var limitErr seminaive.FactLimitError
+	if errors.As(err, &limitErr) {
+		return fmt.Errorf("rule too broad: evaluation derived more than %d facts, halting", limitErr.Limit)
+	}
+	return err
 }
 
-// Next advances the generation and returns the new token for an
-// in-flight evaluation to check against later.
-func (g *generation) Next() uint64 { return g.n.Add(1) }
-
-// Current returns the latest token. A caller holding an older token from
-// Next knows its result is stale if Current() != its token.
-func (g *generation) Current() uint64 { return g.n.Load() }
-
-// Stale reports whether token no longer matches the current generation —
-// i.e. a newer evaluation has started since this one did, so the caller's
-// result should be discarded rather than patched.
-func (g *generation) Stale(token uint64) bool { return g.Current() != token }

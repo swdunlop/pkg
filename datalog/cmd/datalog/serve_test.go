@@ -52,6 +52,35 @@ func newMordorWorkbench(t *testing.T) *workbench {
 	return wb
 }
 
+// mcpURL feeds the ACP agent subprocess's dial address: a wildcard bind
+// host (0.0.0.0, ::, or the empty host-less form) must resolve to a
+// dialable loopback address, not propagate verbatim, and a malformed
+// --listen value must still recover the real port rather than silently
+// falling back to the flag's unrelated default.
+func TestMcpURL(t *testing.T) {
+	cases := []struct {
+		listen string
+		want   string
+	}{
+		{"127.0.0.1:8080", "http://127.0.0.1:8080/mcp"},
+		{":8080", "http://127.0.0.1:8080/mcp"},
+		{":9090", "http://127.0.0.1:9090/mcp"},
+		{"0.0.0.0:9090", "http://127.0.0.1:9090/mcp"},
+		{"[::]:9090", "http://127.0.0.1:9090/mcp"},
+		{"example.internal:9090", "http://example.internal:9090/mcp"},
+		{"9090", "http://127.0.0.1:9090/mcp"},        // bare port, no colon at all
+		{"not-a-valid-listen", "http://127.0.0.1:8080/mcp"}, // unrecoverable: falls back to the flag default
+		{"[::1]:8080", "http://[::1]:8080/mcp"},             // IPv6 literal must stay bracketed
+		{"[2001:db8::1]:9090", "http://[2001:db8::1]:9090/mcp"},
+	}
+	for _, c := range cases {
+		got := mcpURL(c.listen)
+		if got != c.want {
+			t.Errorf("mcpURL(%q) = %q, want %q", c.listen, got, c.want)
+		}
+	}
+}
+
 // TestStartupEvaluatesRules: a preloaded ruleset is evaluated during
 // newWorkbench, so derived predicates are browsable (and agent-visible)
 // immediately — nobody has to remember to press Run after starting serve.
@@ -320,6 +349,88 @@ func TestHTTP_EventsSubscription(t *testing.T) {
 	}
 }
 
+// TestHTTP_EventsReplaysCurrentBusyOnConnect is the regression for item 7:
+// $busy initializes to '' client-side, and before this fix handleEvents
+// never replayed the current key, so a browser tab opened while a job was
+// already running showed idle — no Stop control, no visible feedback —
+// until that job happened to finish and publish "". This simulates a job
+// already in flight (publishBusy("run"), as handleRulesRun would have
+// called before this connection ever opened) and asserts a fresh /events
+// connection sees a busy:"run" signal patch shortly after connecting,
+// alongside the initial predicates fragment.
+func TestHTTP_EventsReplaysCurrentBusyOnConnect(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	srv := startTestServer(wb)
+	defer srv.Close()
+
+	wb.publishBusy("run")
+	defer wb.publishBusy("")
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/events", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /events: %v", err)
+	}
+	defer resp.Body.Close()
+
+	type frame struct {
+		data string
+		err  error
+	}
+	frames := make(chan frame, 8)
+	go func() {
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+		var cur strings.Builder
+		for scanner.Scan() {
+			line := scanner.Text()
+			if line == "" {
+				if cur.Len() > 0 {
+					frames <- frame{data: cur.String()}
+					cur.Reset()
+				}
+				continue
+			}
+			if data, ok := strings.CutPrefix(line, "data: "); ok {
+				if cur.Len() > 0 {
+					cur.WriteByte('\n')
+				}
+				cur.WriteString(data)
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			frames <- frame{err: err}
+		}
+	}()
+
+	found := false
+	for i := 0; i < 3 && !found; i++ {
+		select {
+		case f := <-frames:
+			if f.err != nil {
+				t.Fatalf("reading /events frame: %v", f.err)
+			}
+			if strings.Contains(f.data, `"busy":"run"`) {
+				found = true
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for the replayed busy signal")
+		}
+	}
+	if !found {
+		t.Fatal("a fresh /events connection did not replay the current busy key ('run'); a tab opened mid-job would show idle with no way to stop it")
+	}
+}
+
 // -- 3. confinement over HTTP -----------------------------------------------
 
 func TestHTTP_ConfinementRejectsEscape(t *testing.T) {
@@ -406,38 +517,20 @@ func TestHTTP_CancelDuringRun(t *testing.T) {
 	io.Copy(io.Discard, resp.Body)
 }
 
-// TestGeneration_StaleSuppression is the direct unit test on
-// generation.Next/Stale (sandbox.go), per the task: exercise the primitive
-// directly rather than only through a flaky handler-level race.
-func TestGeneration_StaleSuppression(t *testing.T) {
-	var g generation
-
-	token1 := g.Next()
-	if g.Stale(token1) {
-		t.Fatal("generation: freshly issued token reported stale")
-	}
-
-	token2 := g.Next()
-	if !g.Stale(token1) {
-		t.Fatal("generation: older token not reported stale after a newer Next()")
-	}
-	if g.Stale(token2) {
-		t.Fatal("generation: latest token incorrectly reported stale")
-	}
-}
-
-// TestHTTP_StaleSuppression exercises stale suppression at the handler
-// level: two /rules/run requests for different rules text, run back to
-// back; because handleRulesRun is job-gated (only one Run in flight at a
-// time via wb.jobs.Begin(rulesRunJobKey)), the second call is serialized
-// after the first completes, so genuine mid-flight staleness on THIS
-// specific job key is not directly observable via two sequential HTTP
-// calls. What IS observable and asserted here: wb.gen.Next() advances
-// across sequential Run calls (each Run takes a fresh token), and the final
-// #rules-results fragment reflects the LAST call's rules text, not a stale
-// intermediate result — i.e. no interleaving artifact survives into the
-// final state.
-func TestHTTP_StaleSuppression(t *testing.T) {
+// TestHTTP_SequentialRunsReflectLatest exercises stale suppression at the
+// handler level: two /rules/run requests for different rules text, run back
+// to back. handleRulesRun is job-gated (only one Run in flight at a time via
+// wb.jobs.Begin(rulesRunJobKey)), so the second call is serialized after the
+// first completes — genuine mid-flight staleness on THIS specific job key is
+// not directly observable via two sequential HTTP calls. What this asserts:
+// the final #rules-results fragment reflects the LAST call's rules text, not
+// a stale intermediate result — i.e. no interleaving artifact survives into
+// the final state. (This test previously also asserted a workbench-level
+// wb.gen token advanced across calls; that mechanism was dead — nothing
+// outside this handler's own single in-flight call could ever make a token
+// stale, since Begin already serializes every Run on rulesRunJobKey — and
+// was removed rather than kept alive just to be observed.)
+func TestHTTP_SequentialRunsReflectLatest(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 3)
 	wb := newTestWorkbench(t, dir, "", nil, "test-token")
@@ -448,25 +541,13 @@ func TestHTTP_StaleSuppression(t *testing.T) {
 		t.Fatalf("priming schema: %v", err)
 	}
 
-	before := wb.gen.Current()
-
 	resp1 := postSignals(t, srv, "/rules/run", map[string]any{"rulesText": "foo(X) :- event(_, X, _).\nfoo(X)?\n"})
 	io.Copy(io.Discard, resp1.Body)
 	resp1.Body.Close()
 
-	mid := wb.gen.Current()
-	if mid <= before {
-		t.Fatalf("generation did not advance after first Run: before=%d mid=%d", before, mid)
-	}
-
 	resp2 := postSignals(t, srv, "/rules/run", map[string]any{"rulesText": "bar(X) :- event(_, X, _).\nbar(X)?\n"})
 	body2, _ := io.ReadAll(resp2.Body)
 	resp2.Body.Close()
-
-	after := wb.gen.Current()
-	if after <= mid {
-		t.Fatalf("generation did not advance after second Run: mid=%d after=%d", mid, after)
-	}
 
 	joined := string(body2)
 	if !strings.Contains(joined, "bar") {

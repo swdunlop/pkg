@@ -204,6 +204,12 @@ func (a *fakeACPAgent) Prompt(ctx context.Context, params acp.PromptRequest) (ac
 		return a.promptReadOnlyPermScript(ctx, params)
 	case "sparse-terminal-update":
 		return a.promptSparseTerminalUpdateScript(ctx, params)
+	case "rpc-error":
+		// A genuine, well-formed JSON-RPC error response: the process stays
+		// alive and the connection stays healthy, unlike "exit3" — acpDriver
+		// must return this immediately rather than paying the crash-race
+		// grace window exit3 needs (acp.go's Prompt).
+		return acp.PromptResponse{}, acp.NewInvalidParams("bad prompt, on purpose")
 	default:
 		return a.promptFullScript(ctx, params)
 	}
@@ -939,6 +945,42 @@ func TestACPDriver_AgentExitSurfacesAsPromptError(t *testing.T) {
 	}
 	if !strings.Contains(promptErr.Error(), "agent exited (code 3)") {
 		t.Fatalf("Prompt error = %q, want it to contain %q", promptErr.Error(), "agent exited (code 3)")
+	}
+}
+
+// TestACPDriver_RPCErrorReturnsImmediately uses the "rpc-error" script: the
+// fake agent stays alive and answers session/prompt with a genuine,
+// well-formed JSON-RPC error (acp.NewInvalidParams) instead of exiting.
+// Unlike TestACPDriver_AgentExitSurfacesAsPromptError's crash case, the
+// connection never breaks here, so acp.go's Prompt must not pay its 500ms
+// exited-channel grace window before returning the error — this asserts a
+// generous upper bound (200ms) well under that window, so a regression back
+// to the unconditional wait fails this test.
+func TestACPDriver_RPCErrorReturnsImmediately(t *testing.T) {
+	_, _, cfg := newACPTestWorkbenchAndServer(t)
+	setFakeACPAgentScript(t, "rpc-error")
+
+	driver, err := newACPDriver(cfg)
+	if err != nil {
+		t.Fatalf("newACPDriver: %v", err)
+	}
+	defer driver.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, promptErr := driver.Prompt(ctx, "this will fail with a genuine RPC error", func(agentEvent) {})
+	elapsed := time.Since(start)
+
+	if promptErr == nil {
+		t.Fatal("Prompt returned no error for a scripted RPC error response")
+	}
+	if strings.Contains(promptErr.Error(), "agent exited") {
+		t.Fatalf("Prompt error = %q, a live agent's RPC error must not be reported as an exit", promptErr.Error())
+	}
+	if elapsed >= 200*time.Millisecond {
+		t.Fatalf("Prompt took %s to return a genuine RPC error; want well under the 500ms exited-channel grace window (it should not wait on it at all)", elapsed)
 	}
 }
 

@@ -120,8 +120,6 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 	wb.publishBusy(rulesRunJobKey)
 	defer wb.publishBusy("")
 
-	token := wb.gen.Next()
-
 	if decodeErr != nil {
 		_ = stream.Emit(datastar.Elements(statusFragment("")), datastar.Elements(errorList([]string{decodeErr.Error()})))
 		return
@@ -134,25 +132,24 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 
 	// Apply the document (atomic replace of rules/aggRules/rulesText, plus
 	// the embedded queries the workbench — unlike set_rules — accepts).
-	var queries []syntax.Query
-	applyErr := <-runRecovered(func() error {
-		wb.h.mu.Lock()
-		defer wb.h.mu.Unlock()
-		qs, err := wb.h.sess.setRulesWithQueries(sig.RulesText)
-		queries = qs
-		return err
-	})
+	// runApplyRulesDocument checks ctx AFTER acquiring wb.h.mu and BEFORE
+	// mutating (mirroring runApplySchema's late-arrival guard,
+	// jsonfacts_editor.go): a Stop or expired deadline racing the lock must
+	// never land a mutation this handler is about to report as "not
+	// applied."
+	res := <-runApplyRulesDocument(ctx, wb, sig.RulesText)
+	queries := res.queries
 
 	if ctx.Err() != nil {
+		wb.h.mu.Lock()
+		wb.publishSessionChanged()
+		wb.h.mu.Unlock()
 		_ = stream.Emit(datastar.Elements(statusFragment(evalHaltStatus(ctx, "run stopped"))))
 		return
 	}
-	if applyErr != nil {
-		_ = stream.Emit(datastar.Elements(statusFragment("")), datastar.Elements(errorList([]string{applyErr.Error()})))
+	if res.err != nil {
+		_ = stream.Emit(datastar.Elements(statusFragment("")), datastar.Elements(errorList([]string{res.err.Error()})))
 		return
-	}
-	if wb.gen.Stale(token) {
-		return // a newer Run superseded this one; discard our result
 	}
 
 	// Evaluate the applied ruleset once, unconditionally, and cache the
@@ -165,23 +162,47 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 	// derived predicates as empty regardless of what Run just computed. A
 	// failure here doesn't abort the request; queries below can still
 	// succeed or fail independently, exactly as before this change.
+	//
+	// The snapshot/Transform/swap-back split mirrors set_schema's
+	// prepareSchema/applySchemaLocked split (mcp.go, session.go's
+	// snapshotForEvaluate doc comment): wb.h.mu is held only to capture the
+	// inputs and, afterward, to commit the result — the Transform itself
+	// (which can run for up to evalTimeout) runs lock-free, so Run no
+	// longer freezes every page load, SSE connect, and MCP call for its
+	// duration. The over-cap check happens BEFORE caching or publishing,
+	// matching the startup evaluation's order (serve.go): a rule that blows
+	// the cap must never be cached or shown as this run's "derived" data,
+	// even momentarily.
+	wb.h.mu.Lock()
+	ruleset, engineOpts, db, snapGen, buildErr := wb.h.sess.snapshotForEvaluate()
+	wb.h.mu.Unlock()
+
 	var evaluated datalog.Database
-	var evalErr error
-	evalErr = <-runRecovered(func() error {
-		wb.h.mu.Lock()
-		defer wb.h.mu.Unlock()
-		var err error
-		evaluated, err = wb.h.sess.evaluate(ctx)
-		if err == nil {
-			wb.h.sess.derivedDB = evaluated
-		}
-		return err
-	})
-	if ctx.Err() != nil {
-		_ = stream.Emit(datastar.Elements(statusFragment(evalHaltStatus(ctx, "run stopped"))))
-		return
+	evalErr := buildErr
+	if buildErr == nil {
+		evalErr = <-runRecovered(func() error {
+			var err error
+			evaluated, err = evaluateSnapshot(ctx, ruleset, engineOpts, db)
+			return err
+		})
 	}
-	if wb.gen.Stale(token) {
+
+	var capErr error
+	if evalErr == nil {
+		capErr = checkFactCap(evaluated)
+	}
+
+	wb.h.mu.Lock()
+	if ctx.Err() == nil && evalErr == nil && capErr == nil && wb.h.sess.gen == snapGen {
+		wb.h.sess.derivedDB = evaluated
+	}
+	wb.h.mu.Unlock()
+
+	if ctx.Err() != nil {
+		wb.h.mu.Lock()
+		wb.publishSessionChanged()
+		wb.h.mu.Unlock()
+		_ = stream.Emit(datastar.Elements(statusFragment(evalHaltStatus(ctx, "run stopped"))))
 		return
 	}
 
@@ -189,7 +210,7 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 		var blocks []queryResultBlock
 		if evalErr != nil {
 			blocks = append(blocks, queryResultBlock{Err: evalErr.Error()})
-		} else if capErr := checkFactCap(evaluated); capErr != nil {
+		} else if capErr != nil {
 			blocks = append(blocks, queryResultBlock{Err: capErr.Error()})
 		}
 		wb.h.mu.Lock()
@@ -238,22 +259,55 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 
 	if evalErr != nil {
 		blocks = append(blocks, queryResultBlock{Err: evalErr.Error()})
-	} else if capErr := checkFactCap(evaluated); capErr != nil {
+	} else if capErr != nil {
 		blocks = append(blocks, queryResultBlock{Err: capErr.Error()})
 	}
 	wb.h.mu.Lock()
 	wb.publishSessionChanged()
 	wb.h.mu.Unlock()
 
-	if wb.gen.Stale(token) {
-		return
-	}
-
 	status := ""
 	if timedOut {
 		status = evalHaltStatus(ctx, "run stopped")
 	}
 	_ = stream.Emit(datastar.Elements(statusFragment(status)), datastar.Elements(resultsFragment(blocks)))
+}
+
+// applyRulesResult is runApplyRulesDocument's result payload.
+type applyRulesResult struct {
+	queries []syntax.Query
+	err     error
+}
+
+// runApplyRulesDocument runs setRulesWithQueries under wb.h.mu, via
+// runRecovered for panic recovery, mirroring runApplySchema's ctx-after-lock
+// guard (jsonfacts_editor.go): ctx.Err() is checked AFTER acquiring wb.h.mu
+// and BEFORE calling setRulesWithQueries, so a Stop or expired deadline
+// racing the lock can never land a rules mutation the handler is about to
+// report as "not applied" (run stopped). Before this fix, nothing gated the
+// call at all — a stopped run could still replace the session's rules while
+// reporting "run stopped." Parse/compile (setRulesWithQueries' own cost) is
+// cheap relative to evalTimeout, so — unlike setSchema's data reload —
+// holding wb.h.mu across the whole call is fine; there is no lock-free
+// "prepare" half worth splitting out here.
+func runApplyRulesDocument(ctx context.Context, wb *workbench, rulesText string) <-chan applyRulesResult {
+	out := make(chan applyRulesResult, 1)
+	var queries []syntax.Query
+	done := runRecovered(func() error {
+		wb.h.mu.Lock()
+		defer wb.h.mu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		qs, err := wb.h.sess.setRulesWithQueries(rulesText)
+		queries = qs
+		return err
+	})
+	go func() {
+		err := <-done
+		out <- applyRulesResult{queries: queries, err: err}
+	}()
+	return out
 }
 
 // evalHaltStatus words the status line for an evaluation ctx that ended

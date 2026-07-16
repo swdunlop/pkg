@@ -146,10 +146,19 @@ func agentActivity() html.Content {
 // never runs under it). The button is one control with three faces off the
 // shared $busy mutex:
 //
-//   - idle:       ↑ posts the prompt
-//   - agent busy: ■ posts /cancel — no spinner ring; agentActivity beside
-//     it is the pane's one running indicator
-//   - run/apply busy: disabled, making the mutex visible from this side too
+//   - idle:                 ↑ posts the prompt
+//   - agent busy:           ■ posts /cancel — no spinner ring; agentActivity
+//     beside it is the pane's one running indicator
+//   - run/apply/query busy: disabled, making the mutex visible from this
+//     side too — mirrors BusyActionButton's own "$busy && $busy !== own
+//     key" gate (page.go), so this stays correct if a new busy key is ever
+//     added rather than needing its hardcoded list extended again. Before
+//     this fix, only 'run'/'apply' disabled the button: 'query' (the
+//     console Run button's key) did not, so starting a turn while a query
+//     was in flight clobbered the query's Stop affordance with the agent's,
+//     and the query finishing afterward published busy:'' over the agent
+//     turn still in progress (publishBusy is last-writer-wins across
+//     distinct job keys — see its doc comment in serve.go).
 //
 // Enter sends (guarded on !$busy so it cannot double-fire mid-turn),
 // Shift+Enter inserts a newline via the browser's default behavior.
@@ -161,7 +170,7 @@ func promptInputRow() html.Content {
 				Set("data-bind:console-prompt").
 				Set("data-on:keydown", "evt.key === 'Enter' && !evt.shiftKey && (evt.preventDefault(), !$busy && @post('/console/prompt'))"),
 			tag.New("button#console-send").
-				Set("data-attr:disabled", "$busy === 'run' || $busy === 'apply'").
+				Set("data-attr:disabled", "$busy && $busy !== 'agent'").
 				Set("data-attr:title", "$busy === 'agent' ? 'stop the running turn' : 'send'").
 				Set("data-text", "$busy === 'agent' ? '■' : '↑'").
 				Set("data-on:click", "$busy === 'agent' ? @post('/cancel') : @post('/console/prompt')").

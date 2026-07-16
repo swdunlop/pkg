@@ -300,20 +300,30 @@ func (r *repl) tabComplete(line []rune, cursor int, _ readline.DelayedTabContext
 	return ret
 }
 
-// completeFilePath returns completions for a partial file path.
+// completeFilePath returns completions for a partial file path. Suggestions
+// are the suffix readline should APPEND to partial verbatim (see
+// tabComplete's doc comment), so this must never reconstruct the directory
+// portion via filepath.Dir/Base/Join: those normalize away exactly the
+// prefix partial still carries (e.g. "./x" -> Dir "."), and slicing that
+// normalized reconstruction by len(partial) either produces suggestions
+// misaligned with what the user actually typed or, when the normalized
+// path is shorter than partial (e.g. partial "./x" against a one-character
+// file "x"), panics with a slice-bounds-out-of-range that readline has no
+// recover for — taking the whole REPL process down. Splitting partial on
+// its own last separator instead keeps dirPart exactly as typed (including
+// any "./" or "../"), so a suggestion of name[len(base):] appended after
+// partial always reconstructs dirPart+name correctly, with no
+// reconstruction or re-slicing of the typed prefix at all.
 func completeFilePath(partial string) *readline.TabCompleterReturnT {
 	ret := &readline.TabCompleterReturnT{}
-	dir := filepath.Dir(partial)
+
+	dirPart, base := "", partial
+	if i := strings.LastIndexByte(partial, filepath.Separator); i >= 0 {
+		dirPart, base = partial[:i+1], partial[i+1:]
+	}
+	dir := dirPart
 	if dir == "" {
 		dir = "."
-	}
-	base := filepath.Base(partial)
-	if partial == "" || strings.HasSuffix(partial, string(filepath.Separator)) {
-		dir = partial
-		if dir == "" {
-			dir = "."
-		}
-		base = ""
 	}
 
 	entries, err := os.ReadDir(dir)
@@ -329,14 +339,11 @@ func completeFilePath(partial string) *readline.TabCompleterReturnT {
 		if base != "" && !strings.HasPrefix(name, base) {
 			continue
 		}
-		path := filepath.Join(dir, name)
-		if dir == "." {
-			path = name
-		}
+		suggestion := name[len(base):]
 		if e.IsDir() {
-			path += string(filepath.Separator)
+			suggestion += string(filepath.Separator)
 		}
-		ret.Suggestions = append(ret.Suggestions, path[len(partial):])
+		ret.Suggestions = append(ret.Suggestions, suggestion)
 	}
 	ret.Prefix = partial
 	return ret
@@ -373,10 +380,19 @@ func (r *repl) dispatchCommand(line string) error {
 	return fmt.Errorf("unknown command: %s (type .help for commands)", name)
 }
 
-// fileHistory persists REPL line history to a file, appending each new entry.
+// replHistoryLimit bounds the in-memory REPL history; the history file is
+// compacted back down to this many lines once appends grow it past twice
+// the limit, so the file stays under ~2x the bound too.
+const replHistoryLimit = 1000
+
+// fileHistory persists REPL line history to a file, appending each new
+// entry and compacting per replHistoryLimit. Write failures are reported
+// once per session rather than per keystroke.
 type fileHistory struct {
-	items []string
-	path  string
+	items     []string
+	path      string
+	fileLines int
+	warned    bool
 }
 
 func loadFileHistory(path string) *fileHistory {
@@ -387,6 +403,10 @@ func loadFileHistory(path string) *fileHistory {
 				h.items = append(h.items, line)
 			}
 		}
+	}
+	h.fileLines = len(h.items)
+	if n := len(h.items); n > replHistoryLimit {
+		h.items = append([]string(nil), h.items[n-replHistoryLimit:]...)
 	}
 	return h
 }
@@ -400,13 +420,48 @@ func (h *fileHistory) Write(s string) (int, error) {
 		return n, nil
 	}
 	h.items = append(h.items, s)
-	if h.path != "" {
-		if f, err := os.OpenFile(h.path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600); err == nil {
-			fmt.Fprintln(f, s)
-			f.Close()
-		}
+	if n := len(h.items); n > replHistoryLimit {
+		h.items = h.items[n-replHistoryLimit:]
 	}
+	h.persist(s)
 	return len(h.items), nil
+}
+
+// persist appends s to the history file, or rewrites the file with the
+// retained tail when appends have grown it past 2x replHistoryLimit.
+func (h *fileHistory) persist(s string) {
+	if h.path == "" {
+		return
+	}
+	if h.fileLines+1 > 2*replHistoryLimit {
+		data := strings.Join(h.items, "\n") + "\n"
+		if err := os.WriteFile(h.path, []byte(data), 0600); err != nil {
+			h.warn(err)
+			return
+		}
+		h.fileLines = len(h.items)
+		return
+	}
+	f, err := os.OpenFile(h.path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600)
+	if err != nil {
+		h.warn(err)
+		return
+	}
+	if _, err := fmt.Fprintln(f, s); err != nil {
+		h.warn(err)
+	}
+	if err := f.Close(); err != nil {
+		h.warn(err)
+	}
+	h.fileLines++
+}
+
+func (h *fileHistory) warn(err error) {
+	if h.warned {
+		return
+	}
+	h.warned = true
+	fmt.Fprintf(os.Stderr, "datalog: cannot save REPL history: %v\n", err)
 }
 
 func (h *fileHistory) GetLine(i int) (string, error) {

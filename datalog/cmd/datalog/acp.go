@@ -56,6 +56,18 @@ type acpDriver struct {
 	pendingMu sync.Mutex
 	pending   map[string]chan acp.RequestPermissionOutcome
 
+	// pendingCancelled marks that cancelPending has already run for the
+	// CURRENT turn — closing the window where a request_permission RPC
+	// registers itself in pending after cancelPending drained it (the
+	// agent can still be mid-flight on another tool call when
+	// session/cancel lands) and would otherwise park forever, since
+	// cancelPending only runs once per cancelled turn. RequestPermission
+	// checks this under the same pendingMu lock it inserts under, so the
+	// two orderings — cancel-then-register or register-then-cancel — both
+	// resolve correctly (see RequestPermission and cancelPending). Reset
+	// to false at the start of every Prompt call.
+	pendingCancelled bool
+
 	// sink is the current turn's event target, valid only while a Prompt
 	// call is in flight; acpClient's callbacks (arriving on the connection's
 	// own goroutine, per the SDK's contract) read it under mu. There is only
@@ -249,6 +261,9 @@ func (d *acpDriver) Prompt(ctx context.Context, text string, sink func(agentEven
 	d.sink = sink
 	sessionID := d.sessionID
 	d.mu.Unlock()
+	d.pendingMu.Lock()
+	d.pendingCancelled = false
+	d.pendingMu.Unlock()
 	defer func() {
 		d.mu.Lock()
 		d.sink = nil
@@ -293,28 +308,39 @@ func (d *acpDriver) Prompt(ctx context.Context, text string, sink func(agentEven
 		if ctx.Err() != nil {
 			return d.cancelTurn(sessionID, alreadyDone(r))
 		}
-		// Symmetric race: a dying subprocess breaks the stdio pipe, which the
-		// SDK's own read/write loop observes independently of d.exited (the
-		// single monitor goroutine's cmd.Wait — see newACPDriver) — so
-		// d.conn.Prompt can return its own transport error ("peer
-		// disconnected before response") through promptDone before cmd.Wait
-		// has actually reaped the process and closed d.exited (a broken pipe
-		// is detectable slightly before wait(2) returns the exit status, so
-		// a bare non-blocking peek at d.exited loses this race almost every
-		// time). Giving d.exited a brief grace window — the process is
-		// already gone or dying, so this never meaningfully delays a normal
-		// turn — keeps the error message the design promises
-		// (acp-integration.md: "an agent crash renders an explicit 'agent
-		// exited (code N)' terminal state") regardless of which channel the
-		// runtime happened to service first.
 		if r.err != nil {
+			// d.conn.Done() closes when the connection's read/write loop
+			// itself gives up (peer pipe broken, EOF, ...) — the SAME
+			// condition that makes d.conn.Prompt synthesize the transport
+			// error just received as r.err, so checking it here (rather than
+			// unconditionally waiting below) tells apart the two cases this
+			// branch used to conflate: a genuine agent-side RPC error, where
+			// the connection is still healthy and Done() is not about to
+			// close, returns immediately; a transport failure, where Done()
+			// is already closed or closes within this same tick, still gets
+			// the grace window below.
 			select {
-			case <-d.exited:
-				return "", d.exitError()
-			case <-time.After(500 * time.Millisecond):
+			case <-d.conn.Done():
+				// The subprocess's death breaks the stdio pipe, which the
+				// SDK's own read/write loop observes independently of
+				// d.exited (the single monitor goroutine's cmd.Wait — see
+				// newACPDriver): a broken pipe is detectable slightly before
+				// wait(2) returns the exit status, so d.exited may not have
+				// closed yet even though Done() just did. Giving d.exited a
+				// brief grace window — the process is already gone or dying,
+				// so this never delays a genuine agent-side error, only a
+				// transport failure that was headed for this same outcome
+				// anyway — keeps the error message the design promises
+				// (acp-integration.md: "an agent crash renders an explicit
+				// 'agent exited (code N)' terminal state") regardless of
+				// which channel the runtime happened to service first.
+				select {
+				case <-d.exited:
+					return "", d.exitError()
+				case <-time.After(500 * time.Millisecond):
+				}
+			default:
 			}
-		}
-		if r.err != nil {
 			return "", r.err
 		}
 		return string(r.resp.StopReason), nil
@@ -431,6 +457,12 @@ func (d *acpDriver) cancelPending() {
 		ch <- acp.NewRequestPermissionOutcomeCancelled()
 		delete(d.pending, id)
 	}
+	// Marked under the same lock, in the same critical section, as the
+	// drain above: a request_permission RPC that registers into d.pending
+	// AFTER this point (see RequestPermission) cannot be reached by this
+	// call again, so it must see pendingCancelled instead of parking
+	// forever — see the field's doc comment.
+	d.pendingCancelled = true
 }
 
 // Answer resolves a pending permission request (agent.go's agentDriver
@@ -626,6 +658,15 @@ func (d *acpDriver) RequestPermission(ctx context.Context, params acp.RequestPer
 
 	ch := make(chan acp.RequestPermissionOutcome, 1)
 	d.pendingMu.Lock()
+	// If cancelPending already ran for this turn, it will never run again
+	// to resolve THIS request — registering into d.pending here would park
+	// it until the next turn's cancelPending (or forever, if there isn't
+	// one). Deny it immediately instead of blocking below (see
+	// pendingCancelled's doc comment).
+	if d.pendingCancelled {
+		d.pendingMu.Unlock()
+		return acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}, nil
+	}
 	d.pending[reqID] = ch
 	d.pendingMu.Unlock()
 

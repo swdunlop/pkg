@@ -1,6 +1,8 @@
 package view
 
 import (
+	"strings"
+
 	html "github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/tag"
 )
@@ -100,9 +102,5 @@ func JSONFactsErrors(errs []string) html.Content {
 
 // joinLines joins lines with newlines for a <pre> block.
 func joinLines(lines []string) string {
-	out := lines[0]
-	for _, l := range lines[1:] {
-		out += "\n" + l
-	}
-	return out
+	return strings.Join(lines, "\n")
 }

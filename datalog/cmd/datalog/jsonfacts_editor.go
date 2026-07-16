@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"testing/fstest"
 
 	html "github.com/swdunlop/html-go"
@@ -112,14 +113,7 @@ func extractRecord(cfg jsonfacts.Config, file, raw string) ([]string, error) {
 
 // joinArgs joins fact arguments with ", " for predicate(args...) rendering.
 func joinArgs(args []string) string {
-	if len(args) == 0 {
-		return ""
-	}
-	out := args[0]
-	for _, a := range args[1:] {
-		out += ", " + a
-	}
-	return out
+	return strings.Join(args, ", ")
 }
 
 // handleJSONFactsPreview is the debounced single-row-extraction endpoint
@@ -278,16 +272,27 @@ func runApplySchema(ctx context.Context, wb *workbench, schemaText string) <-cha
 	out := make(chan applySchemaResult, 1)
 	var result setSchemaOutput
 	done := runRecovered(func() error {
+		// The whole Apply — prepare and swap — runs under wb.h.mu, so an
+		// abandoned Apply parks HERE and the ctx guard below is the single
+		// gate between acquiring the lock and mutating anything. (The MCP
+		// set_schema path runs prepareSchema before locking instead; doing
+		// that here would let a prepare failure resolve the job before an
+		// in-flight Stop's ctx guard ever ran. The pane-freeze cost of
+		// loading under the lock is tracked in TODO.md.) h.setSchema is
+		// self-locking and must not be called with wb.h.mu held.
 		wb.h.mu.Lock()
 		defer wb.h.mu.Unlock()
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		var err error
-		// setSchema fires h.onChange (wired to publishSessionChanged by
-		// newWorkbench) on success, so no explicit publish here — a second
+		cfg, db, err := prepareSchema(schemaText, "yaml", wb.h.fsys, wb.h.confine)
+		if err != nil {
+			return err
+		}
+		// applySchemaLocked fires h.onChange (wired to publishSessionChanged
+		// by newWorkbench) on success, so no explicit publish here — a second
 		// one would fan out the same #predicates fragment twice per Apply.
-		result, err = wb.h.setSchema(setSchemaInput{Schema: schemaText, Format: "yaml"})
+		result, err = wb.h.applySchemaLocked(schemaText, cfg, db)
 		return err
 	})
 	go func() {

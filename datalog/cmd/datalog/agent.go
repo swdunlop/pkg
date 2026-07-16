@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/mark3labs/kit/pkg/kit"
 	"github.com/mark3labs/mcp-go/server"
@@ -177,9 +178,12 @@ func (d *kitDriver) Prompt(ctx context.Context, text string, sink func(agentEven
 	// (or kit's resolved streaming mode) doesn't stream the final text, the
 	// reply exists solely in TurnResult.Response, so it is replayed below as
 	// one message event rather than silently dropped.
-	var sawMessage bool
+	// sawMessage is written from kit's callback goroutine and read below
+	// after PromptResult returns, on no guaranteed happens-before edge
+	// between the two — atomic.Bool, not a plain bool, avoids the race.
+	var sawMessage atomic.Bool
 	unsubMsg := d.k.OnMessageUpdate(func(e kit.MessageUpdateEvent) {
-		sawMessage = true
+		sawMessage.Store(true)
 		sink(agentEvent{Kind: "message", Text: e.Chunk})
 	})
 	defer unsubMsg()
@@ -205,7 +209,7 @@ func (d *kitDriver) Prompt(ctx context.Context, text string, sink func(agentEven
 	if err != nil {
 		return "", err
 	}
-	if !sawMessage && res.Response != "" {
+	if !sawMessage.Load() && res.Response != "" {
 		sink(agentEvent{Kind: "message", Text: res.Response})
 	}
 	return res.StopReason, nil

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"os"
 	"testing"
+	"time"
 
 	acp "github.com/coder/acp-go-sdk"
 )
@@ -246,6 +248,61 @@ func TestPermissionEvent(t *testing.T) {
 	}
 	if ev.Options[1].ID != "reject" || ev.Options[1].Kind != "reject_once" {
 		t.Errorf("Options[1] = %+v", ev.Options[1])
+	}
+}
+
+// TestRequestPermission_LateArrivalAfterCancelPendingIsDenied covers the
+// window between cancelTurn's cancelPending call and Prompt's deferred
+// sink-clear: a request_permission RPC for a DIFFERENT tool call than the
+// one that triggered cancellation can still be mid-flight and register
+// itself into d.pending after cancelPending already drained it — nothing
+// will ever resolve that registration again this turn. RequestPermission
+// must instead recognize (via pendingCancelled, set by cancelPending under
+// the same pendingMu lock it registers under) that the turn is already
+// cancelled and deny immediately, rather than parking until some future
+// turn's cancelPending happens to run.
+func TestRequestPermission_LateArrivalAfterCancelPendingIsDenied(t *testing.T) {
+	d := &acpDriver{
+		pending:   map[string]chan acp.RequestPermissionOutcome{},
+		toolState: map[acp.ToolCallId]toolCallState{},
+	}
+	// Simulate cancelTurn's cancelPending call having already run for the
+	// current turn (empty map: nothing was pending at that moment, exactly
+	// as when the request racing in below is for a tool call that only
+	// starts requesting permission after cancellation began).
+	d.cancelPending()
+
+	req := acp.RequestPermissionRequest{
+		ToolCall: acp.ToolCallUpdate{ToolCallId: "call-late"},
+		Options: []acp.PermissionOption{
+			{OptionId: "allow", Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce},
+		},
+	}
+
+	done := make(chan acp.RequestPermissionResponse, 1)
+	go func() {
+		resp, err := d.RequestPermission(context.Background(), req)
+		if err != nil {
+			t.Errorf("RequestPermission: %v", err)
+			return
+		}
+		done <- resp
+	}()
+
+	select {
+	case resp := <-done:
+		if resp.Outcome.Cancelled == nil {
+			t.Errorf("Outcome = %+v, want the Cancelled variant", resp.Outcome)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RequestPermission parked instead of denying a request that arrived after cancelPending already ran")
+	}
+
+	d.pendingMu.Lock()
+	_, stillPending := d.pending["perm-1"]
+	d.pendingMu.Unlock()
+	if stillPending {
+		t.Error("late-arriving request left an entry in d.pending")
 	}
 }
 

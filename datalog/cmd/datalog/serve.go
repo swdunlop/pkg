@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -131,6 +132,12 @@ func newWorkbench(dataDir, configPath string, ruleFiles []string, tokenFlag stri
 	// rule extended to the tool surface itself.
 	srv := server.NewMCPServer("datalog", "0.1.0",
 		server.WithInstructions(mcpServerInstructions),
+		// WithRecovery: this one server value backs both the /mcp mount and
+		// the in-process kit agent, so a tool-handler panic must surface as
+		// a tool error on either path rather than a dropped request (the
+		// stdio server in mcp.go carries the same option for the same
+		// reason).
+		server.WithRecovery(),
 	)
 	h.registerTools(srv)
 
@@ -201,23 +208,38 @@ func firstOrEmpty(files []string) string {
 // mcpURL derives the /mcp URL an acpDriver hands its agent from the
 // --listen flag's value. listen is frequently host-less (the default
 // "127.0.0.1:8080", or an operator-given ":8080") — net.SplitHostPort
-// handles both, and a host-less address becomes 127.0.0.1 (the ACP agent
-// is a local subprocess of this same host, per acp-integration.md's
-// loopback-only posture; there is no reason to prefer a wildcard or
-// externally-reachable host here even if --listen names one).
+// handles both, and a host-less OR wildcard-bind host (0.0.0.0, ::) becomes
+// 127.0.0.1: the ACP agent is a local subprocess of this same host, per
+// acp-integration.md's loopback-only posture, and a wildcard bind address
+// means "accept on every interface," not an address that can itself be
+// dialed (some platforms refuse to dial 0.0.0.0 at all).
 func mcpURL(listen string) string {
 	host, port, err := net.SplitHostPort(listen)
 	if err != nil {
 		// Not a valid host:port at all (shouldn't happen — ListenAndServe
-		// would fail the same way); fall back to treating the whole value
-		// as a port-less host, best-effort.
-		return "http://127.0.0.1:8080/mcp"
+		// would fail the same way); still recover the real port rather than
+		// silently pointing the agent at the flag's default 8080 — e.g. a
+		// bare port number ("9090") fails SplitHostPort but names the
+		// intended port plainly.
+		port = defaultListenPort
+		if _, perr := strconv.Atoi(listen); perr == nil {
+			port = listen
+		}
+		return fmt.Sprintf("http://127.0.0.1:%s/mcp", port)
 	}
-	if host == "" {
+	switch host {
+	case "", "0.0.0.0", "::":
 		host = "127.0.0.1"
 	}
-	return fmt.Sprintf("http://%s:%s/mcp", host, port)
+	// JoinHostPort rather than Sprintf: IPv6 literal hosts (e.g. a --listen
+	// of "[::1]:8080") must be re-bracketed or the URL fails to parse.
+	return fmt.Sprintf("http://%s/mcp", net.JoinHostPort(host, port))
 }
+
+// defaultListenPort mirrors --listen's flag default ("127.0.0.1:8080")
+// port, used only as mcpURL's last-resort fallback when listen doesn't
+// parse as host:port at all.
+const defaultListenPort = "8080"
 
 // generateToken returns 32 hex characters (16 random bytes) from
 // crypto/rand, used as the /mcp bearer token when --mcp-token is not given.
@@ -281,17 +303,23 @@ func (wb *workbench) requireBearerToken(next http.Handler) http.Handler {
 // workbench holds the shared state behind every HTTP handler: the same
 // mcpHandlers the MCP tool surface calls (so a human's Apply/Run and an
 // agent's set_schema/set_rules/query are the same operation), the SSE bus
-// for Transform-completed fan-out, the job set backing Global Cancel, and
-// the stale-suppression generation counter. Mutating handlers go through
-// h's typed methods under h.mu (the same mutex the MCP tools use); reads
-// may use session state under the same mutex for now — the design's
-// snapshot-pointer optimization (design constraint 2) can layer in later
-// without changing this struct's shape.
+// for Transform-completed fan-out, and the job set backing Global Cancel.
+// Mutating handlers go through h's typed methods under h.mu (the same mutex
+// the MCP tools use); reads may use session state under the same mutex for
+// now — the design's snapshot-pointer optimization (design constraint 2) can
+// layer in later without changing this struct's shape.
 type workbench struct {
 	h    *mcpHandlers
 	bus  *bus
 	jobs *jobs
-	gen  generation
+
+	// busyMu guards busyKey, the current $busy value as of the last
+	// publishBusy call — handleEvents replays it to a freshly connecting
+	// SSE subscription (see publishBusy's doc comment) so a tab opened
+	// mid-job can still see and stop the job, instead of showing idle
+	// (and offering no Stop control) until the job happens to end.
+	busyMu  sync.Mutex
+	busyKey string
 
 	// console is the drawer's server-owned scrollback (console.go); mcpSrv
 	// is the shared MCP server value built in newWorkbench, consumed by
@@ -482,14 +510,30 @@ func (wb *workbench) handleCancel(w http.ResponseWriter, r *http.Request) {
 }
 
 // publishBusy fans the page-wide $busy mutex signal out to every open page:
-// key is "run", "apply" or "agent" while that job runs, "" when it ends.
-// The UI greys out the other action buttons and morphs the holder's own
-// button into Stop (view.BusyActionButton, view/console.go's send button).
-// Job keys are distinct, so this is a UI-level mutex, not a server-side
-// one — direct POSTs can still overlap jobs; the signal just reflects the
-// most recent transition, which is fine for the single-user workbench.
+// key is "run", "apply", "query" or "agent" while that job runs, "" when it
+// ends. The UI greys out the other action buttons and morphs the holder's
+// own button into Stop (view.BusyActionButton, view/console.go's send
+// button). Job keys are distinct, so this is a UI-level mutex, not a
+// server-side one — direct POSTs can still overlap jobs; the signal just
+// reflects the most recent transition (last-writer-wins across distinct job
+// keys — a second job ending can publish "" while the first is still
+// running), which is fine for the single-user workbench's UI gating, though
+// a genuinely careful "still busy with something else" signal would need a
+// reference count instead of a single key. wb.busyKey caches the same value
+// this call publishes so handleEvents can replay it to a page that connects
+// mid-job (see busyKey's doc comment on workbench).
 func (wb *workbench) publishBusy(key string) {
+	wb.busyMu.Lock()
+	wb.busyKey = key
+	wb.busyMu.Unlock()
 	wb.bus.Publish(datastar.Signal(map[string]any{"busy": key}))
+}
+
+// currentBusy returns the $busy value as of the last publishBusy call.
+func (wb *workbench) currentBusy() string {
+	wb.busyMu.Lock()
+	defer wb.busyMu.Unlock()
+	return wb.busyKey
 }
 
 // handleEvents is the page's one long-lived subscription connection
@@ -520,6 +564,18 @@ func (wb *workbench) handleEvents(w http.ResponseWriter, r *http.Request) {
 	base, derived := renderPredicates(wb.h.sess)
 	wb.h.mu.Unlock()
 	_ = stream.Emit(datastar.Batch(datastar.Elements(base), datastar.Elements(derived)))
+
+	// $busy defaults to '' client-side and this connection has seen no
+	// publishBusy calls yet, so a tab opened while a job is already running
+	// would otherwise show idle — no Stop control, and no visible feedback —
+	// until that job happens to end and publish "". Replaying the current
+	// key here (captured AFTER subscribing, so a transition landing in the
+	// gap is still caught by the subscription rather than missed entirely)
+	// fixes that for every fresh connection, not just ones that happen to be
+	// open when a job starts.
+	if key := wb.currentBusy(); key != "" {
+		_ = stream.Emit(datastar.Signal(map[string]any{"busy": key}))
+	}
 
 	for { // 3. drain anything that arrived between 1 and 2, plus all future events
 		select {
