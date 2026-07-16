@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"math"
 	"slices"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"swdunlop.dev/pkg/datalog"
 	"swdunlop.dev/pkg/datalog/memory"
@@ -612,5 +614,378 @@ func TestCancelAbortsMidIteration(t *testing.T) {
 	// iteration would run it the full million times.
 	if calls > 100000 {
 		t.Fatalf("evaluation ran %d solutions after cancellation; the iteration was not aborted early", calls)
+	}
+}
+
+// TestNegatedConstraintFailsAtCompile verifies that negating a string
+// constraint builtin (@contains, @starts_with, @ends_with, @regex_match) is
+// rejected at compile time instead of silently compiling as an always-true
+// negated fact-join. compileBody's a.Negated case is checked before
+// isConstraint, so `not @contains(X, "admin")` used to compile as a negated
+// join against a fact predicate named "@contains" that never has any facts
+// -- matchesAnyV always returned false, so the negation always succeeded and
+// the constraint was effectively ignored, deriving safe("admin-root") even
+// though "admin-root" contains "admin".
+func TestNegatedConstraintFailsAtCompile(t *testing.T) {
+	cases := []string{
+		`safe(X) :- name(X), not @contains(X, "admin").`,
+		`safe(X) :- name(X), not @starts_with(X, "admin").`,
+		`safe(X) :- name(X), not @ends_with(X, "admin").`,
+		`safe(X) :- name(X), not @regex_match(X, "admin").`,
+	}
+	for _, src := range cases {
+		t.Run(src, func(t *testing.T) {
+			rs, err := syntax.ParseAll(src)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			_, err = seminaive.New().Compile(rs)
+			if err == nil {
+				t.Fatal("expected a compile error for a negated constraint, got nil")
+			}
+			if !strings.Contains(err.Error(), "cannot negate constraint") {
+				t.Fatalf("expected a 'cannot negate constraint' error, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestNegatedComparisonFailsAtCompile covers the comparison-operator half of
+// the same isConstraint check (=, !=, <, >, <=, >=). The surface syntax
+// grammar never produces a Negated atom with a comparison Pred (parseAtom
+// only takes the inline-comparison path when the atom is not preceded by
+// `not`), so this builds the syntax.Rule directly rather than through
+// syntax.ParseAll -- callers that build a syntax.Ruleset programmatically
+// (not through the parser) can still construct this shape, and checkBodySafety
+// must reject it exactly like the string-builtin cases above.
+func TestNegatedComparisonFailsAtCompile(t *testing.T) {
+	rs := syntax.Ruleset{Rules: []syntax.Rule{{
+		Head: syntax.Atom{Pred: "safe", Terms: []datalog.Term{datalog.Variable("X")}},
+		Body: []syntax.Atom{
+			{Pred: "name", Terms: []datalog.Term{datalog.Variable("X")}},
+			{Pred: "=", Terms: []datalog.Term{datalog.Variable("X"), datalog.String("admin")}, Negated: true},
+		},
+	}}}
+	_, err := seminaive.New().Compile(rs)
+	if err == nil {
+		t.Fatal("expected a compile error for a negated comparison, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot negate constraint") {
+		t.Fatalf("expected a 'cannot negate constraint' error, got: %v", err)
+	}
+}
+
+// TestNegatedBuiltinFailsAtCompile verifies that negating a binding builtin
+// (a JSON destructuring builtin, a WithBuiltin registration, or a
+// WithMultiBuiltin registration) is rejected at compile time instead of
+// silently dropping every derivation. checkBodySafety's isBindBuiltin case
+// (checked before a.Negated used to be considered) marked the builtin's
+// output variable bound, so `r(X, V) :- p(X), not @json_len(X, V).` passed
+// safety analysis; but compileBody's a.Negated case (checked first there)
+// routed the atom to the negated-fact-join path instead of actually running
+// the builtin, so V was never bound by evaluation and every head derivation
+// silently failed to ground, producing an empty relation with no error.
+func TestNegatedBuiltinFailsAtCompile(t *testing.T) {
+	t.Run("json builtin", func(t *testing.T) {
+		rs, err := syntax.ParseAll(`r(X, V) :- p(X), not @json_len(X, V).`)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		_, err = seminaive.New().Compile(rs)
+		if err == nil {
+			t.Fatal("expected a compile error for a negated builtin, got nil")
+		}
+		if !strings.Contains(err.Error(), "cannot negate builtin") {
+			t.Fatalf("expected a 'cannot negate builtin' error, got: %v", err)
+		}
+	})
+
+	t.Run("registered builtin", func(t *testing.T) {
+		double := func(inputs []any) (any, bool) {
+			n, ok := inputs[0].(int64)
+			if !ok {
+				return nil, false
+			}
+			return n * 2, true
+		}
+		rs, err := syntax.ParseAll(`r(X, V) :- p(X), not @double(X, V).`)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		_, err = seminaive.New(seminaive.WithBuiltin("@double", double)).Compile(rs)
+		if err == nil {
+			t.Fatal("expected a compile error for a negated builtin, got nil")
+		}
+		if !strings.Contains(err.Error(), "cannot negate builtin") {
+			t.Fatalf("expected a 'cannot negate builtin' error, got: %v", err)
+		}
+	})
+
+	t.Run("registered multi-builtin", func(t *testing.T) {
+		rs, err := syntax.ParseAll(`r(X, V) :- p(X), not @range(X, V).`)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		_, err = seminaive.New(seminaive.WithMultiBuiltin("@range", 1, rangeBuiltin)).Compile(rs)
+		if err == nil {
+			t.Fatal("expected a compile error for a negated multi-builtin, got nil")
+		}
+		if !strings.Contains(err.Error(), "cannot negate builtin") {
+			t.Fatalf("expected a 'cannot negate builtin' error, got: %v", err)
+		}
+	})
+}
+
+// TestAggregateRecursivePlainRuleFailsAtCompile is a regression test for the
+// stratify.go gap where a plain rule reads an aggregate's own head within the
+// same recursive component. `h(S) :- S = count : p(X).` plus a recursive
+// `h(Y) :- h(X), Y is X - 1, Y > 0.` end up in the same stratum (the h->p
+// aggregate edge lands in a different SCC, so the existing negative-edge
+// cycle check never inspects the ordinary positive h->h join edge from the
+// second rule). transformer.Transform runs the plain-rule fixpoint
+// (ev.evalRules) to completion first and evalAggregates exactly once
+// afterward, so the recursive rule never observes the aggregate's own
+// output within that stratum -- h(1) is silently never derived. This must
+// be rejected at compile time rather than produce a truncated, non-fixpoint
+// result.
+func TestAggregateRecursivePlainRuleFailsAtCompile(t *testing.T) {
+	rs, err := syntax.ParseAll(`
+		h(S) :- S = count : p(X).
+		h(Y) :- h(X), Y is X - 1, Y > 0.
+	`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	_, err = seminaive.New().Compile(rs)
+	if err == nil {
+		t.Fatal("expected a stratification error at compile time, got nil")
+	}
+	if !strings.Contains(err.Error(), "unstratifiable") {
+		t.Fatalf("expected an unstratifiable error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "h") {
+		t.Fatalf("expected the error to name the aggregate head h, got: %v", err)
+	}
+}
+
+// TestAggregateResultVarBoundInBodyFailsAtCompile verifies that an aggregate
+// rule whose ResultVar is also bound by the body is rejected at compile time
+// instead of silently computing a wrong answer. evalAggregates appends the
+// aggregate result to the group's representative InternedSub *last*
+// (aggregate.go), and InternedSub.Get returns the first match by name; if
+// the body already binds a variable with the same name as ResultVar (as in
+// `total(S) :- S = sum(V) : p(S, V).`, where p(S, V) binds S as an ordinary
+// join variable), the head is grounded with the body's binding instead of
+// the aggregate result -- total(10) instead of the correct total(3) for
+// p(10, 1) and p(10, 2).
+func TestAggregateResultVarBoundInBodyFailsAtCompile(t *testing.T) {
+	rs, err := syntax.ParseAll(`
+		total(S) :- S = sum(V) : p(S, V).
+	`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	_, err = seminaive.New().Compile(rs)
+	if err == nil {
+		t.Fatal("expected a safety error for a body-bound result variable, got nil")
+	}
+	if !strings.Contains(err.Error(), "S") {
+		t.Fatalf("expected the error to name the result variable S, got: %v", err)
+	}
+}
+
+// TestMultiBuiltinNegativeOutputsFailsAtCompile verifies that registering a
+// WithMultiBuiltin with a negative outputs count is rejected by Compile
+// instead of panicking with a slice-bounds-out-of-range. checkBodySafety's
+// `a.Terms[:len(a.Terms)-nOut]` (engine.go) computes a slice bound wider
+// than len(a.Terms) when nOut is negative, since `len(a.Terms) < nOut` never
+// catches a negative nOut.
+func TestMultiBuiltinNegativeOutputsFailsAtCompile(t *testing.T) {
+	noop := func(inputs []any, yield func(outputs []any) bool) {}
+	rs, err := syntax.ParseAll(`r(X) :- p(X), @m(X).`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	_, err = seminaive.New(seminaive.WithMultiBuiltin("@m", -1, noop)).Compile(rs)
+	if err == nil {
+		t.Fatal("expected a compile error for a negative multi-builtin outputs count, got nil")
+	}
+	if !strings.Contains(err.Error(), "outputs") || !strings.Contains(err.Error(), "-1") {
+		t.Fatalf("expected an outputs-out-of-range error naming -1, got: %v", err)
+	}
+}
+
+// TestAggregateErrorWrappedWithStratum verifies that an error from
+// evalAggregates is wrapped with the same "stratum [...]" context a
+// plain-rule error gets (see TestIterationLimitErrorNamesStratum), instead
+// of surfacing as a bare, unattributed error.
+func TestAggregateErrorWrappedWithStratum(t *testing.T) {
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.Integer(math.MaxInt64)}})
+	b.AddFact(datalog.Fact{Name: "v", Terms: []datalog.Constant{datalog.Integer(1)}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`total(S) :- S = sum(X) : v(X).`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	tr, err := seminaive.New().Compile(rs)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	_, err = tr.Transform(context.Background(), input)
+	if err == nil {
+		t.Fatal("expected an overflow error from the aggregate, got nil")
+	}
+	if !strings.Contains(err.Error(), "stratum [") || !strings.Contains(err.Error(), "total") {
+		t.Fatalf("expected the error to be wrapped with the stratum context naming total, got: %v", err)
+	}
+}
+
+// TestFactLimitHaltsCrossProductEarly verifies that WithFactLimit is
+// enforced during evaluation, not after Transform fully materializes: a
+// rule that cross-products two 20000-row relations would derive 4*10^8
+// facts if allowed to run to completion (far too many to finish, or even
+// fit in memory, inside this test's deadline), but with a low fact limit it
+// must stop -- with a FactLimitError naming the limit -- almost
+// immediately, long before the context's generous backstop deadline
+// expires. That backstop rides the pre-existing ctx-cancellation sampling
+// in countStep (see eval.go), so even a broken/absent fact-limit check
+// can't hang the test forever; it just makes this assertion fail because
+// the error would be context.DeadlineExceeded (after ~10s), not a prompt
+// FactLimitError.
+func TestFactLimitHaltsCrossProductEarly(t *testing.T) {
+	const n = 20000
+	b := memory.NewBuilder()
+	for i := range n {
+		b.AddFact(datalog.Fact{Name: "a", Terms: []datalog.Constant{datalog.Integer(i)}})
+		b.AddFact(datalog.Fact{Name: "b", Terms: []datalog.Constant{datalog.Integer(i)}})
+	}
+	input := b.Build()
+
+	tr, err := syntax.Parse(seminaive.New(seminaive.WithFactLimit(1000)), `
+		cp(X, Y) :- a(X), b(Y).
+	`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	_, err = tr.Transform(ctx, input)
+	elapsed := time.Since(start)
+
+	var fle seminaive.FactLimitError
+	if !errors.As(err, &fle) {
+		t.Fatalf("expected a FactLimitError, got: %v", err)
+	}
+	if fle.Limit != 1000 {
+		t.Fatalf("expected FactLimitError.Limit == 1000, got %d", fle.Limit)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("expected the fact limit to halt the %[1]d x %[1]d cross product quickly (well under the 10s ctx deadline backstop), took %s", n, elapsed)
+	}
+}
+
+// TestFactLimitUnaffectedUnderLimit verifies that WithFactLimit does not
+// change behavior for a program that derives fewer facts than the limit.
+func TestFactLimitUnaffectedUnderLimit(t *testing.T) {
+	b := memory.NewBuilder()
+	for i := range 10 {
+		b.AddFact(datalog.Fact{Name: "edge", Terms: []datalog.Constant{
+			datalog.Integer(i), datalog.Integer(i + 1),
+		}})
+	}
+	input := b.Build()
+
+	const rules = `
+		path(X, Y) :- edge(X, Y).
+		path(X, Z) :- edge(X, Y), path(Y, Z).
+	`
+
+	tr, err := syntax.Parse(seminaive.New(seminaive.WithFactLimit(1000)), rules)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatalf("expected a generous fact limit to leave the result unaffected, got: %v", err)
+	}
+
+	count := 0
+	for range output.Facts("path", 2) {
+		count++
+	}
+	// A 10-edge chain has 10 + 9 + ... + 1 = 55 path facts.
+	if count != 55 {
+		t.Fatalf("expected 55 path facts, got %d", count)
+	}
+}
+
+// TestFactLimitAppliesAcrossStrataAndAggregates verifies that the fact
+// counter accumulates across the whole Transform run, not per-stratum: a
+// plain-rule stratum that lands exactly at the limit on its own must still
+// trip the error once a later aggregate stratum (depending on the first
+// stratum's derived predicate, so it necessarily runs as a separate,
+// later stratum) derives even one more fact past it.
+func TestFactLimitAppliesAcrossStrataAndAggregates(t *testing.T) {
+	const n = 500
+	b := memory.NewBuilder()
+	for i := range n {
+		b.AddFact(datalog.Fact{Name: "item", Terms: []datalog.Constant{datalog.Integer(i)}})
+	}
+	input := b.Build()
+
+	const rules = `
+		mid(X) :- item(X).
+		total(N) :- N = count : mid(?).
+	`
+
+	// mid/1 alone derives exactly n=500 facts (== the limit, not over it);
+	// total/1's aggregate stratum runs after mid/1's and derives one more,
+	// tipping the cumulative count to 501 > 500.
+	tr, err := syntax.Parse(seminaive.New(seminaive.WithFactLimit(n)), rules)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	_, err = tr.Transform(context.Background(), input)
+
+	var fle seminaive.FactLimitError
+	if !errors.As(err, &fle) {
+		t.Fatalf("expected a FactLimitError once the aggregate stratum pushed the cumulative count past the limit, got: %v", err)
+	}
+	if fle.Limit != n {
+		t.Fatalf("expected FactLimitError.Limit == %d, got %d", n, fle.Limit)
+	}
+
+	// A limit generous enough to cover both strata (n + 1) succeeds and
+	// produces the expected facts, confirming the earlier failure was the
+	// cumulative cross-stratum count, not some unrelated rejection.
+	tr, err = syntax.Parse(seminaive.New(seminaive.WithFactLimit(n+1)), rules)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatalf("expected WithFactLimit(%d) to cover both strata, got: %v", n+1, err)
+	}
+	midCount := 0
+	for range output.Facts("mid", 1) {
+		midCount++
+	}
+	if midCount != n {
+		t.Fatalf("expected %d mid facts, got %d", n, midCount)
+	}
+	totalCount := 0
+	for row := range output.Facts("total", 1) {
+		totalCount++
+		if got, ok := row[0].(datalog.Integer); !ok || int(got) != n {
+			t.Fatalf("expected total(%d), got %v", n, row[0])
+		}
+	}
+	if totalCount != 1 {
+		t.Fatalf("expected exactly 1 total fact, got %d", totalCount)
 	}
 }

@@ -21,6 +21,7 @@ type transformer struct {
 	strata        []stratum // computed at compile time from rules and aggRules
 	facts         []datalog.Fact
 	maxIter       int
+	factLimit     int
 	builtins      map[string]BuiltinFunc
 	multiBuiltins map[string]multiBuiltin
 	externals     map[string]externalPredicate
@@ -82,7 +83,7 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 			}
 		}
 
-		ev := &evaluator{ctx: ctx, dict: dict, maxIter: t.maxIter, builtins: t.builtins, multiBuiltins: t.multiBuiltins}
+		ev := &evaluator{ctx: ctx, dict: dict, maxIter: t.maxIter, factLimit: t.factLimit, builtins: t.builtins, multiBuiltins: t.multiBuiltins}
 
 		var stats []StratumStats
 		if t.profile != nil {
@@ -111,18 +112,23 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 				stratumStart = time.Now()
 			}
 
+			// Name the stratum so an error from either half (the plain-rule
+			// fixpoint or the aggregate pass) identifies the offending
+			// predicates the same way; %w keeps errors.Is working for
+			// context cancellation in both cases.
+			stratumErr := func(err error) error {
+				preds := make([]string, 0, len(s.predicates))
+				for p := range s.predicates {
+					preds = append(preds, p)
+				}
+				sort.Strings(preds)
+				return fmt.Errorf("stratum [%s]: %w", strings.Join(preds, " "), err)
+			}
+
 			if len(s.rules) > 0 {
 				factCount, iterations, err := ev.evalRules(ctx, s.rules, existing, t.maxIter)
 				if err != nil {
-					// Name the stratum so iteration-cap hits identify the
-					// offending predicates; %w keeps errors.Is working for
-					// context cancellation.
-					preds := make([]string, 0, len(s.predicates))
-					for p := range s.predicates {
-						preds = append(preds, p)
-					}
-					sort.Strings(preds)
-					return nil, fmt.Errorf("stratum [%s]: %w", strings.Join(preds, " "), err)
+					return nil, stratumErr(err)
 				}
 				if stats != nil {
 					ss.FactCount += factCount
@@ -133,7 +139,7 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 			if len(s.aggRules) > 0 {
 				aggDerived, err := ev.evalAggregates(ctx, s.aggRules, existing)
 				if err != nil {
-					return nil, err
+					return nil, stratumErr(err)
 				}
 				if stats != nil {
 					ss.FactCount += len(aggDerived.Index)
@@ -334,9 +340,23 @@ func (t *transformer) fetchExternals(ctx context.Context, dict *interned.Dict, e
 	}
 
 	// For each external predicate, collect pushdown values per position.
+	//
+	// unbounded marks a position that some *occurrence* of the external
+	// predicate leaves without any anchor to bound it (a free variable no
+	// other atom in that occurrence's body constrains, e.g. `user(N, R)`
+	// with R appearing nowhere else). One external call serves every rule
+	// that references the predicate, so positions.get(pos) is the union of
+	// candidate values across all occurrences -- but a position an
+	// unconstrained occurrence needs the *entire* domain for, and pushing
+	// down any restriction (even one a different occurrence's anchor
+	// legitimately narrows to) would silently starve that unconstrained
+	// occurrence of every non-matching value. So unbounded is a veto that
+	// dominates: if set for a position, that position is never pushed down,
+	// no matter what candidate values other occurrences collected for it.
 	type pushdownInfo struct {
 		ep        externalPredicate
 		positions map[int]map[uint64]bool // position → set of interned value IDs
+		unbounded map[int]bool            // position → some occurrence has no anchor here
 	}
 	pushdowns := map[string]*pushdownInfo{}
 
@@ -349,7 +369,7 @@ func (t *transformer) fetchExternals(ctx context.Context, dict *interned.Dict, e
 
 			pd, exists := pushdowns[a.Pred]
 			if !exists {
-				pd = &pushdownInfo{ep: ep, positions: map[int]map[uint64]bool{}}
+				pd = &pushdownInfo{ep: ep, positions: map[int]map[uint64]bool{}, unbounded: map[int]bool{}}
 				pushdowns[a.Pred] = pd
 			}
 
@@ -363,13 +383,18 @@ func (t *transformer) fetchExternals(ctx context.Context, dict *interned.Dict, e
 				}
 			}
 
-			// Collect values from anchor atoms via shared variables.
+			// Collect values from anchor atoms via shared variables. A
+			// position whose term is a variable is bounded by this
+			// occurrence only if some other atom in the SAME rule body
+			// anchors that variable; otherwise this occurrence needs the
+			// position left unbound (see unbounded's doc comment above).
 			for i, term := range a.Terms {
 				v, ok := term.(datalog.Variable)
 				if !ok {
 					continue
 				}
 				varName := string(v)
+				anchored := false
 				for _, other := range body {
 					if isConstraint(other) || other.Pred == "is" || other.Negated {
 						continue
@@ -390,6 +415,7 @@ func (t *transformer) fetchExternals(ctx context.Context, dict *interned.Dict, e
 					}
 					for j, ot := range other.Terms {
 						if ov, ok := ot.(datalog.Variable); ok && string(ov) == varName {
+							anchored = true
 							predID := dict.Intern(other.Pred)
 							facts := existing.Get(predID, len(other.Terms))
 							if pd.positions[i] == nil {
@@ -398,8 +424,17 @@ func (t *transformer) fetchExternals(ctx context.Context, dict *interned.Dict, e
 							for k := range facts {
 								pd.positions[i][facts[k].Values[j]] = true
 							}
+							// facts may legitimately be empty (the anchor
+							// predicate currently has zero rows): that's a
+							// real, sound restriction for THIS occurrence
+							// alone (its join can never match anything, so it
+							// needs no candidate values), not a veto. Only
+							// the absence of any anchor at all is a veto.
 						}
 					}
+				}
+				if !anchored {
+					pd.unbounded[i] = true
 				}
 			}
 		}
@@ -416,6 +451,12 @@ func (t *transformer) fetchExternals(ctx context.Context, dict *interned.Dict, e
 	for predName, pd := range pushdowns {
 		b := Bindings{Arity: pd.ep.arity}
 		for pos, ids := range pd.positions {
+			if pd.unbounded[pos] {
+				// Some occurrence of this external needs every value at pos;
+				// the veto dominates regardless of what other occurrences
+				// collected here (see unbounded's doc comment above).
+				continue
+			}
 			bt := BoundTerm{Position: pos}
 			for id := range ids {
 				bt.Values = append(bt.Values, dict.Resolve(id))

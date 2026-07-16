@@ -68,6 +68,7 @@ type StratumStats struct {
 // Engine implements syntax.Engine using semi-naive evaluation.
 type Engine struct {
 	maxIter       int
+	factLimit     int
 	builtins      map[string]BuiltinFunc
 	multiBuiltins map[string]multiBuiltin
 	externals     map[string]externalPredicate
@@ -86,6 +87,40 @@ type Option func(*Engine)
 // be positive; Compile returns an error otherwise.
 func WithMaxIterations(n int) Option {
 	return func(e *Engine) { e.maxIter = n }
+}
+
+// WithFactLimit caps the total number of facts the evaluator may derive
+// during a single Transform call -- counted across every stratum, rule, and
+// aggregate (facts loaded from the input database don't count). Unlike a
+// post-hoc cap applied to Transform's output, this is enforced during
+// evaluation itself: the count is checked once per fact as it is actually
+// derived (see FactLimitError), so a rule computing a runaway cross product
+// halts as soon as it crosses the limit instead of after it has already
+// materialized every derived fact and exhausted memory.
+//
+// Transform returns a FactLimitError, matchable with errors.As, once the
+// limit is exceeded; like every other evaluation error, partial results are
+// discarded.
+//
+// n <= 0 means unlimited, which is also the zero-value Engine's behavior:
+// unlike WithMaxIterations (whose zero value would be nonsensical -- zero
+// iterations can never converge, so Compile rejects it), an Engine that
+// never calls WithFactLimit must still work, so its unset factLimit field
+// has to mean "no cap" rather than a compile-time error.
+func WithFactLimit(n int) Option {
+	return func(e *Engine) { e.factLimit = n }
+}
+
+// FactLimitError is returned by Transform (matchable with errors.As or
+// errors.Is) when the number of facts derived during evaluation exceeds a
+// limit configured with WithFactLimit. See WithFactLimit for exactly what
+// counts toward the limit.
+type FactLimitError struct {
+	Limit int
+}
+
+func (e FactLimitError) Error() string {
+	return fmt.Sprintf("seminaive: derived fact limit (%d) exceeded", e.Limit)
 }
 
 // WithBuiltin registers a named binding builtin that can be used in rule
@@ -183,6 +218,21 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 		}
 	}
 
+	// WithMultiBuiltin takes outputs as a plain int with no error return (it
+	// is an Option, applied by New before Compile ever sees the engine), so
+	// an out-of-range value -- notably negative, but also anything wider
+	// than a fact can hold -- can only be caught here. Left unchecked, a
+	// negative outputs count reaches checkBodySafety's
+	// `a.Terms[:len(a.Terms)-nOut]` slice (nOut negative makes the slice
+	// bound exceed len(a.Terms)) and panics with a slice-bounds-out-of-range
+	// instead of failing cleanly.
+	for name, mb := range e.multiBuiltins {
+		if mb.outputs < 0 || mb.outputs > interned.MaxFactArity {
+			return nil, fmt.Errorf("multi-builtin %s: outputs %d out of range [0, %d]",
+				name, mb.outputs, interned.MaxFactArity)
+		}
+	}
+
 	// The four string constraint predicates are evaluated directly by
 	// checkConstraintV, never by consulting e.builtins/e.multiBuiltins, so a
 	// WithBuiltin/WithMultiBuiltin registration under one of these names
@@ -258,6 +308,7 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 		strata:        strata,
 		facts:         facts,
 		maxIter:       e.maxIter,
+		factLimit:     e.factLimit,
 		builtins:      e.builtins,
 		multiBuiltins: e.multiBuiltins,
 		externals:     e.externals,
@@ -301,6 +352,19 @@ func checkAggRuleSafety(ar syntax.AggregateRule, builtins map[string]BuiltinFunc
 		return err
 	}
 
+	// The result binding (ResultVar -> the computed aggregate) is appended to
+	// the group's representative InternedSub last, in evalAggregates; if the
+	// body itself also binds a variable with that same name (e.g. `total(S)
+	// :- S = sum(V) : p(S, V).`, where the body's own p(S, V) atom binds S),
+	// InternedSub.Get returns the FIRST entry with that name -- the body's
+	// binding -- so the head is silently grounded with the body's value
+	// instead of the aggregate result (total(10) instead of total(3) in that
+	// example). Reject this shape at compile time instead of letting the
+	// aggregate result be silently shadowed.
+	if bound[ar.ResultVar] {
+		return fmt.Errorf("unsafe aggregate rule: result variable %s is also bound by the body; the aggregate result would be shadowed by the body's binding", ar.ResultVar)
+	}
+
 	for _, t := range ar.Head.Terms {
 		v, ok := t.(datalog.Variable)
 		if !ok || string(v) == ar.ResultVar {
@@ -330,6 +394,34 @@ func checkBodySafety(body []syntax.Atom, builtins map[string]BuiltinFunc, multiB
 	bound := map[string]bool{}
 	for _, a := range body {
 		switch {
+		case a.Negated && isConstraint(a):
+			// A negated constraint (not @contains(...), not X = Y, ...) is not
+			// evaluated as "the constraint is false": compileBody's a.Negated
+			// case is checked before isConstraint, so it compiles the atom as
+			// a negated *fact* join against a.Pred/arity instead -- a
+			// predicate ("=", "@contains", ...) that never has facts, so
+			// matchesAnyV always returns false and the negation always
+			// succeeds. The atom is silently always-true regardless of its
+			// real truth value (see TestNegatedConstraintFailsAtCompile's doc
+			// comment for a worked example). Reject at compile time rather
+			// than implement negated-constraint semantics piecemeal across
+			// four different builtins plus the comparison operators; the rule
+			// author can use the inverse comparison directly (!= for "not =",
+			// etc.) or restructure the string check.
+			return nil, fmt.Errorf("unsafe rule: cannot negate constraint %s; negated constraint atoms are not supported (use the inverse comparison operator, e.g. != for \"not =\", instead of negating)", a.Pred)
+		case a.Negated && (isBindBuiltin(a, builtins) || isMultiBindBuiltin(a, multiBuiltins)):
+			// Same compileBody mismatch as above, for binding builtins: a
+			// negated builtin atom is routed to the negativeBody fact-join
+			// path too, so the builtin body never runs and its output
+			// variable is never bound by evaluation. But the
+			// isBindBuiltin/isMultiBindBuiltin cases below (which don't look
+			// at a.Negated) would mark that same output variable bound here
+			// in safety analysis, so a rule like `r(X, V) :- p(X), not
+			// @json_len(X, V).` passes checkRuleSafety (V looks bound) while
+			// evaluation never binds V, silently dropping every head
+			// (unification against an unbound V fails). Reject instead of
+			// letting safety analysis and evaluation disagree.
+			return nil, fmt.Errorf("unsafe rule: cannot negate builtin %s; negated atoms test membership in a relation, they cannot bind variables", a.Pred)
 		case a.Pred == "is":
 			if a.Expr != nil {
 				if err := checkExprSafety(a.Expr, bound); err != nil {

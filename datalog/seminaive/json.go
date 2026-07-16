@@ -24,6 +24,14 @@ func registerJSONBuiltins(e *Engine) {
 // form) into an engine value: scalars pass through, true/false/null become
 // the dedicated constants, and nested objects/arrays become composites in
 // their own right.
+//
+// The map[string]any/[]any case uses datalog.NewCompositeTrusted rather than
+// NewComposite: v is always a subtree pulled straight out of an existing
+// Composite's already-normalized decoded form (every caller reaches jsonValue
+// with a value read from a *datalog.Composite's Value()), so re-running
+// NewComposite's normalizeJSON copy-and-validate pass on it is redundant work
+// paid on every extraction in the fixpoint's inner loop. NewCompositeTrusted
+// only re-derives the canonical encoding, which it cannot avoid producing.
 func jsonValue(v any) (any, bool) {
 	switch val := v.(type) {
 	case nil:
@@ -33,11 +41,7 @@ func jsonValue(v any) (any, bool) {
 	case string, int64, float64:
 		return val, true
 	case map[string]any, []any:
-		c, err := datalog.NewComposite(val)
-		if err != nil {
-			return nil, false
-		}
-		return c, true
+		return datalog.NewCompositeTrusted(val), true
 	}
 	return nil, false
 }
@@ -140,11 +144,10 @@ func jsonSlice(inputs []any) (any, bool) {
 	if !ok || from < 0 || from > int64(len(arr)) {
 		return nil, false
 	}
-	tail, err := datalog.NewComposite(arr[from:])
-	if err != nil {
-		return nil, false
-	}
-	return tail, true
+	// arr is already the normalized decoded form of c; arr[from:] reuses its
+	// (already-normalized) elements under a new slice header, so this is the
+	// same already-normalized-subtree case jsonValue documents.
+	return datalog.NewCompositeTrusted(arr[from:]), true
 }
 
 // jsonEach implements @json_each(Arr, Elem), yielding each array element.

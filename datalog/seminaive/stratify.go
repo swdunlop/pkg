@@ -83,6 +83,48 @@ func stratify(rules []syntax.Rule, aggRules []syntax.AggregateRule, builtins map
 		}
 	}
 
+	// The check above only rejects a cycle that closes through a *negative*
+	// (agg or negation) edge. But an aggregate's own head can also be read
+	// by an ordinary, non-negated plain-rule atom whose head lands in that
+	// same SCC -- e.g. `h(S) :- S = count : p(X).` plus a recursive
+	// `h(Y) :- h(X), Y is X - 1, Y > 0.`: the h->p edge is a negative agg
+	// edge (to a different SCC, so it doesn't trip the check above) and the
+	// h->h edge from the second rule is an ordinary positive join edge,
+	// which the negative-edge check never inspects at all. Both rules end
+	// up in the same stratum (see the sccStratum/strata build below), but
+	// evalTransform runs the plain-rule fixpoint (ev.evalRules) to
+	// completion first and evalAggregates exactly once afterward -- so the
+	// recursive plain rule never sees the aggregate's output within that
+	// stratum, silently truncating the recursion (h(1) is never derived)
+	// instead of running to a real fixpoint. Reject this shape outright
+	// rather than attempt to iterate aggregates to a fixpoint, which would
+	// require proving the aggregate is monotonic (not true in general: sum,
+	// min, and max are not).
+	for _, ar := range aggRules {
+		sccIdx, ok := predToSCC[ar.Head.Pred]
+		if !ok {
+			continue
+		}
+		for _, r := range rules {
+			if predToSCC[r.Head.Pred] != sccIdx {
+				continue
+			}
+			for _, b := range r.Body {
+				if b.Negated || isConstraint(b) || isBindBuiltin(b, builtins) || isMultiBindBuiltin(b, multiBuiltins) || b.Pred == "is" {
+					continue
+				}
+				if b.Pred != ar.Head.Pred {
+					continue
+				}
+				members := slices.Sorted(maps.Keys(sccs[sccIdx]))
+				return nil, fmt.Errorf(
+					"unstratifiable: rule for %s reads aggregate result %s within the same recursive component (%s); "+
+						"aggregate output cannot feed a plain rule in its own stratum (aggregates run once per stratum, after the plain-rule fixpoint)",
+					r.Head.Pred, ar.Head.Pred, strings.Join(members, ", "))
+			}
+		}
+	}
+
 	sccStratum := make([]int, len(sccs))
 	for i := range sccs {
 		sccStratum[i] = 0

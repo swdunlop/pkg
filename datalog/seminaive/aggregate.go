@@ -10,15 +10,41 @@ import (
 	"swdunlop.dev/pkg/datalog/syntax"
 )
 
+// aggGroup accumulates one aggregate group as it streams past: keyVals is
+// the group-by tuple that identifies it (extracted once, when the group is
+// first seen), values holds the aggregated variable's interned id per row
+// (streamed straight from the join callback), and count is the row count
+// (kept separately so AggCount doesn't need values populated at all).
+// Nothing about a row beyond its group-by key and aggregated value is ever
+// needed, so a group never holds a full VarSub or a name-keyed InternedSub
+// per row -- see evalAggregates.
+type aggGroup struct {
+	keyVals []uint64
+	values  []uint64
+	count   int
+}
+
 // evalAggregates evaluates aggregate rules against the current facts,
 // returning new derived facts. All computation stays in interned space.
+//
+// Grouping streams straight out of the body's join evaluation
+// (evalBodyRecursiveV) instead of first collecting every body solution into
+// a name-keyed InternedSub (an allocation per solution) or even a raw
+// VarSub (a fixed 16-slot array, most of it wasted for the handful of
+// variables a typical body actually uses) and only then grouping: each
+// solution's group-by key is read directly off the VarSub at pre-resolved
+// indices (groupByIdx/aggVarIdx, resolved once per rule below) and folded
+// into its aggGroup's compact per-row value slice, so per-solution cost is
+// a map lookup plus appending one or two uint64s, not materializing and
+// then re-scanning a whole substitution.
 //
 // ctx is checked once per aggregate rule (before running its body join, the
 // expensive part) and, via the evaluator's shared countStep sampling, once
 // every evalStepsPerCheck groups while computing aggregates -- the same
-// sampling queryInternedFacts uses during a single rule's body evaluation, so
-// one large aggregate body (e.g. a multi-way self cross-product) or a group
-// loop over many groups can't itself run uncancellably.
+// sampling the join scans inside evalBodyRecursiveV use during a single
+// rule's body evaluation, so one large aggregate body (e.g. a multi-way self
+// cross-product) or a group loop over many groups can't itself run
+// uncancellably.
 func (ev *evaluator) evalAggregates(ctx context.Context, aggRules []syntax.AggregateRule, memFacts interned.InternedFactSet) (_ interned.InternedFactSet, err error) {
 	defer recoverEvalError(ctx, &err)
 	result := interned.NewLightInternedFactSet()
@@ -28,7 +54,7 @@ func (ev *evaluator) evalAggregates(ctx context.Context, aggRules []syntax.Aggre
 			return result, err
 		}
 
-		bindings, err := ev.queryInternedFacts(ctx, ar.Body, memFacts)
+		items, negativeBody, varNames, err := ev.compileQueryBody(ar.Body)
 		if err != nil {
 			return result, err
 		}
@@ -40,42 +66,71 @@ func (ev *evaluator) evalAggregates(ctx context.Context, aggRules []syntax.Aggre
 				groupByVars = append(groupByVars, string(v))
 			}
 		}
+		groupByIdx := make([]int8, len(groupByVars))
+		for i, name := range groupByVars {
+			groupByIdx[i] = varNameIndex(varNames, name)
+		}
 
 		// Resolve the aggregate term name (if it's a variable).
 		var aggVarName string
+		var aggVarIdx int8 = -1
 		var aggConstID uint64
 		var aggIsConst bool
 		if v, ok := ar.AggTerm.(datalog.Variable); ok {
 			aggVarName = string(v)
+			aggVarIdx = varNameIndex(varNames, aggVarName)
 		}
 		if c, ok := ar.AggTerm.(datalog.Constant); ok {
 			aggConstID = ev.dict.InternConstant(c)
 			aggIsConst = true
 		}
-
-		// Group bindings by group-by variable IDs using FNV-1a hash.
-		type group struct {
-			representative interned.InternedSub
-			subs           []interned.InternedSub
+		// checkAggRuleSafety (engine.go) rejects an aggregated variable the
+		// body never binds at compile time, so aggVarIdx < 0 here can only
+		// mean this evaluator's compiled varMap disagrees with that check --
+		// fail loudly with the same message the old per-row check used,
+		// checked once per rule rather than once per row. AggCount ignores
+		// AggTerm entirely (per syntax.AggregateRule's doc), so it never has
+		// a meaningful aggVarName/aggVarIdx to validate here.
+		if ar.Kind != syntax.AggCount && !aggIsConst && aggVarIdx < 0 {
+			return result, fmt.Errorf("aggregate %s: unbound variable %s in aggregate", ar.Kind, aggVarName)
 		}
-		groups := map[uint64][]group{}
 
-		for _, sub := range bindings {
-			gk := internedGroupKey(sub, groupByVars)
+		groups := map[uint64][]*aggGroup{}
+		noDelta := interned.InternedFactSet{}
+		noEmitted := interned.InternedFactSet{}
+		var sub interned.VarSub
+		ev.evalBodyRecursiveV(items, negativeBody, varNames, -1, noDelta, memFacts, noEmitted, &sub, 0, func(vs *interned.VarSub) {
+			gk := groupKeyHash(vs, groupByIdx)
 			bucket := groups[gk]
-			matched := false
-			for i := range bucket {
-				if internedGroupEqual(sub, bucket[i].representative, groupByVars) {
-					bucket[i].subs = append(bucket[i].subs, sub)
-					matched = true
+			var g *aggGroup
+			for _, cand := range bucket {
+				if groupKeyMatches(vs, groupByIdx, cand.keyVals) {
+					g = cand
 					break
 				}
 			}
-			if !matched {
-				bucket = append(bucket, group{representative: sub, subs: []interned.InternedSub{sub}})
+			if g == nil {
+				g = &aggGroup{keyVals: extractGroupKey(vs, groupByIdx)}
+				groups[gk] = append(bucket, g)
 			}
-			groups[gk] = bucket
-		}
+			g.count++
+			if ar.Kind != syntax.AggCount {
+				// AggCount only needs the row count; every other kind needs
+				// each row's aggregated value. aggVarIdx is guaranteed valid
+				// and bound here: it was resolved from varNames (the same
+				// compiled varMap this join is running against), and every
+				// variable compileBody registers via a positive atom is
+				// bound by the time evalBodyRecursiveV reaches this terminal
+				// callback -- a join can't succeed to this point otherwise.
+				var id uint64
+				if aggIsConst {
+					id = aggConstID
+				} else {
+					id = vs.Vals[aggVarIdx]
+				}
+				g.values = append(g.values, id)
+			}
+		})
 
 		// Pre-compile head atom for grounding.
 		head, err := interned.CompileAtom(ar.Head.Pred, ar.Head.Terms, ev.dict)
@@ -91,19 +146,32 @@ func (ev *evaluator) evalAggregates(ctx context.Context, aggRules []syntax.Aggre
 			for _, g := range bucket {
 				ev.countStep()
 
-				aggResultID, err := computeInternedAggregate(
-					ar.Kind, aggVarName, aggConstID, aggIsConst,
-					g.subs, ev.dict,
+				aggResultID, err := computeGroupAggregate(
+					ar.Kind, aggVarName, aggIsConst, g.values, g.count, ev.dict,
 				)
 				if err != nil {
 					return result, fmt.Errorf("aggregate %s: %w", ar.Kind, err)
 				}
 
-				resultSub := append(g.representative.Clone(),
-					interned.InternedSubEntry{Name: ar.ResultVar, Value: aggResultID})
+				// The group's InternedSub is materialized exactly once per
+				// output group here, not once per input body solution.
+				// checkAggRuleSafety (engine.go) already rejects a
+				// body-bound ResultVar at compile time, so appending the
+				// result binding last can never be shadowed by a same-named
+				// body binding.
+				resultSub := make(interned.InternedSub, 0, len(groupByVars)+1)
+				for i, name := range groupByVars {
+					resultSub = append(resultSub, interned.InternedSubEntry{Name: name, Value: g.keyVals[i]})
+				}
+				resultSub = append(resultSub, interned.InternedSubEntry{Name: ar.ResultVar, Value: aggResultID})
 
 				if fact, ok := interned.GroundCompiled(head, resultSub); ok {
 					result.Add(fact)
+					// Counted against the same shared limit evalRules' emit
+					// closure uses (see checkFactLimit): one aggregate-produced
+					// fact per output group, so WithFactLimit applies to
+					// aggregate strata too, not just plain-rule fixpoints.
+					ev.checkFactLimit()
 				}
 			}
 		}
@@ -112,42 +180,82 @@ func (ev *evaluator) evalAggregates(ctx context.Context, aggRules []syntax.Aggre
 	return result, nil
 }
 
-func internedGroupKey(sub interned.InternedSub, vars []string) uint64 {
+// varNameIndex finds name's VarSub index in names, or -1 if absent.
+// Resolved once per aggregate rule (for groupByIdx/aggVarIdx), not per
+// binding -- checkAggRuleSafety guarantees group-by and aggregated
+// variables are bound by the body, so -1 is not expected in practice, but
+// callers still handle it (as an always-unbound value) rather than assume it
+// can't happen.
+func varNameIndex(names []string, name string) int8 {
+	for i, n := range names {
+		if n == name {
+			return int8(i)
+		}
+	}
+	return -1
+}
+
+// groupKeyHash, groupKeyMatches, and extractGroupKey read a body solution's
+// group-by values straight off its VarSub at pre-resolved indices
+// (groupByIdx), instead of the retired name-keyed grouping's linear
+// InternedSub.Get scan per group-by variable per solution. A negative index
+// or an unbound slot contributes 0, matching InternedSub.Get's (0, false)
+// -> value 0 fallback the retired functions relied on (silently, by
+// discarding the ok bool) for the same "can't happen per
+// checkAggRuleSafety, but degrade gracefully" case.
+func groupKeyHash(sub *interned.VarSub, idx []int8) uint64 {
 	h := uint64(interned.FNVOffset64)
-	for _, v := range vars {
-		val, _ := sub.Get(v)
-		h ^= val
+	for _, i := range idx {
+		h ^= groupKeyVal(sub, i)
 		h *= interned.FNVPrime64
 	}
 	return h
 }
 
-func internedGroupEqual(a, b interned.InternedSub, vars []string) bool {
-	for _, v := range vars {
-		av, _ := a.Get(v)
-		bv, _ := b.Get(v)
-		if av != bv {
+func groupKeyMatches(sub *interned.VarSub, idx []int8, keyVals []uint64) bool {
+	for i, vi := range idx {
+		if groupKeyVal(sub, vi) != keyVals[i] {
 			return false
 		}
 	}
 	return true
 }
 
-func computeInternedAggregate(
+func extractGroupKey(sub *interned.VarSub, idx []int8) []uint64 {
+	vals := make([]uint64, len(idx))
+	for i, vi := range idx {
+		vals[i] = groupKeyVal(sub, vi)
+	}
+	return vals
+}
+
+func groupKeyVal(sub *interned.VarSub, idx int8) uint64 {
+	if idx >= 0 && sub.Mask>>uint(idx)&1 != 0 {
+		return sub.Vals[idx]
+	}
+	return 0
+}
+
+// computeGroupAggregate computes one group's aggregate result from its
+// already-extracted per-row values (see aggGroup) rather than a slice of
+// substitutions -- extraction happened once, while streaming the body's
+// join solutions into groups (evalAggregates), not once per aggregate kind
+// dispatch.
+func computeGroupAggregate(
 	kind syntax.AggregateKind,
-	aggVarName string, aggConstID uint64, aggIsConst bool,
-	subs []interned.InternedSub, dict *interned.Dict,
+	aggVarName string, aggIsConst bool,
+	values []uint64, count int, dict *interned.Dict,
 ) (uint64, error) {
 	switch kind {
 	case syntax.AggCount:
-		return dict.Intern(int64(len(subs))), nil
+		return dict.Intern(int64(count)), nil
 
 	case syntax.AggSum:
 		var sumInt int64
 		var sumFloat float64
 		isInt := true
-		for _, sub := range subs {
-			val, err := resolveInternedAggValue(aggVarName, aggConstID, aggIsConst, sub, dict, "sum")
+		for _, id := range values {
+			val, err := resolveInternedAggValue(id, dict, "sum", aggVarName, aggIsConst)
 			if err != nil {
 				return 0, err
 			}
@@ -186,10 +294,10 @@ func computeInternedAggregate(
 		return dict.Intern(sumFloat), nil
 
 	case syntax.AggMin:
-		return computeExtremum("min", -1, aggVarName, aggConstID, aggIsConst, subs, dict)
+		return computeExtremum("min", -1, aggVarName, aggIsConst, values, dict)
 
 	case syntax.AggMax:
-		return computeExtremum("max", 1, aggVarName, aggConstID, aggIsConst, subs, dict)
+		return computeExtremum("max", 1, aggVarName, aggIsConst, values, dict)
 
 	default:
 		return 0, fmt.Errorf("unknown aggregate kind: %v", kind)
@@ -208,12 +316,12 @@ func computeInternedAggregate(
 // is a genuine non-numeric mismatch, not NaN.
 func computeExtremum(
 	name string, sign int,
-	aggVarName string, aggConstID uint64, aggIsConst bool,
-	subs []interned.InternedSub, dict *interned.Dict,
+	aggVarName string, aggIsConst bool,
+	values []uint64, dict *interned.Dict,
 ) (uint64, error) {
 	var best any
-	for _, sub := range subs {
-		val, err := resolveInternedAggValue(aggVarName, aggConstID, aggIsConst, sub, dict, name)
+	for _, id := range values {
+		val, err := resolveInternedAggValue(id, dict, name, aggVarName, aggIsConst)
 		if err != nil {
 			return 0, err
 		}
@@ -244,30 +352,23 @@ func computeExtremum(
 
 // resolveInternedAggValue is the single chokepoint every numeric aggregate
 // (sum, min, max, and avg if/when it exists) resolves its per-row value
-// through. NaN is an admitted value at interning (dict.go's nanKey -- that
-// trade-off is settled and not revisited here), but letting it flow into an
-// aggregate silently produces bad results downstream: computeExtremum can't
-// order it (a NaN could win or lose a min/max depending on its arbitrary
-// position in the group) and AggSum would silently intern a NaN total that
-// then compares unordered-false against everything else. So this is the one
-// place that checks for it, uniformly, for every aggregate kind, and the
-// error names both the aggregate (via name) and the offending predicate/rule
-// context the caller already carries in its own wrapping (evalAggregates
-// wraps this error with "aggregate %s: %w").
-func resolveInternedAggValue(
-	varName string, constID uint64, isConst bool,
-	sub interned.InternedSub, dict *interned.Dict, name string,
-) (any, error) {
-	var val any
-	if isConst {
-		val = dict.Resolve(constID)
-	} else {
-		id, ok := sub.Get(varName)
-		if !ok {
-			return nil, fmt.Errorf("unbound variable %s in aggregate", varName)
-		}
-		val = dict.Resolve(id)
-	}
+// through. id is already known-valid: evalAggregates extracts it while
+// streaming (either the constant AggTerm's id or Vals[aggVarIdx], both
+// guaranteed resolvable at that point -- see its "unbound variable" pre-check
+// and streaming callback), so there is no per-row unbound case left to
+// detect here, unlike the retired per-substitution version. NaN is an
+// admitted value at interning (dict.go's nanKey -- that trade-off is settled
+// and not revisited here), but letting it flow into an aggregate silently
+// produces bad results downstream: computeExtremum can't order it (a NaN
+// could win or lose a min/max depending on its arbitrary position in the
+// group) and AggSum would silently intern a NaN total that then compares
+// unordered-false against everything else. So this is the one place that
+// checks for it, uniformly, for every aggregate kind, and the error names
+// both the aggregate (via name) and the offending predicate/rule context the
+// caller already carries in its own wrapping (evalAggregates wraps this
+// error with "aggregate %s: %w").
+func resolveInternedAggValue(id uint64, dict *interned.Dict, name, varName string, isConst bool) (any, error) {
+	val := dict.Resolve(id)
 	if f, ok := val.(float64); ok && math.IsNaN(f) {
 		return nil, fmt.Errorf("cannot compute %s: NaN value in %s", name, describeAggSource(varName, isConst))
 	}

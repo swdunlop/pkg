@@ -14,8 +14,31 @@ import (
 	"swdunlop.dev/pkg/datalog/syntax"
 )
 
-// regexCache caches compiled regular expressions for regex_match.
-var regexCache sync.Map // map[string]*regexp.Regexp
+// regexCacheCap bounds the number of distinct compiled @regex_match patterns
+// kept in regexCache across the process's lifetime, so a long-running
+// process evaluating many different (e.g. data-driven or generated)
+// patterns over time can't grow the cache without bound. Once full, caching
+// a new pattern evicts the oldest still-cached one (FIFO via regexCacheOrder
+// below) -- simpler than true LRU and sufficient here: the intended working
+// set is the small, fixed set of @regex_match patterns appearing in a
+// process's compiled rule text, not an unbounded adversarial stream: a
+// stream that exceeds the cap just falls back to recompiling on a miss,
+// same as if there were no cache at all for the evicted entries.
+const regexCacheCap = 512
+
+// regexCache caches compiled regular expressions for regex_match, shared by
+// every Engine/evaluation in the process (matching the retired unbounded
+// sync.Map's cross-call reuse), bounded to regexCacheCap entries via a
+// mutex-guarded map plus a FIFO ring of insertion order. Mutex rather than
+// sync.Map because eviction needs a consistent view across the "is it
+// already cached", "record the new entry", and "evict the oldest entry"
+// steps -- sync.Map has no atomic compound operation for that.
+var (
+	regexCacheMu    sync.Mutex
+	regexCache      = make(map[string]*regexp.Regexp)
+	regexCacheOrder [regexCacheCap]string // ring of inserted keys; "" = empty slot
+	regexCacheNext  int                   // next ring slot to write (and, if occupied, to evict)
+)
 
 // constraintBuiltinNames is the single source of truth for the string
 // constraint predicates (@contains, @starts_with, @ends_with, @regex_match):
@@ -79,14 +102,32 @@ func isExternalPred(a syntax.Atom, externals map[string]externalPredicate) bool 
 }
 
 func cachedRegexp(pattern string) (*regexp.Regexp, error) {
-	if v, ok := regexCache.Load(pattern); ok {
-		return v.(*regexp.Regexp), nil
+	regexCacheMu.Lock()
+	re, ok := regexCache[pattern]
+	regexCacheMu.Unlock()
+	if ok {
+		return re, nil
 	}
+
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil, err
 	}
-	regexCache.Store(pattern, re)
+
+	regexCacheMu.Lock()
+	defer regexCacheMu.Unlock()
+	if existing, ok := regexCache[pattern]; ok {
+		// Lost a race with another goroutine compiling the same pattern
+		// between the unlocked check above and this store; keep the entry
+		// already cached (and its ring slot) rather than double-inserting.
+		return existing, nil
+	}
+	if evict := regexCacheOrder[regexCacheNext]; evict != "" {
+		delete(regexCache, evict)
+	}
+	regexCache[pattern] = re
+	regexCacheOrder[regexCacheNext] = pattern
+	regexCacheNext = (regexCacheNext + 1) % regexCacheCap
 	return re, nil
 }
 
@@ -752,6 +793,34 @@ type evaluator struct {
 	// legitimately disagree.
 	ctx   context.Context
 	steps uint
+
+	// factLimit and factsDerived implement WithFactLimit. There is exactly
+	// one evaluator per Transform call (see ctx's doc comment above), so
+	// factsDerived is a running total across every stratum, rule, and
+	// aggregate in the run -- not reset per stratum or per evalRules/
+	// evalAggregates call -- which is what makes the limit apply across
+	// strata and across plain-rule/aggregate evaluation alike.
+	factLimit    int
+	factsDerived int
+}
+
+// checkFactLimit counts one fact actually added to a result set against the
+// evaluator's configured WithFactLimit and panics FactLimitError once the
+// count exceeds it, mirroring countStep's unwind-via-panic for context
+// cancellation (see evalCancelled). Callers place it at the exact point a
+// fact is derived -- evalRules' emit closure, once per newly derived fact,
+// and evalAggregates, once per output group -- not on a sampled interval,
+// so the check is an exact O(1) increment-and-compare per emitted fact and a
+// runaway rule halts as soon as it crosses the limit rather than after
+// finishing its scan or materializing every derived fact.
+func (ev *evaluator) checkFactLimit() {
+	if ev.factLimit <= 0 {
+		return // unlimited
+	}
+	ev.factsDerived++
+	if ev.factsDerived > ev.factLimit {
+		panic(FactLimitError{Limit: ev.factLimit})
+	}
 }
 
 // evalCancelled is a sentinel panicked by evaluator.countStep to unwind
@@ -779,9 +848,10 @@ func (ev *evaluator) countStep() {
 
 // recoverEvalError converts the sentinel panics that unwind
 // evalBodyRecursiveV -- evalCancelled (context ended, see countStep),
-// builtinValueError (a user builtin returned an unsupported value), and
-// arithmeticOverflowError (an int64 is-expression +, -, or * overflowed) --
-// into ordinary errors at an entry point that has an error return. Any other
+// builtinValueError (a user builtin returned an unsupported value),
+// arithmeticOverflowError (an int64 is-expression +, -, or * overflowed),
+// and FactLimitError (WithFactLimit exceeded, see checkFactLimit) -- into
+// ordinary errors at an entry point that has an error return. Any other
 // panic is re-raised. Must be installed with defer at every evaluator entry
 // point that runs the shared recursion.
 func recoverEvalError(ctx context.Context, err *error) {
@@ -798,6 +868,10 @@ func recoverEvalError(ctx context.Context, err *error) {
 			*err = aoe
 			return
 		}
+		if fle, ok := r.(FactLimitError); ok {
+			*err = fle
+			return
+		}
 		panic(r)
 	}
 }
@@ -805,8 +879,9 @@ func recoverEvalError(ctx context.Context, err *error) {
 // evalRules runs semi-naive evaluation for a set of rules to fixpoint.
 // It returns an error if the fixpoint is not reached within maxIter
 // iterations, the context is cancelled mid-evaluation, a builtin yields
-// a value of an unsupported type (see builtinValueError), or an int64
-// is-expression +, -, or * overflows (see arithmeticOverflowError); the
+// a value of an unsupported type (see builtinValueError), an int64
+// is-expression +, -, or * overflows (see arithmeticOverflowError), or the
+// evaluator's WithFactLimit is exceeded (see checkFactLimit); the
 // partial results are discarded in any case.
 func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existing interned.InternedFactSet, maxIter int) (factCount int, iterations int, err error) {
 	defer recoverEvalError(ctx, &err)
@@ -817,7 +892,8 @@ func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existin
 	// Pre-compile all rules once, assigning per-rule variable indices.
 	type compiledRule struct {
 		head         interned.CompiledAtom
-		body         []bodyItem
+		body         []bodyItem   // iteration-0 order: no atom forced first, full existing/emitted scan
+		bodyByDelta  [][]bodyItem // joinIdx -> body reordered with that join forced outermost (see reorderBody)
 		negativeBody []interned.CompiledAtom
 		joinCount    int
 		joinAtoms    []interned.CompiledAtom // joinIdx -> compiled atom, precomputed once (was a per-iteration linear scan of body)
@@ -834,7 +910,6 @@ func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existin
 		if err != nil {
 			return 0, 0, err
 		}
-		cr.body = items
 		cr.negativeBody = negativeBody
 		cr.joinCount = joinCount
 		// A rule with no positive join atom (body is only is-atoms, bind
@@ -845,20 +920,34 @@ func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existin
 		// complete. It is still compiled and reordered like any other rule;
 		// only the per-iteration dispatch below (see "iterations == 0"
 		// below) treats it specially, running it once and never again.
-		cr.body = reorderBody(cr.body)
+		cr.body = reorderBody(items, -1)
 		cr.varNames = make([]string, len(varMap))
 		for name, idx := range varMap {
 			cr.varNames[idx] = name
 		}
-		// Precompute joinIdx -> CompiledAtom once; reorderBody permutes body
-		// order but joinIdx values are stable, so this map is fixed for the
-		// life of the rule and doesn't need to be rebuilt per iteration.
+		// Precompute joinIdx -> CompiledAtom once from the unordered items;
+		// stable regardless of any particular reordering, so it doesn't need
+		// to be rebuilt per iteration or per delta-designated join.
 		if joinCount > 0 {
 			cr.joinAtoms = make([]interned.CompiledAtom, joinCount)
-			for _, item := range cr.body {
+			for _, item := range items {
 				if item.kind == bodyItemJoin {
 					cr.joinAtoms[item.joinIdx] = item.ca
 				}
+			}
+			// Standard semi-naive join ordering: for each join atom, a body
+			// order with that atom forced outermost, so a round designating
+			// it the delta scans only this round's new facts for that atom
+			// and probes every other atom's Scan index with the resulting
+			// bindings, instead of the fixed compile-time order (tuned for
+			// boundedness at iteration 0) leaving the delta atom buried
+			// behind a full unindexed scan of a large "existing" relation on
+			// later rounds. Computed once per rule at compile time, not per
+			// iteration -- reorderBody is a pure function of (items,
+			// forceFirstJoinIdx).
+			cr.bodyByDelta = make([][]bodyItem, joinCount)
+			for j := range joinCount {
+				cr.bodyByDelta[j] = reorderBody(items, j)
 			}
 		}
 		compiled = append(compiled, cr)
@@ -888,6 +977,7 @@ func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existin
 				}
 				emitted.AddUnchecked(fact, fk)
 				factCount++
+				ev.checkFactLimit()
 			}
 
 			var sub interned.VarSub
@@ -907,7 +997,7 @@ func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existin
 						continue
 					}
 					sub = interned.VarSub{}
-					ev.evalBodyRecursiveV(cr.body, cr.negativeBody, cr.varNames,
+					ev.evalBodyRecursiveV(cr.bodyByDelta[deltaJoinIdx], cr.negativeBody, cr.varNames,
 						deltaJoinIdx, delta, existing, emitted,
 						&sub, 0, emit)
 				}
@@ -1241,7 +1331,19 @@ func (ev *evaluator) matchesAnyV(ca interned.CompiledAtom, sub *interned.VarSub,
 // Joins with more bound arguments (constants + already-bound variables)
 // are placed first. Constraints and is-atoms are placed as soon as their
 // input variables become bound.
-func reorderBody(body []bodyItem) []bodyItem {
+//
+// forceFirstJoinIdx, when >= 0, seeds the order with the join atom whose
+// joinIdx matches it -- standard semi-naive evaluation: the delta-designated
+// atom for a given round (see evalRules) only ever holds this round's new
+// facts, so scanning it first both bounds its variables for every other atom
+// (letting them use InternedFactSet.Scan's column index instead of an
+// unindexed full-relation scan) and keeps the outer loop sized to the delta
+// rather than to the whole relation. Everything else falls out of the same
+// greedy phase-1/phase-2 loop used for the -1 (no forced atom) case, so the
+// result is still a safe order: forcing a join first only ever adds bound
+// variables before the loop starts, it never lets a constraint/is/bind atom
+// run ahead of the positive join that binds its inputs.
+func reorderBody(body []bodyItem, forceFirstJoinIdx int) []bodyItem {
 	if len(body) <= 1 {
 		return body
 	}
@@ -1250,6 +1352,21 @@ func reorderBody(body []bodyItem) []bodyItem {
 	placed := make([]bool, n)
 	result := make([]bodyItem, 0, n)
 	boundVars := uint16(0)
+
+	if forceFirstJoinIdx >= 0 {
+		for i := range n {
+			if body[i].kind == bodyItemJoin && body[i].joinIdx == forceFirstJoinIdx {
+				placed[i] = true
+				result = append(result, body[i])
+				for _, t := range body[i].ca.Terms {
+					if t.VarIdx >= 0 {
+						boundVars |= 1 << uint(t.VarIdx)
+					}
+				}
+				break
+			}
+		}
+	}
 
 	for len(result) < n {
 		// Phase 1: place any ready constraints/is/bind atoms.
@@ -1439,15 +1556,9 @@ func exprVarsBound(expr compiledExpr, boundVars uint16) bool {
 func (ev *evaluator) queryInternedFacts(ctx context.Context, body []syntax.Atom, memFacts interned.InternedFactSet) (_ []interned.InternedSub, err error) {
 	defer recoverEvalError(ctx, &err)
 
-	items, negativeBody, _, varMap, err := compileBody(body, ev.dict, ev.builtins, ev.multiBuiltins)
+	items, negativeBody, varNames, err := ev.compileQueryBody(body)
 	if err != nil {
 		return nil, err
-	}
-	items = reorderBody(items)
-
-	varNames := make([]string, len(varMap))
-	for name, idx := range varMap {
-		varNames[idx] = name
 	}
 
 	noDelta := interned.InternedFactSet{}
@@ -1459,4 +1570,23 @@ func (ev *evaluator) queryInternedFacts(ctx context.Context, body []syntax.Atom,
 		results = append(results, varSubToInternedSub(vs, varNames))
 	})
 	return results, nil
+}
+
+// compileQueryBody compiles and reorders a query/aggregate-rule body,
+// shared by queryInternedFacts and evalAggregates (which runs
+// evalBodyRecursiveV directly, streaming solutions into aggregate groups
+// instead of collecting them into a slice first -- see evalAggregates) so
+// both agree on atom classification and join order.
+func (ev *evaluator) compileQueryBody(body []syntax.Atom) (items []bodyItem, negativeBody []interned.CompiledAtom, varNames []string, err error) {
+	items, negativeBody, _, varMap, err := compileBody(body, ev.dict, ev.builtins, ev.multiBuiltins)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	items = reorderBody(items, -1)
+
+	varNames = make([]string, len(varMap))
+	for name, idx := range varMap {
+		varNames[idx] = name
+	}
+	return items, negativeBody, varNames, nil
 }

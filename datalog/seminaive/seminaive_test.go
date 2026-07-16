@@ -1865,6 +1865,159 @@ func TestExternalPredicateMixedEDBAndIDBAnchor(t *testing.T) {
 	}
 }
 
+// TestExternalPredicateUnconstrainedOccurrenceVetoesPushdown is a regression
+// test for fetchExternals unioning bound constant values across every rule
+// occurrence of an external predicate without recording that some occurrence
+// leaves a position unbound. `admin(N) :- user(N, "admin").` constrains
+// position 1 to {"admin"}; `everyone(N) :- user(N, R).` leaves position 1
+// totally unconstrained (R is not bound anywhere else in that rule). Both
+// rules share the SAME external call (fetchExternals materializes each
+// external predicate exactly once), so pushing down {"admin"} for position 1
+// silently starved everyone(N) of every non-admin user. The unconstrained
+// occurrence must veto the restriction entirely, regardless of what the
+// other occurrence's anchor contributed.
+func TestExternalPredicateUnconstrainedOccurrenceVetoesPushdown(t *testing.T) {
+	users := map[string]string{"alice": "admin", "bob": "user"}
+	var observedPos1 []any
+	ext := func(ctx context.Context, b seminaive.Bindings) iter.Seq[[]any] {
+		return func(yield func([]any) bool) {
+			// Honor pushdown as documented: only produce tuples matching
+			// bound positions. If the fix is missing, position 1 arrives
+			// bound to {"admin"} and this function -- correctly obeying its
+			// contract -- never yields "bob".
+			allowedRole := map[string]bool{}
+			roleBound := false
+			for _, bt := range b.Bound {
+				if bt.Position == 1 {
+					roleBound = true
+					observedPos1 = bt.Values
+					for _, v := range bt.Values {
+						if s, ok := v.(string); ok {
+							allowedRole[s] = true
+						}
+					}
+				}
+			}
+			for n, r := range users {
+				if roleBound && !allowedRole[r] {
+					continue
+				}
+				if !yield([]any{n, r}) {
+					return
+				}
+			}
+		}
+	}
+
+	rs, err := syntax.ParseAll(`
+		admin(N) :- user(N, "admin").
+		everyone(N) :- user(N, R).
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithExternal("user", 2, ext))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := tr.Transform(context.Background(), datalog.Empty{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if observedPos1 != nil {
+		t.Errorf("expected position 1 to be left unbound (an unconstrained occurrence exists), got pushed-down values %v", observedPos1)
+	}
+
+	var admins, everyone []string
+	for row := range output.Facts("admin", 1) {
+		admins = append(admins, string(row[0].(datalog.String)))
+	}
+	for row := range output.Facts("everyone", 1) {
+		everyone = append(everyone, string(row[0].(datalog.String)))
+	}
+	slices.Sort(admins)
+	slices.Sort(everyone)
+	if want := []string{"alice"}; !slices.Equal(admins, want) {
+		t.Errorf("admin = %v, want %v", admins, want)
+	}
+	if want := []string{"alice", "bob"}; !slices.Equal(everyone, want) {
+		t.Errorf("everyone = %v, want %v (bug: an unconstrained occurrence must not be starved by another occurrence's narrower pushdown)", everyone, want)
+	}
+}
+
+// TestExternalPredicateEmptyAnchorDoesNotVetoUnrelatedPosition verifies the
+// "zero facts anchor" variant of the same fetchExternals mechanism: an
+// anchor predicate that currently has zero facts contributes a sound,
+// legitimately empty candidate set for ITS occurrence (that occurrence's
+// join can never match anything regardless of what the external returns),
+// but must not be confused with -- or allowed to poison -- a position that a
+// different, genuinely unconstrained occurrence needs left wide open.
+func TestExternalPredicateEmptyAnchorDoesNotVetoUnrelatedPosition(t *testing.T) {
+	users := map[string]string{"alice": "admin", "bob": "user"}
+	ext := func(ctx context.Context, b seminaive.Bindings) iter.Seq[[]any] {
+		return func(yield func([]any) bool) {
+			allowedRole := map[string]bool{}
+			roleBound := false
+			for _, bt := range b.Bound {
+				if bt.Position == 1 {
+					roleBound = true
+					for _, v := range bt.Values {
+						if s, ok := v.(string); ok {
+							allowedRole[s] = true
+						}
+					}
+				}
+			}
+			for n, r := range users {
+				if roleBound && !allowedRole[r] {
+					continue
+				}
+				if !yield([]any{n, r}) {
+					return
+				}
+			}
+		}
+	}
+
+	rs, err := syntax.ParseAll(`
+		flagged(N) :- user(N, R), tag(R).
+		everyone(N) :- user(N, R2).
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng := seminaive.New(seminaive.WithExternal("user", 2, ext))
+	tr, err := eng.Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// "tag" has zero facts: flagged/1 can never match anything, but that
+	// must not starve everyone/1's unconstrained occurrence of position 1.
+	output, err := tr.Transform(context.Background(), datalog.Empty{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var everyone []string
+	for row := range output.Facts("everyone", 1) {
+		everyone = append(everyone, string(row[0].(datalog.String)))
+	}
+	slices.Sort(everyone)
+	if want := []string{"alice", "bob"}; !slices.Equal(everyone, want) {
+		t.Errorf("everyone = %v, want %v", everyone, want)
+	}
+
+	var flagged []string
+	for row := range output.Facts("flagged", 1) {
+		flagged = append(flagged, string(row[0].(datalog.String)))
+	}
+	if len(flagged) != 0 {
+		t.Errorf("expected no flagged facts (tag/1 is empty), got %v", flagged)
+	}
+}
+
 // TestExternalGoIntNormalizesAndJoins verifies that an ExternalFunc
 // returning bare Go int values (not int64) is normalized so the resulting
 // facts actually join against int64-typed data facts, rather than silently
