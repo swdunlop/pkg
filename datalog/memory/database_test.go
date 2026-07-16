@@ -117,3 +117,93 @@ func TestExtendWideArityReturnsError(t *testing.T) {
 		t.Fatalf("expected original database to still have 1 narrow fact, got %d", count)
 	}
 }
+
+// TestFactCountMatchesFacts verifies FactCount agrees with the row count a
+// caller would get by ranging over Facts, for a known predicate/arity, an
+// unknown arity of a known predicate, and an entirely unknown predicate.
+func TestFactCountMatchesFacts(t *testing.T) {
+	b := memory.NewBuilder()
+	for i := 0; i < 5; i++ {
+		if err := b.AddFact(datalog.Fact{Name: "event", Terms: []datalog.Constant{datalog.Integer(int64(i))}}); err != nil {
+			t.Fatalf("AddFact: %v", err)
+		}
+	}
+	if err := b.AddFact(datalog.Fact{Name: "event", Terms: []datalog.Constant{datalog.String("a"), datalog.String("b")}}); err != nil {
+		t.Fatalf("AddFact: %v", err)
+	}
+	db := b.Build()
+
+	if got := db.FactCount("event", 1); got != 5 {
+		t.Errorf("FactCount(event, 1) = %d, want 5", got)
+	}
+	if got := db.FactCount("event", 2); got != 1 {
+		t.Errorf("FactCount(event, 2) = %d, want 1", got)
+	}
+	if got := db.FactCount("event", 3); got != 0 {
+		t.Errorf("FactCount(event, 3) = %d, want 0 (known predicate, unused arity)", got)
+	}
+	if got := db.FactCount("nope", 1); got != 0 {
+		t.Errorf("FactCount(nope, 1) = %d, want 0 (unknown predicate)", got)
+	}
+
+	scanned := 0
+	for range db.Facts("event", 1) {
+		scanned++
+	}
+	if scanned != db.FactCount("event", 1) {
+		t.Errorf("FactCount and ranging over Facts disagree: %d vs %d", db.FactCount("event", 1), scanned)
+	}
+}
+
+// TestPredicateCountsMatchesFacts verifies PredicateCounts enumerates
+// exactly the (name, arity) pairs Predicates does, each paired with the
+// same count ranging over Facts would produce, and that TotalFactCount is
+// their sum.
+func TestPredicateCountsMatchesFacts(t *testing.T) {
+	b := memory.NewBuilder()
+	facts := []datalog.Fact{
+		{Name: "event", Terms: []datalog.Constant{datalog.Integer(1)}},
+		{Name: "event", Terms: []datalog.Constant{datalog.Integer(2)}},
+		{Name: "event", Terms: []datalog.Constant{datalog.Integer(3)}},
+		{Name: "proc", Terms: []datalog.Constant{datalog.String("a"), datalog.String("b")}},
+	}
+	for _, f := range facts {
+		if err := b.AddFact(f); err != nil {
+			t.Fatalf("AddFact(%v): %v", f, err)
+		}
+	}
+	db := b.Build()
+
+	got := map[memory.PredArity]int{}
+	for pa, n := range db.PredicateCounts() {
+		got[pa] = n
+	}
+	want := map[memory.PredArity]int{
+		{Name: "event", Arity: 1}: 3,
+		{Name: "proc", Arity: 2}:  1,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("PredicateCounts: got %d entries, want %d: %v", len(got), len(want), got)
+	}
+	for pa, n := range want {
+		if got[pa] != n {
+			t.Errorf("PredicateCounts[%v] = %d, want %d", pa, got[pa], n)
+		}
+	}
+
+	// Cross-check against Predicates()/Facts() directly.
+	for name, arity := range db.Predicates() {
+		scanned := 0
+		for range db.Facts(name, arity) {
+			scanned++
+		}
+		pa := memory.PredArity{Name: name, Arity: arity}
+		if got[pa] != scanned {
+			t.Errorf("PredicateCounts[%v] = %d, but ranging over Facts gives %d", pa, got[pa], scanned)
+		}
+	}
+
+	if total := db.TotalFactCount(); total != len(facts) {
+		t.Errorf("TotalFactCount() = %d, want %d", total, len(facts))
+	}
+}

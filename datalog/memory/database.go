@@ -127,6 +127,58 @@ func (db *Database) Predicates() iter.Seq2[string, int] {
 	}
 }
 
+// FactCount returns the number of facts stored for one predicate/arity
+// pair. It is O(1) — a fact-slice length via the underlying InternedFactSet,
+// not a scan — unlike counting by ranging over Facts, which additionally
+// resolves every term of every row just to be discarded by the counter.
+// Returns 0 for a predicate/arity pair with no facts, whether or not the
+// predicate name is known to the database at all.
+func (db *Database) FactCount(pred string, arity int) int {
+	predID, ok := db.dict.Has(pred)
+	if !ok {
+		return 0
+	}
+	return len(db.facts.Get(predID, arity))
+}
+
+// PredArity names one predicate/arity pair, the key PredicateCounts iterates
+// over — predicates may be overloaded by arity, so a bare name is not a
+// unique key on its own.
+type PredArity struct {
+	Name  string
+	Arity int
+}
+
+// PredicateCounts iterates every predicate/arity pair that has at least one
+// fact (the same set Predicates enumerates) paired with its fact count.
+// Each count is O(1) (the same fact-slice length FactCount uses), so the
+// whole iteration is O(#predicates), not O(#facts) — the fix for
+// mcp.go's list_predicates and sample_facts, which previously ranged over
+// every fact of every predicate under the session's lock just to count
+// them (doc/features/mcp-server.md review item 7).
+func (db *Database) PredicateCounts() iter.Seq2[PredArity, int] {
+	return func(yield func(PredArity, int) bool) {
+		for key := range db.facts.ByPred {
+			pred := db.dict.Resolve(key.Pred).(string)
+			n := len(db.facts.Get(key.Pred, key.Arity))
+			if !yield(PredArity{Name: pred, Arity: key.Arity}, n) {
+				return
+			}
+		}
+	}
+}
+
+// TotalFactCount returns the total number of facts across every predicate
+// in db, in O(#predicates) (summing each predicate's O(1) count) rather
+// than O(#facts) with every term of every row resolved and discarded.
+func (db *Database) TotalFactCount() int {
+	total := 0
+	for _, n := range db.PredicateCounts() {
+		total += n
+	}
+	return total
+}
+
 // Extend returns a new database containing all facts from db plus the extra facts.
 // The original database is not modified.
 func (db *Database) Extend(extra ...datalog.Fact) (*Database, error) {
