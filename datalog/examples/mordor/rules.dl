@@ -23,8 +23,9 @@ remote_logon(TargetHost, User, SrcIp, Auth) :-
     logon(TargetHost, User, ?, "3", SrcIp, ?, Auth).
 
 % -- Admin share usage -------------------------------------------------
-%% A remote IP accessed an administrative share on Host -- C$ here --
-%% the filesystem-level access attackers use to stage payloads.
+%% A remote IP accessed an administrative share on Host -- the "C$"
+%% substring test catches both C$ and IPC$ -- the filesystem-level
+%% access attackers use to stage payloads.
 admin_share(Host, User, Share, Ip) :-
     share_access(Host, User, Share, Ip),
     contains(Share, "C$").
