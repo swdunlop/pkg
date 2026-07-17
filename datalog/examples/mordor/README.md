@@ -39,7 +39,7 @@ The `-d` flag accepts a `.zip` file as well as a directory.
 ?> .list
   ci_ends_with/2  (2 facts)
   cidr_match/2  (2 facts)
-  contains/2  (4 facts)
+  contains/2  (1 facts)
   file_create/3  (5 facts)
   image_load/5  (1 facts)
   logon/7  (2 facts)

@@ -156,85 +156,116 @@ matchers:
 
 declarations:
   - name: net_conn
+    use: >-
+      A network connection observed by Sysmon (event 3): the process on
+      host that connected src_ip:src_port to dst_ip:dst_port.
     terms:
       - {name: host}
-      - {name: image}
+      - {name: image, use: the process that made the connection}
       - {name: src_ip}
       - {name: src_port}
       - {name: dst_ip}
       - {name: dst_port}
-      - {name: protocol}
-      - {name: user}
+      - {name: protocol, use: 'transport protocol, e.g. "tcp"'}
+      - {name: user, use: the account the connecting process ran as}
 
   - name: proc_terminate
+    use: >-
+      A process exit observed by Sysmon (event 5).
     terms:
       - {name: host}
-      - {name: image}
-      - {name: guid}
+      - {name: image, use: the process that exited}
+      - {name: guid, use: Sysmon's process GUID}
 
   - name: image_load
+    use: >-
+      A module loaded into a process, observed by Sysmon (event 7),
+      with its code-signing status.
     terms:
       - {name: host}
-      - {name: image}
-      - {name: loaded}
-      - {name: signed}
-      - {name: signature}
+      - {name: image, use: the process that loaded the module}
+      - {name: loaded, use: path of the loaded module}
+      - {name: signed, use: '"true" when the module is code-signed'}
+      - {name: signature, use: signer name when signed}
 
   - name: proc_access
+    use: >-
+      One process opened a handle to another, observed by Sysmon
+      (event 10) -- the shape credential dumping and injection take.
     terms:
       - {name: host}
-      - {name: source}
-      - {name: target}
-      - {name: access}
+      - {name: source, use: the process that opened the handle}
+      - {name: target, use: the process the handle points at}
+      - {name: access, use: 'requested access mask, e.g. "0x1000"'}
 
   - name: file_create
+    use: >-
+      A file created on disk, observed by Sysmon (event 11).
     terms:
       - {name: host}
-      - {name: image}
-      - {name: path}
+      - {name: image, use: the process that created the file}
+      - {name: path, use: filesystem path of the new file}
 
   - name: reg_key
+    use: >-
+      A registry key created or deleted, observed by Sysmon (event 12).
     terms:
       - {name: host}
-      - {name: image}
+      - {name: image, use: the process that touched the key}
       - {name: key}
 
   - name: reg_value
+    use: >-
+      A registry value set, observed by Sysmon (event 13).
     terms:
       - {name: host}
-      - {name: image}
+      - {name: image, use: the process that set the value}
       - {name: key}
       - {name: value}
 
   - name: logon
+    use: >-
+      A Windows authentication event (Security 4624): user logged on to
+      host. type is the numeric logon type -- "2" interactive at the
+      console, "3" network, "10" remote interactive (RDP).
     terms:
       - {name: host}
       - {name: user}
       - {name: domain}
-      - {name: type}
-      - {name: ip}
-      - {name: port}
-      - {name: auth}
+      - {name: type, use: 'Windows logon type: "2" console, "3" network, "10" RDP'}
+      - {name: ip, use: source address for network logons}
+      - {name: port, use: source port for network logons}
+      - {name: auth, use: 'authentication package, e.g. "Kerberos" or "NTLM"'}
 
   - name: special_priv
+    use: >-
+      Special privileges were assigned at logon (Security 4672) --
+      SeDebugPrivilege and friends; an administrative or
+      service-level session.
     terms:
       - {name: host}
       - {name: user}
       - {name: domain}
-      - {name: privileges}
+      - {name: privileges, use: the privilege list granted at logon}
 
   - name: share_access
+    use: >-
+      A network share object was accessed (Security 5140): user reached
+      share on host from ip.
     terms:
       - {name: host}
       - {name: user}
-      - {name: share}
-      - {name: ip}
+      - {name: share, use: 'UNC share name, e.g. "\\*\C$"'}
+      - {name: ip, use: the client address that mounted the share}
 
   - name: share_file
+    use: >-
+      A file within a network share was accessed (Security 5145):
+      user touched path under share on host from ip.
     terms:
       - {name: host}
       - {name: user}
-      - {name: share}
-      - {name: path}
-      - {name: ip}
-      - {name: access_mask}
+      - {name: share, use: UNC share name the file lives under}
+      - {name: path, use: file path relative to the share root}
+      - {name: ip, use: the client address behind the access}
+      - {name: access_mask, use: 'requested access mask, e.g. "0x17019f"'}
