@@ -2,6 +2,7 @@ package jsonfacts
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"strconv"
 
@@ -40,11 +41,25 @@ func NewEncoder(w io.Writer, decls []datalog.Declaration) *Encoder {
 //	{"predicate": {"term1": val1, "term2": val2, ...}}
 //
 // Otherwise, terms are keyed by their positional index as strings.
+//
+// Encode returns an error rather than silently dropping a value if two
+// terms of the matching declaration resolve to the same JSON object key
+// (obj[key] = ... below is a plain Go map write, so a duplicate key would
+// otherwise silently overwrite an earlier term's value with a later one's).
+// Config.validate rejects such a declaration before any fact reaches this
+// point when the declarations came from a Config, but this check is the
+// backstop for any other caller that builds a []datalog.Declaration by hand
+// and passes it directly to NewEncoder without going through Config.
 func (e *Encoder) Encode(pred string, row []datalog.Constant) error {
 	obj := make(map[string]any, len(row))
 	names := e.decls[declKey{pred, len(row)}]
+	seen := make(map[string]int, len(row))
 	for i, c := range row {
 		key := termKey(names, i)
+		if prev, ok := seen[key]; ok {
+			return fmt.Errorf("encoding %s: term %d and term %d both resolve to JSON key %q; declare distinct term names to avoid silently dropping a value", pred, prev, i, key)
+		}
+		seen[key] = i
 		obj[key] = constantToJSON(c)
 	}
 

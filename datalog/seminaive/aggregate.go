@@ -411,14 +411,36 @@ func subInt64Checked(a, b int64) (diff int64, overflow bool) {
 
 // mulInt64Checked multiplies a and b, reporting overflow instead of wrapping.
 // Uses the canonical round-trip check: a non-overflowing product divides back
-// by each factor exactly.
+// by each factor exactly -- except for the MinInt64*-1 (and -1*MinInt64)
+// case, which the round-trip check alone misses: Go defines MinInt64 * -1 as
+// MinInt64 * -1 == MinInt64 (silent wrap, since +2^63 is not representable),
+// and MinInt64/-1 then reproduces -1 exactly (prod/a == b holds even though
+// prod is wrong), so the round-trip check alone would pass through a wrapped
+// value. Guarded explicitly up front, matching the documented policy that
+// int64 overflow panics arithmeticOverflowError rather than wrapping.
 func mulInt64Checked(a, b int64) (prod int64, overflow bool) {
 	if a == 0 || b == 0 {
 		return 0, false
+	}
+	if (a == -1 && b == math.MinInt64) || (b == -1 && a == math.MinInt64) {
+		return 0, true
 	}
 	prod = a * b
 	if prod/a != b {
 		return 0, true
 	}
 	return prod, false
+}
+
+// divInt64Checked divides a by b, reporting overflow instead of wrapping.
+// Go defines MinInt64 / -1 == MinInt64 (a silent wrap: the mathematical
+// result, +2^63, is not representable as int64), the only int64/int64
+// division that can overflow. Division by zero is handled by the caller
+// (applyBinOp), which already treats it as "no result" rather than an error;
+// divInt64Checked only guards the overflow case.
+func divInt64Checked(a, b int64) (quot int64, overflow bool) {
+	if a == math.MinInt64 && b == -1 {
+		return 0, true
+	}
+	return a / b, false
 }

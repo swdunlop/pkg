@@ -135,3 +135,56 @@ func TestDeclarationSetZeroTermsDeclaresArityZeroOnly(t *testing.T) {
 		t.Error("flag/2: expected arity mismatch error (only flag/0 is declared)")
 	}
 }
+
+// TestDeclarationSetDocOnlySkipsChecking is the regression test for bug #1:
+// a Declaration{Name: "p", DocOnly: true} with nil Terms must not register as
+// the schema for p/0 (unlike an ordinary zero-Terms declaration, pinned by
+// TestDeclarationSetZeroTermsDeclaresArityZeroOnly above) and must not reject
+// facts of p at any real arity. DocOnly declarations exist purely so a
+// predicate is listed in Database.Declarations() for schema display (e.g.
+// seminaive's rule-head bookkeeping, or a jsonfacts name+use-only config
+// declaration) and must never participate in CheckFact/CheckAtom.
+func TestDeclarationSetDocOnlySkipsChecking(t *testing.T) {
+	ds := NewDeclarationSet(func(yield func(Declaration) bool) {
+		yield(Declaration{Name: "p", DocOnly: true})
+	})
+
+	if err := ds.CheckFact(Fact{Name: "p", Terms: []Constant{Integer(1), Integer(2), Integer(3)}}); err != nil {
+		t.Errorf("p/3: expected no error for DocOnly declaration, got: %v", err)
+	}
+	if err := ds.CheckFact(Fact{Name: "p"}); err != nil {
+		t.Errorf("p/0: expected no error for DocOnly declaration, got: %v", err)
+	}
+	if err := ds.CheckAtom("p", []Term{Integer(1), Variable("X")}); err != nil {
+		t.Errorf("p/2 atom: expected no error for DocOnly declaration, got: %v", err)
+	}
+}
+
+// --- TermType bool/null regression tests (bug #14) ---
+//
+// term.go defines Bool and Null as first-class Constant implementations, but
+// TermType had no matching values and CheckConstant's switch had no cases
+// for them, so there was no way to declare a term's type as bool/null: a
+// genuine Bool or Null constant checked against such a declaration fell
+// through the switch to the default "false" case and was always rejected.
+
+func TestTermBoolCheckConstant(t *testing.T) {
+	if !TermBool.CheckConstant(Bool(true)) {
+		t.Error("TermBool.CheckConstant(Bool(true)): expected true")
+	}
+	if !TermBool.CheckConstant(Bool(false)) {
+		t.Error("TermBool.CheckConstant(Bool(false)): expected true")
+	}
+	if TermBool.CheckConstant(String("x")) {
+		t.Error("TermBool.CheckConstant(String(\"x\")): expected false")
+	}
+}
+
+func TestTermNullCheckConstant(t *testing.T) {
+	if !TermNull.CheckConstant(Null{}) {
+		t.Error("TermNull.CheckConstant(Null{}): expected true")
+	}
+	if TermNull.CheckConstant(String("x")) {
+		t.Error("TermNull.CheckConstant(String(\"x\")): expected false")
+	}
+}

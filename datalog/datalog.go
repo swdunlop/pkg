@@ -63,17 +63,30 @@ type Fact struct {
 }
 
 // A Declaration describes a predicate by naming its terms.
+//
+// A Declaration with DocOnly set is documentation-only: it names a
+// predicate (optionally with Use text) purely so the predicate appears in
+// [Database.Declarations] for schema display/encoding, without asserting
+// anything about its arity or term types. [NewDeclarationSet] -- the single
+// chokepoint used to build a checking [DeclarationSet] for [DeclarationSet.CheckFact]
+// / [DeclarationSet.CheckAtom] -- skips DocOnly declarations entirely, so they
+// never constrain or reject facts/atoms of that predicate at any arity.
+// Producers that only want a predicate to be listed (e.g. seminaive's
+// rule-head bookkeeping, or a jsonfacts config declaration with no Terms)
+// must set DocOnly: true so they are structurally prevented from being
+// mistaken for an arity-0 schema.
 type Declaration struct {
-	Name  string            `json:"name"`  // the name of the predicate
-	Use   string            `json:"use"`   // markdown text explaining how the predicate is used
-	Terms []TermDeclaration `json:"terms"` // the defined name of the terms for the predicate
+	Name    string            `json:"name"`              // the name of the predicate
+	Use     string            `json:"use"`               // markdown text explaining how the predicate is used
+	Terms   []TermDeclaration `json:"terms"`             // the defined name of the terms for the predicate
+	DocOnly bool              `json:"docOnly,omitempty"` // true if this declaration exists only for documentation/listing, and must not constrain arity or types
 }
 
 // TermDeclaration describes the name and use of a term in a declaration.
 type TermDeclaration struct {
 	Name string   `json:"name"`           // the name of the term, empty for anonymous terms
 	Use  string   `json:"use"`            // markdown text explaining the term's meaning.
-	Type TermType `json:"type,omitempty"` // optional type constraint: "string", "integer", "float", "id", or "" (any)
+	Type TermType `json:"type,omitempty"` // optional type constraint: "string", "integer", "float", "id", "json", "bool", "null", or "" (any)
 }
 
 // TermType constrains the expected type of a term in a declaration.
@@ -86,6 +99,8 @@ const (
 	TermFloat   TermType = "float"   // matches Float
 	TermID      TermType = "id"      // matches ID
 	TermJSON    TermType = "json"    // matches *Composite
+	TermBool    TermType = "bool"    // matches Bool
+	TermNull    TermType = "null"    // matches Null
 )
 
 // CheckConstant reports whether a constant matches the declared type.
@@ -108,6 +123,12 @@ func (typ TermType) CheckConstant(c Constant) bool {
 		return ok
 	case TermJSON:
 		_, ok := c.(*Composite)
+		return ok
+	case TermBool:
+		_, ok := c.(Bool)
+		return ok
+	case TermNull:
+		_, ok := c.(Null)
 		return ok
 	}
 	return false
@@ -147,24 +168,32 @@ type declKey struct {
 // for the same name at a DIFFERENT arity is an arity mismatch (CheckFact and
 // CheckAtom report it as such). A name with no declaration at any arity is
 // simply unchecked. This is also the only "no schema" state: a
-// Declaration{Name: "p"} with nil/empty Terms registers as the schema for
-// p/0 (an empty term list, i.e. arity 0) like any other declaration -- it
-// does not exempt every arity of p from checking. A caller that wants "p
-// exists but I don't want its arity checked" (e.g. seminaive's rule-head
-// bookkeeping, which registers a bare Declaration{Name: r.Head.Pred} purely
-// so the predicate shows up in Database.Declarations() for schema
-// display/encoding -- see seminaive/transformer.go) must not feed that
-// declaration into a DeclarationSet used for CheckFact/CheckAtom: doing so
-// would flag every non-zero arity of the rule as a mismatch.
+// Declaration{Name: "p"} with nil/empty Terms and DocOnly false registers as
+// the schema for p/0 (an empty term list, i.e. arity 0) like any other
+// declaration -- it does not exempt every arity of p from checking. A caller
+// that wants "p exists but I don't want its arity checked" (e.g. seminaive's
+// rule-head bookkeeping, which registers a bare
+// Declaration{Name: r.Head.Pred, DocOnly: true} purely so the predicate shows
+// up in Database.Declarations() for schema display/encoding -- see
+// seminaive/transformer.go) sets DocOnly: true; [NewDeclarationSet] skips
+// DocOnly declarations entirely, so they cannot flag any arity of that
+// predicate as a mismatch.
 type DeclarationSet map[declKey]Declaration
 
 // NewDeclarationSet builds a DeclarationSet from declarations, keyed by
-// (name, arity). The first declaration seen for a given (name, arity) wins;
+// (name, arity), for use with [DeclarationSet.CheckFact] and
+// [DeclarationSet.CheckAtom]. Declarations with DocOnly set are skipped --
+// they exist only so a predicate is listed in [Database.Declarations] for
+// schema display/encoding, and must never participate in checking. Among the
+// remaining declarations, the first one seen for a given (name, arity) wins;
 // later ones with the same name and arity are ignored. Declarations for the
 // same name at different arities are independent and both kept.
 func NewDeclarationSet(decls iter.Seq[Declaration]) DeclarationSet {
 	ds := DeclarationSet{}
 	for d := range decls {
+		if d.DocOnly {
+			continue
+		}
 		k := declKey{d.Name, len(d.Terms)}
 		if _, exists := ds[k]; !exists {
 			ds[k] = d

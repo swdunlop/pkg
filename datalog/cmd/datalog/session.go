@@ -77,6 +77,104 @@ type session struct {
 	gen uint64
 }
 
+// reservedQueryPred is the synthetic predicate name runQuery mixes into
+// every query's evaluation (see runQuery's doc comment: "Build synthetic
+// rule: _q_(Var1, ..., VarN) :- body."). It is reserved across the whole
+// user-facing predicate namespace — fact names, rule/aggregate-rule heads,
+// AND body atoms — because a user-asserted `_q_(...)` fact would sit in the
+// same predicate slot runQuery's synthetic rule writes its answer rows into
+// (session.go's runQuery/querySnapshot.runQuery, output.Facts("_q_", ...)),
+// silently mixing unrelated user data into every query's result set with no
+// error at all. parseUserProgram is the single funnel every entry point
+// that accepts user program text (facts/rules/queries) must call instead of
+// syntax.ParseAll directly, so this reservation cannot be forgotten by a
+// future call site.
+const reservedQueryPred = "_q_"
+
+// parseUserProgram parses source with syntax.ParseAll and then rejects any
+// use of the reserved query predicate (reservedQueryPred) as a fact name,
+// rule head, aggregate-rule head, or body atom — the single chokepoint for
+// BUG #2 (silent wrong answer): before this check existed, a program
+// containing `_q_("boom").` parsed and compiled cleanly, and its fact
+// silently rode along in every later query's result rows (runQuery reads
+// exactly that predicate out of the post-query fixpoint). Every session
+// entry point that accepts raw user program text (setRules,
+// setRulesWithQueries, loadProgram) — and the workbench/console call sites
+// that pre-parse the same text for check-only or query-only purposes
+// (rules_editor.go's handleRulesCheck, console.go's query handler) — must
+// call this instead of syntax.ParseAll, so the reservation cannot be
+// bypassed by adding a new entry point that forgets it.
+func parseUserProgram(source string) (syntax.Ruleset, error) {
+	ruleset, err := syntax.ParseAll(source)
+	if err != nil {
+		return syntax.Ruleset{}, err
+	}
+	if err := validateNoReservedPred(ruleset); err != nil {
+		return syntax.Ruleset{}, err
+	}
+	return ruleset, nil
+}
+
+// validateNoReservedPred rejects a parsed Ruleset that names
+// reservedQueryPred anywhere a user predicate can appear: fact/rule heads,
+// aggregate-rule heads, and body atoms of rules, aggregate rules, and
+// queries alike (the query body case matters too — `_q_(X)?` would read
+// back whatever the last query happened to leave in that predicate, an
+// equally confusing silent-wrong-answer surface). See parseUserProgram's
+// doc comment for why this lives as one shared check rather than being
+// duplicated per call site.
+func validateNoReservedPred(rs syntax.Ruleset) error {
+	is := func(pred string) bool { return pred == reservedQueryPred }
+	for _, r := range rs.Rules {
+		if is(r.Head.Pred) {
+			return fmt.Errorf("predicate %q is reserved for internal query evaluation and cannot be used as a fact or rule name", reservedQueryPred)
+		}
+		for _, atom := range r.Body {
+			if is(atom.Pred) {
+				return fmt.Errorf("predicate %q is reserved for internal query evaluation and cannot be used in a rule body", reservedQueryPred)
+			}
+		}
+	}
+	for _, ar := range rs.AggRules {
+		if is(ar.Head.Pred) {
+			return fmt.Errorf("predicate %q is reserved for internal query evaluation and cannot be used as an aggregate rule name", reservedQueryPred)
+		}
+		for _, atom := range ar.Body {
+			if is(atom.Pred) {
+				return fmt.Errorf("predicate %q is reserved for internal query evaluation and cannot be used in a rule body", reservedQueryPred)
+			}
+		}
+	}
+	for _, q := range rs.Queries {
+		for _, atom := range q.Body {
+			if is(atom.Pred) {
+				return fmt.Errorf("predicate %q is reserved for internal query evaluation and cannot be used in a query", reservedQueryPred)
+			}
+		}
+	}
+	return nil
+}
+
+// validateStatementNoReservedPred applies the reservedQueryPred reservation to
+// a single statement parsed via syntax.ParseStatement -- the ingest surfaces
+// that take one statement at a time rather than a whole program (the
+// interactive REPL and the MCP query handler). It wraps the statement in a
+// one-element Ruleset and defers to validateNoReservedPred so all program
+// ingest, whether via ParseAll or ParseStatement, enforces the reservation
+// through the same shared check and no ParseStatement caller can silently
+// reintroduce the _q_ leak.
+func validateStatementNoReservedPred(stmt any) error {
+	switch v := stmt.(type) {
+	case *syntax.Rule:
+		return validateNoReservedPred(syntax.Ruleset{Rules: []syntax.Rule{*v}})
+	case *syntax.AggregateRule:
+		return validateNoReservedPred(syntax.Ruleset{AggRules: []syntax.AggregateRule{*v}})
+	case *syntax.Query:
+		return validateNoReservedPred(syntax.Ruleset{Queries: []syntax.Query{*v}})
+	}
+	return nil
+}
+
 // setDataSource configures the session to load facts from a jsonfacts config.
 func (s *session) setDataSource(configPath, dataDir string) {
 	s.configPath = configPath
@@ -100,9 +198,22 @@ func (s *session) loadData() error {
 
 	var db *memory.Database
 	if strings.HasSuffix(s.dataDir, ".zip") {
-		db, err = loadFromZip(cfg, s.dataDir)
+		db, err = loadFromZip(&cfg, s.dataDir)
 	} else {
-		db, err = cfg.LoadDir(s.dataDir)
+		// Resolve *_from pattern files against the same directory LoadDir
+		// will read from, mirroring prepareSchema's fsys/ResolveFromFS
+		// pairing (mcp.go's set_schema path). LoadDir/LoadFS do not resolve
+		// _from fields themselves (see ResolveFromFS's doc comment) — before
+		// this call, a matcher like `contains_from: iocs.txt` validated but
+		// silently matched against an empty inline list, so compileMatchers
+		// emitted zero facts with no warning. Without this, the CLI -c/
+		// .reload path and the MCP set_schema path disagreed on the same
+		// schema document.
+		fsys := os.DirFS(s.dataDir)
+		if err = cfg.ResolveFromFS(fsys); err != nil {
+			return fmt.Errorf("resolving *_from patterns in %s: %w", s.dataDir, err)
+		}
+		db, err = cfg.LoadFS(fsys)
 	}
 	if err != nil {
 		return fmt.Errorf("loading data from %s: %w", s.dataDir, err)
@@ -117,12 +228,19 @@ func (s *session) loadData() error {
 }
 
 // loadFromZip opens a zip file and loads JSONL data using it as an fs.FS.
-func loadFromZip(cfg jsonfacts.Config, path string) (*memory.Database, error) {
+// Like the plain-directory path in loadData, it resolves *_from pattern
+// files against the same fs.FS (the zip contents) before loading, so a
+// zip-packaged config's matchers behave the same as a directory-packaged
+// one — see loadData's comment for why this matters (BUG #3).
+func loadFromZip(cfg *jsonfacts.Config, path string) (*memory.Database, error) {
 	r, err := zip.OpenReader(path)
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
+	if err := cfg.ResolveFromFS(&r.Reader); err != nil {
+		return nil, fmt.Errorf("resolving *_from patterns in %s: %w", path, err)
+	}
 	return cfg.LoadFS(&r.Reader)
 }
 
@@ -259,7 +377,7 @@ func (s *session) setSchema(text string, format string, fsys fs.FS, confine conf
 // mcp-server.md specifies for the MCP tool surface. On any error, session
 // state is unchanged.
 func (s *session) setRules(source string) error {
-	ruleset, err := syntax.ParseAll(source)
+	ruleset, err := parseUserProgram(source)
 	if err != nil {
 		return err
 	}
@@ -293,7 +411,7 @@ func (s *session) setRules(source string) error {
 // `.`/`?` convention, so a pasted `.dl` file with trailing queries should
 // just work. On any error, session state is unchanged.
 func (s *session) setRulesWithQueries(source string) ([]syntax.Query, error) {
-	ruleset, err := syntax.ParseAll(source)
+	ruleset, err := parseUserProgram(source)
 	if err != nil {
 		return nil, err
 	}
@@ -314,7 +432,7 @@ func (s *session) setRulesWithQueries(source string) ([]syntax.Query, error) {
 // adding facts and rules to the session. Queries found in the source are
 // returned for the caller to execute and present.
 func (s *session) loadProgram(src string) ([]syntax.Query, error) {
-	ruleset, err := syntax.ParseAll(src)
+	ruleset, err := parseUserProgram(src)
 	if err != nil {
 		return nil, err
 	}

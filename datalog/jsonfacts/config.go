@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
+	"strconv"
 
 	"swdunlop.dev/pkg/datalog"
 )
@@ -30,9 +31,12 @@ type Config struct {
 	// It fires for three distinct situations, all reported as plain errors
 	// naming the expression, the record, and (for the filter case) the
 	// actual result:
-	//   - a filter or arg expression that fails to evaluate outright (a
-	//     genuine expr runtime error), which drops the mapping's fact for
-	//     the record;
+	//   - a filter, arg, or imperative (expr:) mapping expression that fails
+	//     to evaluate outright (a genuine expr runtime error), which drops
+	//     the mapping's fact (or, for an imperative mapping, that record's
+	//     assert() calls for that mapping) for the record -- both mapping
+	//     modes agree on this fatal-vs-skip boundary: only a compile-time
+	//     error is fatal, a per-record runtime error is not;
 	//   - a filter that evaluates to anything other than a literal true/false
 	//     (including nil), which is treated as "no match" and also drops the
 	//     fact -- notably, expr-lang does not error on a map field access
@@ -160,6 +164,47 @@ func (cfg *Config) validate() error {
 			return fmt.Errorf("matcher %d: %w", mi, err)
 		}
 	}
+	for di, d := range cfg.Declarations {
+		if err := validateDeclarationTermNames(d); err != nil {
+			return fmt.Errorf("declaration %d (%s): %w", di, d.Name, err)
+		}
+	}
+	return nil
+}
+
+// validateDeclarationTermNames rejects a declaration whose Terms contain a
+// duplicate name, or a named term that collides with the positional key
+// (Encoder's termKey uses strconv.Itoa(i) for any term without a name)
+// another term in the same declaration would fall back to if it were
+// unnamed. Both cases would make Encoder.Encode -- which builds the
+// per-fact JSON object by writing obj[key] = ... for each term in order --
+// silently overwrite an earlier term's value with a later one's (a plain Go
+// map key collision, not an error), dropping a value with no indication
+// anything went wrong. Catching this at declaration load time, before any
+// fact is ever encoded, is the earliest chokepoint: it rejects the bad
+// schema outright instead of letting every fact encoded under it silently
+// lose data.
+func validateDeclarationTermNames(d datalog.Declaration) error {
+	seen := make(map[string]int, len(d.Terms))
+	for i, t := range d.Terms {
+		key := t.Name
+		if key == "" {
+			key = strconv.Itoa(i)
+		}
+		if prev, ok := seen[key]; ok {
+			if t.Name == "" {
+				return fmt.Errorf("term %d has no name and collides with the positional key %q already used by term %d", i, key, prev)
+			}
+			return fmt.Errorf("duplicate term name %q used by terms %d and %d", t.Name, prev, i)
+		}
+		seen[key] = i
+	}
+	// A single pass suffices for the positional-key collision too (e.g. a
+	// term literally named "1" and an unnamed term at index 1): seen is
+	// keyed by each term's *resolved* key (its own name if set, else its
+	// index as a string), so a later term's resolved key colliding with an
+	// earlier one's is caught above regardless of which one is named and
+	// which is positional, and regardless of declaration order.
 	return nil
 }
 
@@ -182,9 +227,7 @@ func (mc Matcher) validate() error {
 	}
 	hasPatterns := len(mc.Contains) > 0 || len(mc.StartsWith) > 0 || len(mc.EndsWith) > 0 ||
 		len(mc.RegexMatch) > 0 || len(mc.Base64) > 0 || len(mc.Base64UTF16) > 0 || len(mc.CIDR) > 0
-	hasFromFiles := mc.ContainsFrom != "" || mc.StartsWithFrom != "" || mc.EndsWithFrom != "" ||
-		mc.RegexMatchFrom != "" || mc.Base64From != "" || mc.Base64UTF16From != "" || mc.CIDRFrom != ""
-	if !hasPatterns && !hasFromFiles {
+	if !hasPatterns && !mc.hasFromFiles() {
 		return fmt.Errorf("matcher must have at least one pattern list or _from file")
 	}
 	for _, p := range mc.RegexMatch {
@@ -196,6 +239,43 @@ func (mc Matcher) validate() error {
 		if _, err := netip.ParsePrefix(c); err != nil {
 			return fmt.Errorf("invalid CIDR %q: %w", c, err)
 		}
+	}
+	return nil
+}
+
+// hasFromFiles reports whether any *_from field is still set, i.e. names a
+// pattern file that has not yet been resolved into its corresponding inline
+// list (resolveFromFS clears each *_from field to "" once it has merged
+// that file's patterns into the inline slice and is the only thing that
+// clears them). A Matcher that validates successfully (validate only checks
+// that *some* pattern source, inline or _from, is present) can still have
+// hasFromFiles true forever if ResolveFromFS/LoadSchemaFS's automatic
+// resolution was never called -- see checkResolved, which turns that state
+// into a load-time error instead of the silent "zero derived facts" it
+// otherwise causes.
+func (mc Matcher) hasFromFiles() bool {
+	return mc.ContainsFrom != "" || mc.StartsWithFrom != "" || mc.EndsWithFrom != "" ||
+		mc.RegexMatchFrom != "" || mc.Base64From != "" || mc.Base64UTF16From != "" || mc.CIDRFrom != ""
+}
+
+// checkResolved rejects a Matcher that still has an unresolved *_from field
+// at the point matching is about to run (compileMatchers, the mechanism
+// both applyMatchers/LoadFS and any other caller of compileMatchers go
+// through). Without this, a matcher like {"contains_from": "iocs.txt"}
+// passes validate (which only requires *some* pattern source, inline or
+// _from) but, if ResolveFromFS was never called to turn that file into an
+// inline list, compileMatchers silently reads zero patterns from the
+// (still-empty) inline Contains slice and the matcher derives no facts at
+// all -- a total, silent loss of every match this matcher was meant to
+// produce, with no warning distinguishable from "the file legitimately
+// contained no patterns". This check makes that distinction explicit:
+// "never resolved" is now a clear error; "resolved to an empty file" (the
+// *_from field is cleared to "" by resolveFromFS regardless of how many
+// patterns it found) is not, and continues to load with zero derived facts
+// for that matcher as before.
+func (mc Matcher) checkResolved() error {
+	if mc.hasFromFiles() {
+		return fmt.Errorf("matcher has an unresolved _from field; call Config.ResolveFromFS (or LoadSchemaDir/LoadSchemaFS, which do this automatically) before LoadFS/LoadDir")
 	}
 	return nil
 }

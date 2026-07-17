@@ -741,9 +741,14 @@ func (p *parser) parseStatement() (any, error) {
 	if err := p.validateHeadAtom(head, headPos); err != nil {
 		return nil, err
 	}
-	if _, err := p.expect(tokImplies); err != nil {
-		return nil, err
+	if p.current.kind != tokImplies {
+		if isErrorTok(p.current.kind) {
+			return nil, p.errorTok(p.current)
+		}
+		return nil, p.errorf(p.current.pos,
+			"expected '.', '?', ',', or ':-', got %q", p.current.val)
 	}
+	p.advance()
 
 	// Check for aggregate pattern: Var = aggKind(...) : body
 	if p.current.kind == tokIdent {

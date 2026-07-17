@@ -41,7 +41,7 @@ func cmdHelp(r *repl, _ string) error {
 	fmt.Fprintln(r.out, "  ancestor(X, Y) :- parent(X, Y).      Define a rule")
 	fmt.Fprintln(r.out, `  ancestor("tom", X)?                   Query`)
 	fmt.Fprintln(r.out, "  not parent(?, X)                     Negation in rule body")
-	fmt.Fprintln(r.out, "  C = count : person(?, ?).            Aggregate in rule body")
+	fmt.Fprintln(r.out, "  pop(C) :- C = count : person(?, ?).  Aggregate rule")
 	return nil
 }
 

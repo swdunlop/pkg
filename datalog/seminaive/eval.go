@@ -63,6 +63,20 @@ var constraintBuiltinNames = map[string]bool{
 	"@regex_match": true,
 }
 
+// constraintBuiltinArity is the authoritative expected total-arity table for
+// the four string constraint predicates, all of which take exactly two
+// already-bound arguments (see constraintBuiltinNames's doc comment). Driven
+// by checkBodyBuiltins (engine.go) so a wrong-arity call like
+// @contains(X) -- which checkConstraintV's `len(terms) < 2` guard would
+// otherwise just silently evaluate to false, forever -- fails at Compile
+// instead of compiling clean and never firing.
+var constraintBuiltinArity = map[string]int{
+	"@contains":    2,
+	"@starts_with": 2,
+	"@ends_with":   2,
+	"@regex_match": 2,
+}
+
 // isConstraint reports whether an atom is an inline constraint (comparison or string builtin).
 func isConstraint(a syntax.Atom) bool {
 	switch a.Pred {
@@ -509,7 +523,11 @@ func applyBinOp(op string, lhs, rhs any) (any, bool) {
 				if r == 0 {
 					return nil, false
 				}
-				return l / r, true
+				quot, overflow := divInt64Checked(l, r)
+				if overflow {
+					panic(arithmeticOverflowError{op: op, a: l, b: r, err: errInt64Overflow})
+				}
+				return quot, true
 			case "mod":
 				if r == 0 {
 					return nil, false

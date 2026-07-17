@@ -2266,3 +2266,131 @@ func TestMultiBuiltinUnsupportedTypeErrors(t *testing.T) {
 		t.Errorf("expected error to name builtin @multibad, got: %v", err)
 	}
 }
+
+// --- DocOnly declaration regression tests (bug #1 / bug #13) ---
+
+// TestStageTwoAcceptsStageOneDocOnlyRuleHeadDeclarations is the regression
+// test for bug #1's seminaive producer: stage 1's rule-head bookkeeping used
+// to emit a bare Declaration{Name: pred} (arity-0, per datalog.go's "zero
+// Terms declares arity zero" rule) for every derived predicate not already
+// declared. Feeding stage 1's output Declarations() into stage 2's
+// WithDeclarations then made stage 2 reject its own rules referencing that
+// predicate at its real (non-zero) arity as an arity mismatch at compile
+// time. Rule-head declarations must be DocOnly so they never constrain
+// checking; this pins that stage 2 compiles and derives facts using a
+// predicate stage 1 only declared via rule-head bookkeeping.
+func TestStageTwoAcceptsStageOneDocOnlyRuleHeadDeclarations(t *testing.T) {
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "parent", Terms: []datalog.Constant{datalog.String("tom"), datalog.String("bob")}})
+	b.AddFact(datalog.Fact{Name: "parent", Terms: []datalog.Constant{datalog.String("bob"), datalog.String("ann")}})
+	input := b.Build()
+
+	// Stage 1: derives grandparent/2. "grandparent" has no explicit
+	// declaration anywhere, so stage 1's Declarations() must supply a
+	// DocOnly rule-head marker for it.
+	rs1, err := syntax.ParseAll(`grandparent(X, Z) :- parent(X, Y), parent(Y, Z).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr1, err := seminaive.New().Compile(rs1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage1, err := tr1.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stage1Decls []datalog.Declaration
+	for d := range stage1.Declarations() {
+		stage1Decls = append(stage1Decls, d)
+	}
+	foundDocOnly := false
+	for _, d := range stage1Decls {
+		if d.Name == "grandparent" {
+			if !d.DocOnly {
+				t.Errorf("expected stage 1's grandparent declaration to be DocOnly, got: %+v", d)
+			}
+			foundDocOnly = true
+		}
+	}
+	if !foundDocOnly {
+		t.Fatal("expected stage 1 to emit a grandparent declaration")
+	}
+
+	// Stage 2: a rule referencing grandparent/2 at its real arity, compiled
+	// with stage 1's declarations fed into WithDeclarations. Before the fix,
+	// this failed to compile with an arity mismatch (grandparent/0 vs
+	// grandparent/2).
+	rs2, err := syntax.ParseAll(`ancestor(X, Z) :- grandparent(X, Z).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng2 := seminaive.New(seminaive.WithDeclarations(stage1Decls))
+	tr2, err := eng2.Compile(rs2)
+	if err != nil {
+		t.Fatalf("stage 2 failed to compile using stage 1's DocOnly declarations: %v", err)
+	}
+
+	output, err := tr2.Transform(context.Background(), stage1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var results []string
+	for row := range output.Facts("ancestor", 2) {
+		results = append(results, string(row[0].(datalog.String))+","+string(row[1].(datalog.String)))
+	}
+	if len(results) != 1 || results[0] != "tom,ann" {
+		t.Errorf("expected ancestor facts [tom,ann], got %v", results)
+	}
+}
+
+// TestTransformPreservesDistinctArityInputDeclarations is the regression
+// test for bug #13: the transformer used to dedupe input declarations by
+// predicate name alone (seen[d.Name] / seenDecl[d.Name]), so a database that
+// legitimately declares the same predicate at two arities -- p/1 and p/2, as
+// distinct declarations -- had the second one silently dropped, even though
+// datalog.DeclarationSet itself is keyed by (name, arity) and would happily
+// keep both. This pins that both survive through Transform's output
+// Declarations().
+func TestTransformPreservesDistinctArityInputDeclarations(t *testing.T) {
+	b := memory.NewBuilder()
+	b.AddDeclaration(datalog.Declaration{
+		Name:  "p",
+		Terms: []datalog.TermDeclaration{{Name: "a", Type: datalog.TermString}},
+	})
+	b.AddDeclaration(datalog.Declaration{
+		Name: "p",
+		Terms: []datalog.TermDeclaration{
+			{Name: "a", Type: datalog.TermString},
+			{Name: "b", Type: datalog.TermInteger},
+		},
+	})
+	b.AddFact(datalog.Fact{Name: "p", Terms: []datalog.Constant{datalog.String("x")}})
+	b.AddFact(datalog.Fact{Name: "p", Terms: []datalog.Constant{datalog.String("x"), datalog.Integer(1)}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`q(X) :- p(X).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr, err := seminaive.New().Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := tr.Transform(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	arities := map[int]bool{}
+	for d := range output.Declarations() {
+		if d.Name == "p" {
+			arities[len(d.Terms)] = true
+		}
+	}
+	if !arities[1] || !arities[2] {
+		t.Errorf("expected both p/1 and p/2 declarations to survive Transform, got arities: %v", arities)
+	}
+}

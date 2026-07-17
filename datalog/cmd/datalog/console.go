@@ -12,7 +12,6 @@ import (
 	"github.com/swdunlop/html-go/datastar"
 	"github.com/swdunlop/html-go/tag"
 	"swdunlop.dev/pkg/datalog/cmd/datalog/view"
-	"swdunlop.dev/pkg/datalog/syntax"
 )
 
 // consoleLog is the server-owned scrollback behind the console drawer
@@ -185,7 +184,7 @@ func (wb *workbench) handleConsoleQuery(w http.ResponseWriter, r *http.Request) 
 
 	_ = stream.Emit(datastar.Signal(map[string]any{"consoleQuery": ""}))
 
-	ruleset, err := syntax.ParseAll(text)
+	ruleset, err := parseUserProgram(text)
 	if err != nil {
 		wb.consoleAppend("query", "error", queryEcho(text), html.Text(err.Error()))
 		return

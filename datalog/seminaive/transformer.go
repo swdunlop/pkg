@@ -14,6 +14,15 @@ import (
 	"swdunlop.dev/pkg/datalog/syntax"
 )
 
+// declArityKey builds a map key combining a predicate name and its arity, for
+// deduping declarations the same way datalog.DeclarationSet is keyed (see
+// datalog.go's declKey): by (name, arity), not name alone, so a predicate
+// declared at two distinct arities (p/1 and p/2) is never collapsed to just
+// one of them.
+func declArityKey(name string, arity int) string {
+	return fmt.Sprintf("%s\x00%d", name, arity)
+}
+
 // transformer implements datalog.Transformer using semi-naive evaluation.
 type transformer struct {
 	rules         []syntax.Rule
@@ -32,27 +41,37 @@ var _ datalog.Transformer = (*transformer)(nil)
 
 // Declarations returns the merged set of input and derived predicate declarations.
 func (t *transformer) Declarations(ctx context.Context, input datalog.Database) iter.Seq[datalog.Declaration] {
-	// Collect input declarations.
-	seen := map[string]bool{}
+	// Collect input declarations, deduped by (Name, arity) so a predicate
+	// legitimately declared at two arities (p/1 and p/2) is not collapsed
+	// to just the first one seen -- that would silently drop a real
+	// declaration, matching how datalog.DeclarationSet itself is keyed.
+	seen := map[string]bool{}      // any declaration exists for this name (used to gate the DocOnly bookkeeping below)
+	seenArity := map[string]bool{} // (name, arity) pair already emitted, encoded as name+"\x00"+arity
 	var decls []datalog.Declaration
 	for d := range input.Declarations() {
-		if !seen[d.Name] {
-			seen[d.Name] = true
+		seen[d.Name] = true
+		k := declArityKey(d.Name, len(d.Terms))
+		if !seenArity[k] {
+			seenArity[k] = true
 			decls = append(decls, d)
 		}
 	}
 
-	// Add declarations for rule-head predicates not already declared.
+	// Add DocOnly declarations for rule-head predicates not already declared
+	// at any arity, purely so the predicate appears in Declarations() for
+	// schema display. DocOnly ensures these never constrain arity/type
+	// checking (see datalog.NewDeclarationSet); one bare marker per name is
+	// enough regardless of how many arities the rule set derives.
 	for _, r := range t.rules {
 		if !seen[r.Head.Pred] {
 			seen[r.Head.Pred] = true
-			decls = append(decls, datalog.Declaration{Name: r.Head.Pred})
+			decls = append(decls, datalog.Declaration{Name: r.Head.Pred, DocOnly: true})
 		}
 	}
 	for _, ar := range t.aggRules {
 		if !seen[ar.Head.Pred] {
 			seen[ar.Head.Pred] = true
-			decls = append(decls, datalog.Declaration{Name: ar.Head.Pred})
+			decls = append(decls, datalog.Declaration{Name: ar.Head.Pred, DocOnly: true})
 		}
 	}
 
@@ -158,7 +177,12 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 		}
 	}
 
-	// Merge declarations for derived predicates.
+	// Merge declarations for derived predicates. seenDecl tracks "any
+	// declaration exists for this name" -- sufficient to skip adding the
+	// DocOnly rule-head marker below, since one bare marker per name is
+	// enough regardless of how many arities are otherwise declared. decls
+	// itself (from loadInput) already preserves distinct arities for the
+	// same name; this loop must not re-collapse it by name.
 	seenDecl := map[string]bool{}
 	for _, d := range decls {
 		seenDecl[d.Name] = true
@@ -166,13 +190,13 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 	for _, r := range t.rules {
 		if !seenDecl[r.Head.Pred] {
 			seenDecl[r.Head.Pred] = true
-			decls = append(decls, datalog.Declaration{Name: r.Head.Pred})
+			decls = append(decls, datalog.Declaration{Name: r.Head.Pred, DocOnly: true})
 		}
 	}
 	for _, ar := range t.aggRules {
 		if !seenDecl[ar.Head.Pred] {
 			seenDecl[ar.Head.Pred] = true
-			decls = append(decls, datalog.Declaration{Name: ar.Head.Pred})
+			decls = append(decls, datalog.Declaration{Name: ar.Head.Pred, DocOnly: true})
 		}
 	}
 	sort.Slice(decls, func(i, j int) bool { return decls[i].Name < decls[j].Name })
@@ -225,12 +249,15 @@ func (t *transformer) loadFromGeneric(input datalog.Database) (*interned.Dict, i
 	dict := interned.NewDict()
 	existing := interned.NewInternedFactSet()
 
-	// Collect declarations.
+	// Collect declarations, deduped by (Name, arity) -- not Name alone -- so
+	// a predicate legitimately declared at two arities (p/1 and p/2) is not
+	// silently collapsed to just the first one seen. See declArityKey.
 	var decls []datalog.Declaration
-	seenDecl := map[string]bool{}
+	seenArity := map[string]bool{}
 	for d := range input.Declarations() {
-		if !seenDecl[d.Name] {
-			seenDecl[d.Name] = true
+		k := declArityKey(d.Name, len(d.Terms))
+		if !seenArity[k] {
+			seenArity[k] = true
 			decls = append(decls, d)
 		}
 	}

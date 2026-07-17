@@ -50,9 +50,30 @@ func (cfg *Config) LoadFS(fsys fs.FS) (*memory.Database, error) {
 		facts = append(facts, derived...)
 	}
 
-	if cfg.OnTypeError != nil && len(cfg.Declarations) > 0 {
+	// A config declaration with no Terms is documentation-only: it names a
+	// predicate (optionally with Use text) purely so it appears in the
+	// output database's schema listing, without asserting an arity-0
+	// schema. Mark it DocOnly so datalog.NewDeclarationSet -- the chokepoint
+	// both CheckFact below and any downstream checking set goes through --
+	// skips it, rather than rejecting every real fact of that predicate at
+	// its actual (non-zero) arity as an arity mismatch. We mark it on the
+	// declaration that is STORED in the database (not just an ephemeral check
+	// copy) so the doc-only property travels with the declaration: any later
+	// consumer that builds a checking set from Database.Declarations() (e.g.
+	// feeding them into seminaive.WithDeclarations) inherits the same skip and
+	// cannot re-trigger the arity-0 rejection. The declaration still appears in
+	// Declarations() for schema display; DocOnly only affects checking.
+	normDecls := make([]datalog.Declaration, len(cfg.Declarations))
+	for i, d := range cfg.Declarations {
+		if len(d.Terms) == 0 {
+			d.DocOnly = true
+		}
+		normDecls[i] = d
+	}
+
+	if cfg.OnTypeError != nil && len(normDecls) > 0 {
 		ds := datalog.NewDeclarationSet(func(yield func(datalog.Declaration) bool) {
-			for _, d := range cfg.Declarations {
+			for _, d := range normDecls {
 				if !yield(d) {
 					return
 				}
@@ -66,7 +87,7 @@ func (cfg *Config) LoadFS(fsys fs.FS) (*memory.Database, error) {
 	}
 
 	builder := memory.NewBuilder()
-	for _, d := range cfg.Declarations {
+	for _, d := range normDecls {
 		builder.AddDeclaration(d)
 	}
 	for _, f := range facts {
@@ -107,10 +128,15 @@ type compiledMapping struct {
 
 // loadSource reads a single JSONL source from fsys and returns all generated
 // facts. onMappingError, if non-nil, is called for each record where a
-// mapping's filter or arg expression:
+// mapping's filter, arg, or imperative expr expression:
 //   - fails to evaluate outright (a genuine expr runtime error, e.g. indexing
-//     past the end of a string), which drops that mapping's fact for the
-//     record;
+//     past the end of a string), which drops that mapping's fact(s) for the
+//     record -- for an imperative (expr:) mapping this means the whole
+//     record's assert() calls for that mapping are skipped, exactly as a
+//     declarative mapping's fact is skipped for the same class of error;
+//     only a compile-time error (a malformed expr that fails to compile) is
+//     still fatal and aborts the whole load, since that is a config defect
+//     rather than a per-record data defect;
 //   - is a filter that evaluates to something other than a literal bool
 //     (including nil), which is treated as "don't match" and also drops the
 //     fact -- expr-lang does not error when a map field access like
@@ -192,7 +218,23 @@ func loadSource(src Source, fsys fs.FS, counter *idCounter, onMappingError func(
 		for mi, cm := range compiled {
 			if cm.imperative != nil {
 				if _, err := expr.Run(cm.imperative, runEnv); err != nil {
-					return nil, fmt.Errorf("%s: line %d: mapping %d: %w", src.File, lineNum, mi, err)
+					// A per-record runtime evaluation error here is the same
+					// class of failure as a declarative mapping's filter/arg
+					// runtime error below (e.g. indexing past the end of a
+					// string): a defect in this one record, not the
+					// mapping's compiled program. compileImperative already
+					// rejected anything that fails to COMPILE (a genuine
+					// config-level defect) back in compileMappings, so any
+					// error reaching this point is necessarily a runtime
+					// one. Routing it through onMappingError and skipping
+					// just this record's assertions -- instead of aborting
+					// the whole load -- matches the declarative path's
+					// fatal-vs-skip boundary so the two mapping modes agree
+					// on the same failure class.
+					if onMappingError != nil {
+						onMappingError(fmt.Errorf("%s: line %d: mapping %d: %w", src.File, lineNum, mi, err))
+					}
+					continue
 				}
 				continue
 			}

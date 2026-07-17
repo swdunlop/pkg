@@ -47,7 +47,7 @@ func (wb *workbench) handleRulesCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ruleset, err := syntax.ParseAll(sig.RulesText)
+	ruleset, err := parseUserProgram(sig.RulesText)
 	if err != nil {
 		_ = stream.Emit(datastar.Elements(errorList([]string{err.Error()})))
 		return

@@ -20,6 +20,35 @@ func registerJSONBuiltins(e *Engine) {
 	WithMultiBuiltin("@json_items", 2, jsonItems)(e)
 }
 
+// builtinBuiltinArity is the authoritative expected total-arity table
+// (inputs + output(s)) for the always-registered JSON destructuring
+// builtins, each of which hardcodes its own `len(inputs) != N` runtime
+// check (see jsonGet et al.) that a wrong-arity call silently fails --
+// e.g. @json_get(X, V) with one input instead of two just returns (nil,
+// false) forever, indistinguishable from "key not found". Driven by
+// checkBodyBuiltins (engine.go) so a wrong-arity call to one of these
+// fixed-shape builtins fails at Compile instead of compiling clean and
+// never firing. Keyed by the atom's full arity (arg count in rule text,
+// matching len(a.Terms)), the same unit constraintBuiltinArity and
+// checkRuleArity use -- not the BuiltinFunc's inputs-only count -- so one
+// table entry works for both single-output builtins (registered via
+// WithBuiltin, whose atom arity is len(inputs)+1) and multi-output builtins
+// (registered via WithMultiBuiltin, whose atom arity is len(inputs)+outputs).
+//
+// User-registered builtins (WithBuiltin/WithMultiBuiltin outside this file)
+// have no declared arity anywhere in the Option API -- only multiBuiltin.outputs
+// is known, never the input count -- so they cannot be arity-checked at
+// compile time by this table; checkBodyBuiltins only validates the names
+// this package itself defines.
+var builtinBuiltinArity = map[string]int{
+	"@json_get":   3, // Obj/Arr, Key/Idx, V
+	"@json_len":   2, // ArrOrObj, N
+	"@json_type":  2, // V, T
+	"@json_slice": 3, // Arr, From, T
+	"@json_each":  2, // Arr, Elem
+	"@json_items": 3, // Obj, K, V
+}
+
 // jsonValue converts a normalized JSON sub-value (from a Composite's decoded
 // form) into an engine value: scalars pass through, true/false/null become
 // the dedicated constants, and nested objects/arrays become composites in

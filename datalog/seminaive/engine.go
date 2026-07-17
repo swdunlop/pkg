@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"regexp"
 	"strings"
 	"time"
 
@@ -262,6 +263,9 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 			if err := checkRuleSafety(r, e.builtins, e.multiBuiltins, e.externals); err != nil {
 				return nil, err
 			}
+			if err := checkBodyBuiltins(r.Body, e.builtins, e.multiBuiltins, e.externals); err != nil {
+				return nil, err
+			}
 			if err := checkRuleVarLimit(r.Head, r.Body); err != nil {
 				return nil, err
 			}
@@ -278,6 +282,9 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 			return nil, err
 		}
 		if err := checkAggRuleSafety(ar, e.builtins, e.multiBuiltins, e.externals); err != nil {
+			return nil, err
+		}
+		if err := checkBodyBuiltins(ar.Body, e.builtins, e.multiBuiltins, e.externals); err != nil {
 			return nil, err
 		}
 		if err := checkRuleVarLimit(ar.Head, ar.Body); err != nil {
@@ -507,6 +514,76 @@ func checkBodySafety(body []syntax.Atom, builtins map[string]BuiltinFunc, multiB
 	}
 
 	return bound, nil
+}
+
+// checkBodyBuiltins is the compile-time chokepoint for every "@"-prefixed
+// body atom, catching two shapes that otherwise compile clean and silently
+// derive zero facts forever -- indistinguishable from "no matching data":
+//
+//  1. An unrecognized "@" predicate (typically a typo, e.g. @json_ge instead
+//     of @json_get). The parser reserves "@" for builtins (validateHeadAtom
+//     rejects an "@" head), but checkBodySafety/compileBody route anything
+//     that isn't a known constraint, bind builtin, or multi-bind builtin
+//     through the ordinary join case: it parses and compiles as a join
+//     against a predicate that (being a typo) never has any facts, so the
+//     rule derives nothing and Compile never complains.
+//  2. A wrong-arity call to a builtin this package itself defines (the four
+//     string constraints and the always-registered JSON destructuring
+//     builtins) -- e.g. @contains(X) with one argument. Every one of these
+//     has a fixed, statically-known shape and validates its own arity at
+//     RUNTIME with a `len(...) != N` guard that just returns false/no
+//     results on mismatch (checkConstraintV's `len(terms) < 2`, jsonGet's
+//     `len(inputs) != 2`, ...), so the mismatch is silent there too.
+//     constraintBuiltinArity (eval.go) and builtinBuiltinArity (json.go) are
+//     the authoritative arity tables this check is driven from -- the same
+//     ones the runtime code's own shape assumptions rely on -- rather than a
+//     hand-maintained parallel list that could drift from them.
+//
+// A caller-registered builtin (WithBuiltin/WithMultiBuiltin outside this
+// package) has no declared arity anywhere in the Option API, so its calls
+// cannot be arity-checked here; only the name-recognition check (1) applies
+// to those. isMultiBindBuiltin/isBindBuiltin already recognize them by name,
+// so they never fall into the "unknown builtin" branch below.
+func checkBodyBuiltins(body []syntax.Atom, builtins map[string]BuiltinFunc, multiBuiltins map[string]multiBuiltin, externals map[string]externalPredicate) error {
+	for _, a := range body {
+		if a.Pred == "is" || !strings.HasPrefix(a.Pred, "@") {
+			continue
+		}
+		switch {
+		case isExternalPred(a, externals):
+			// A registered external predicate is a legitimate body atom even
+			// with an @-prefixed name (WithExternal imposes no name
+			// restriction). Its arity is already enforced in checkBodySafety,
+			// so recognizing it by name here is enough to keep it out of the
+			// "unknown builtin" branch below.
+		case constraintBuiltinNames[a.Pred]:
+			if want, ok := constraintBuiltinArity[a.Pred]; ok && len(a.Terms) != want {
+				return fmt.Errorf("builtin %s: expected %d argument(s), got %d", a.Pred, want, len(a.Terms))
+			}
+			if a.Pred == "@regex_match" && len(a.Terms) == 2 {
+				// Only a constant pattern can be validated now; a variable
+				// pattern (bound at runtime from a fact/join) is only known
+				// once evaluation supplies a value, so its validation stays
+				// at cachedRegexp's runtime compile -- see checkConstraintV.
+				if pat, ok := a.Terms[1].(datalog.String); ok {
+					if _, err := regexp.Compile(string(pat)); err != nil {
+						return fmt.Errorf("builtin @regex_match: invalid pattern %q: %w", string(pat), err)
+					}
+				}
+			}
+		case isBindBuiltin(a, builtins):
+			if want, ok := builtinBuiltinArity[a.Pred]; ok && len(a.Terms) != want {
+				return fmt.Errorf("builtin %s: expected %d argument(s), got %d", a.Pred, want, len(a.Terms))
+			}
+		case isMultiBindBuiltin(a, multiBuiltins):
+			if want, ok := builtinBuiltinArity[a.Pred]; ok && len(a.Terms) != want {
+				return fmt.Errorf("builtin %s: expected %d argument(s), got %d", a.Pred, want, len(a.Terms))
+			}
+		default:
+			return fmt.Errorf("unknown builtin %s", a.Pred)
+		}
+	}
+	return nil
 }
 
 // checkRuleArity rejects any atom (head, fact, or body literal) wider than

@@ -497,6 +497,9 @@ func (h *mcpHandlers) query(ctx context.Context, in queryInput) (queryOutput, er
 	if err != nil {
 		return queryOutput{}, err
 	}
+	if err := validateStatementNoReservedPred(parsed); err != nil {
+		return queryOutput{}, err
+	}
 	q, ok := parsed.(*syntax.Query)
 	if !ok {
 		return queryOutput{}, fmt.Errorf("query: expected a query statement ending in '?', got %T", parsed)

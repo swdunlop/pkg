@@ -149,11 +149,17 @@ map(value.attachments, assert("email_attachment", [id, #.name, #.hash, #.size]))
 	}
 }
 
-// TestImperativeMappingErrorAborts confirms that a runtime error raised by an
-// imperative Expr mapping on one record is surfaced as a load error (naming
-// the file and line) rather than silently dropping the rest of that record's
-// asserts and continuing, which would produce an undiagnosed partial load.
-func TestImperativeMappingErrorAborts(t *testing.T) {
+// TestImperativeMappingErrorSkipsRecord confirms that a runtime error raised
+// by an imperative Expr mapping on one record is treated the same as a
+// declarative mapping's per-record runtime error: the record's asserts for
+// that mapping are skipped and the load continues, rather than aborting the
+// entire load. This mirrors the declarative filter/arg runtime-error
+// behavior (see TestOnMappingErrorFiresOnArgEvalError and friends) so both
+// mapping modes agree on the same failure class. See
+// loader_encoder_review_test.go for the OnMappingError-hook variant of this
+// scenario and for confirmation that a compile-time expr error is still
+// fatal.
+func TestImperativeMappingErrorSkipsRecord(t *testing.T) {
 	dir := t.TempDir()
 	// Record 2 (line 2) has only 1 tag, so indexing tags[1] is out of range,
 	// which expr-lang raises as a runtime error. Records 1 and 3 are well-formed.
@@ -179,13 +185,16 @@ func TestImperativeMappingErrorAborts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err := cfg.LoadDir(dir)
-	if err == nil {
-		t.Fatal("expected an error from the record 2 division-by-zero, got nil")
+	db, err := cfg.LoadDir(dir)
+	if err != nil {
+		t.Fatalf("LoadDir: %v", err)
 	}
-	msg := err.Error()
-	if !strings.Contains(msg, "recs.jsonl") || !strings.Contains(msg, "line 2") {
-		t.Errorf("expected error naming the file and line 2, got: %v", err)
+	count := 0
+	for range db.Facts("rec", 2) {
+		count++
+	}
+	if count != 2 {
+		t.Errorf("expected 2 rec facts (record 2 skipped, records 1 and 3 kept), got %d", count)
 	}
 }
 
@@ -1521,5 +1530,69 @@ func TestNormalizeToConstantTwoTo63StaysFloat(t *testing.T) {
 	const twoTo63 = 9223372036854775808.0
 	if float64(got) != twoTo63 {
 		t.Fatalf("expected Float(2^63) = %v, got %v", twoTo63, got)
+	}
+}
+
+// TestDocOnlyDeclarationDoesNotRejectRealArityFacts is the regression test
+// for bug #1's jsonfacts producer: a config declaration with a name and Use
+// text but no Terms is meant as documentation only ("this predicate exists,
+// don't constrain its arity"). Before the fix, NewDeclarationSet registered
+// that bare declaration as the schema for the predicate's arity 0, so every
+// real fact of the predicate at its actual (non-zero) arity was flagged as
+// an arity mismatch and OnTypeError fired for every loaded record -- a
+// false rejection of valid data.
+func TestDocOnlyDeclarationDoesNotRejectRealArityFacts(t *testing.T) {
+	dataFS := fstest.MapFS{
+		"data.jsonl": {Data: []byte(
+			`{"user":"alice","host":"h1","port":22}` + "\n" +
+				`{"user":"bob","host":"h2","port":443}` + "\n",
+		)},
+	}
+	var typeErrors []error
+	cfg := jsonfacts.Config{
+		Sources: []jsonfacts.Source{{
+			File: "data.jsonl",
+			Mappings: []jsonfacts.Mapping{{
+				Predicate: "conn",
+				Args:      []string{"value.user", "value.host", "value.port"},
+			}},
+		}},
+		Declarations: []datalog.Declaration{
+			// Doc-only: name + Use, no Terms -- "conn exists" but its arity
+			// is not being constrained here.
+			{Name: "conn", Use: "a connection observed in the evidence"},
+		},
+		OnTypeError: func(err error) {
+			typeErrors = append(typeErrors, err)
+		},
+	}
+
+	db, err := cfg.LoadFS(dataFS)
+	if err != nil {
+		t.Fatalf("LoadFS: %v", err)
+	}
+
+	if len(typeErrors) != 0 {
+		t.Errorf("expected no OnTypeError calls for a doc-only declaration, got %d: %v", len(typeErrors), typeErrors)
+	}
+
+	count := 0
+	for range db.Facts("conn", 3) {
+		count++
+	}
+	if count != 2 {
+		t.Errorf("expected 2 conn/3 facts to load, got %d", count)
+	}
+
+	// The doc-only declaration must still surface in the output database's
+	// declarations for schema display/encoding.
+	found := false
+	for d := range db.Declarations() {
+		if d.Name == "conn" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected the doc-only conn declaration to still appear in db.Declarations()")
 	}
 }

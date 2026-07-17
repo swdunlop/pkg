@@ -320,6 +320,35 @@ func TestParseLoneAtErrors(t *testing.T) {
 	}
 }
 
+// TestParseStrayTokenAfterHeadNamesLegalContinuations guards the
+// parseStatement fallthrough that used to report a bare "expected ':-',
+// got ..." whenever the token after a rule/fact head atom was neither '.',
+// '?', ',', nor ':-' -- misleadingly implying ':-' was the only legal
+// continuation of a statement. A stray '?' landing mid-statement (as
+// opposed to immediately after the head, where it is a valid single-atom
+// query) hits this exact fallthrough via the unexpected 'b' that follows
+// it, since parseAtomList/parseStatement report the token that actually
+// broke the match. The message must name the full set of legal
+// continuations at this point, not just ':-'.
+func TestParseStrayTokenAfterHeadNamesLegalContinuations(t *testing.T) {
+	_, err := syntax.ParseAll("a(1) b(2) ? c(3).")
+	if err == nil {
+		t.Fatal("expected a parse error for the stray '?' statement, got nil")
+	}
+	msg := err.Error()
+	if strings.Contains(msg, `expected ':-', got`) {
+		t.Errorf("error message still uses the misleading bare ':-' expectation: %v", msg)
+	}
+	for _, want := range []string{`'.'`, `'?'`, `','`, `':-'`} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("expected the error to name %s as a legal continuation, got: %v", want, msg)
+		}
+	}
+	if !strings.Contains(msg, `"b"`) {
+		t.Errorf("expected the error to mention the offending token 'b', got: %v", msg)
+	}
+}
+
 // TestParseAllValidProgramsStillParse is a broader smoke test that the
 // unrecognized-character fix did not disturb lexing of valid input.
 func TestParseAllValidProgramsStillParse(t *testing.T) {

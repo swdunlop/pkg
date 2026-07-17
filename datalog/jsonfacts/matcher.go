@@ -113,6 +113,9 @@ func windashMatchPatterns(entries []windashEntry) []string {
 func compileMatchers(matchers []Matcher, onWarning func(error)) ([]compiledMatcher, error) {
 	compiled := make([]compiledMatcher, len(matchers))
 	for i, mc := range matchers {
+		if err := mc.checkResolved(); err != nil {
+			return nil, fmt.Errorf("matcher %d (%s): %w", i, mc.Predicate, err)
+		}
 		cm := compiledMatcher{
 			predicate:       mc.Predicate,
 			term:            mc.Term,

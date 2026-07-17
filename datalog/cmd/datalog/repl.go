@@ -181,6 +181,9 @@ func (r *repl) execStatement(text string) error {
 	if err != nil {
 		return err
 	}
+	if err := validateStatementNoReservedPred(result); err != nil {
+		return err
+	}
 
 	switch v := result.(type) {
 	case *syntax.Rule:
