@@ -182,6 +182,16 @@ func loadMoreControl(name string, arity, offset, pageLen, total int, hasMore boo
 // do; it follows the same plain @post pattern as every other row-level
 // button in this file (predicateEntry's click-to-expand, loadMoreControl).
 func WhyButton(name string, arity int, factLiteral string) html.Content {
+	// QueryEscape is doing double duty here: besides URL encoding, its
+	// output alphabet (alnum, -_.~%+) contains no quote, backslash, or
+	// HTML-special byte, so the escaped literal cannot terminate the
+	// single-quoted @post('…') JS string it is spliced into — html-go's
+	// attribute escaping alone would not save us, since &apos; decodes
+	// back to a raw quote before Datastar evaluates the expression.
+	// String terms may contain quotes/backslashes (datalog.String renders
+	// %q), so this invariant is load-bearing; TestWhyButtonLiteralIsInert
+	// pins it. name needs no escaping: why? buttons render only for
+	// derived predicates, whose names lexed as identifiers ([a-zA-Z0-9_]).
 	href := fmt.Sprintf("/why/%s/%d?fact=%s", name, arity, url.QueryEscape(factLiteral))
 	// Reveal the Query tab before posting: the result lands in the console
 	// scrollback, and this is the one console-writing affordance that lives
