@@ -90,6 +90,62 @@ func TestProvenanceTwoRuleChain(t *testing.T) {
 	t.Logf("rendered tree:\n%s", rendered)
 }
 
+// TestProvenanceAggregateRuleDocThreading is TestProvenanceRuleDocThreading's
+// aggregate mirror: a %% doc block on an AggregateRule must thread through the
+// aggregate witness path (explainAggLocked/explainTreeAggLocked ->
+// aggRuleDoc) onto the Derivation's Doc field, with the aggregate Rule text
+// staying bare, and the text renderer citing the doc ahead of the rule line.
+// The plain-rule and aggregate paths use different provenance code, so the
+// plain-rule test alone leaves this branch unpinned.
+func TestProvenanceAggregateRuleDocThreading(t *testing.T) {
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "d", Terms: []datalog.Constant{datalog.String("x"), datalog.Integer(1)}})
+	b.AddFact(datalog.Fact{Name: "d", Terms: []datalog.Constant{datalog.String("x"), datalog.Integer(2)}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll("%% total value per key\ntotal(K, T) :- T = sum(V) : d(K, V).")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prov := seminaive.NewProvenance()
+	tr, err := seminaive.New(seminaive.WithProvenance(prov)).Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.Transform(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+
+	fact := datalog.Fact{Name: "total", Terms: []datalog.Constant{datalog.String("x"), datalog.Integer(3)}}
+	d, ok := prov.Explain(fact)
+	if !ok {
+		t.Fatalf("Explain(%v) not found", fact)
+	}
+	if !d.Aggregate {
+		t.Fatalf("expected an aggregate derivation, got %+v", d)
+	}
+	if d.Doc != "total value per key" {
+		t.Errorf("Doc = %q, want %q", d.Doc, "total value per key")
+	}
+	if strings.Contains(d.Rule, "%%") {
+		t.Errorf("aggregate Rule text must not carry the doc block: %q", d.Rule)
+	}
+
+	tree, ok := prov.ExplainTree(fact)
+	if !ok {
+		t.Fatal("ExplainTree not found")
+	}
+	rendered := tree.String()
+	if !strings.Contains(rendered, "%% total value per key") {
+		t.Errorf("rendered tree must cite the aggregate rule doc:\n%s", rendered)
+	}
+	docIdx := strings.Index(rendered, "%% total value per key")
+	ruleIdx := strings.Index(rendered, "rule: total(K, T)")
+	if ruleIdx < 0 || docIdx < 0 || docIdx > ruleIdx {
+		t.Errorf("doc must render ahead of the aggregate rule line:\n%s", rendered)
+	}
+}
+
 // TestProvenanceDisabledChangesNothing confirms that compiling and
 // transforming without WithProvenance behaves identically to before the
 // feature existed -- no observable side effects, same results.
@@ -320,5 +376,60 @@ func TestProvenanceRepeatedBodyAtomGroundsDistinctFacts(t *testing.T) {
 	if d.Body[0].Fact.Terms[0].(datalog.String) == d.Body[1].Fact.Terms[0].(datalog.String) &&
 		d.Body[0].Fact.Terms[1].(datalog.String) == d.Body[1].Fact.Terms[1].(datalog.String) {
 		t.Errorf("expected two distinct edge facts, got the same fact twice: %+v", d.Body)
+	}
+}
+
+// TestProvenanceRuleDocThreading pins the predicate-docs synergy the
+// provenance spec planned for: a %% doc block on a rule surfaces on the
+// Derivation's Doc field (with Rule staying bare rule text, no doc mixed
+// in) and the text renderer cites the doc ahead of the rule line.
+func TestProvenanceRuleDocThreading(t *testing.T) {
+	b := memory.NewBuilder()
+	b.AddFact(datalog.Fact{Name: "conn", Terms: []datalog.Constant{datalog.String("a"), datalog.Integer(1)}})
+	input := b.Build()
+
+	rs, err := syntax.ParseAll(`
+		%% A connection was seen at all.
+		%% Second line of the doc.
+		seen(H) :- conn(H, ?).
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prov := seminaive.NewProvenance()
+	tr, err := seminaive.New(seminaive.WithProvenance(prov)).Compile(rs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.Transform(context.Background(), input); err != nil {
+		t.Fatal(err)
+	}
+
+	seen := datalog.Fact{Name: "seen", Terms: []datalog.Constant{datalog.String("a")}}
+	d, ok := prov.Explain(seen)
+	if !ok {
+		t.Fatalf("Explain(%v) not found", seen)
+	}
+	if want := "A connection was seen at all.\nSecond line of the doc."; d.Doc != want {
+		t.Errorf("Doc = %q, want %q", d.Doc, want)
+	}
+	if strings.Contains(d.Rule, "%%") {
+		t.Errorf("Rule text must not carry the doc block: %q", d.Rule)
+	}
+
+	tree, ok := prov.ExplainTree(seen)
+	if !ok {
+		t.Fatal("ExplainTree not found")
+	}
+	rendered := tree.String()
+	if !strings.Contains(rendered, "%% A connection was seen at all.") ||
+		!strings.Contains(rendered, "%% Second line of the doc.") {
+		t.Errorf("rendered tree must cite the rule doc:\n%s", rendered)
+	}
+	docIdx := strings.Index(rendered, "%% A connection")
+	ruleIdx := strings.Index(rendered, "rule: seen(H)")
+	if ruleIdx < 0 || docIdx < 0 || docIdx > ruleIdx {
+		t.Errorf("doc must render ahead of the rule line:\n%s", rendered)
 	}
 }

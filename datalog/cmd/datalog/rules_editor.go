@@ -62,7 +62,30 @@ func (wb *workbench) handleRulesCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = stream.Emit(datastar.Elements(errorList(nil)))
+	// A clean parse/compile still surfaces ruleset.Warnings -- detached
+	// '%%' doc blocks the author almost certainly meant to attach. This is
+	// the round-trip editor's data-loss tell: the workbench rules document
+	// round-trips through parse->String on every edit, so a dropped doc is
+	// user data loss the author needs to see rather than a silent
+	// "no errors" that hides it. Rendered in the same #rules-error fragment,
+	// prefixed "warning:" so they read distinctly from hard errors.
+	_ = stream.Emit(datastar.Elements(errorList(warningPrefixed(ruleset.Warnings))))
+}
+
+// warningPrefixed prefixes each parse warning with "warning: " so the
+// shared #rules-error list distinguishes non-fatal diagnostics (dropped
+// detached doc blocks) from hard parse/compile errors. Returns nil for no
+// warnings, so the list renders empty (and is hidden by the :empty CSS
+// rule) exactly as on a fully clean check.
+func warningPrefixed(warnings []string) []string {
+	if len(warnings) == 0 {
+		return nil
+	}
+	out := make([]string, len(warnings))
+	for i, w := range warnings {
+		out[i] = "warning: " + w
+	}
+	return out
 }
 
 // errorList renders the #rules-error fragment: an empty list (hidden by the

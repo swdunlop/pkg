@@ -28,7 +28,7 @@ import (
 // in," the primary assertion is the rejection itself.
 func TestReservedQueryPredRejectedAsFact(t *testing.T) {
 	s := &session{}
-	err := s.setRules(`_q_("boom").`)
+	_, err := s.setRules(`_q_("boom").`)
 	if err == nil {
 		t.Fatal("setRules: expected error for _q_ fact, got none")
 	}
@@ -41,7 +41,7 @@ func TestReservedQueryPredRejectedAsFact(t *testing.T) {
 // just a ground fact) through setRules.
 func TestReservedQueryPredRejectedAsRuleHead(t *testing.T) {
 	s := &session{}
-	err := s.setRules(`_q_(X) :- event(X).`)
+	_, err := s.setRules(`_q_(X) :- event(X).`)
 	if err == nil {
 		t.Fatal("setRules: expected error for _q_ rule head, got none")
 	}
@@ -54,7 +54,7 @@ func TestReservedQueryPredRejectedAsRuleHead(t *testing.T) {
 // form through setRules.
 func TestReservedQueryPredRejectedAsAggHead(t *testing.T) {
 	s := &session{}
-	err := s.setRules(`_q_(N) :- N = count : event(X).`)
+	_, err := s.setRules(`_q_(N) :- N = count : event(X).`)
 	if err == nil {
 		t.Fatal("setRules: expected error for _q_ aggregate rule head, got none")
 	}
@@ -67,7 +67,7 @@ func TestReservedQueryPredRejectedAsAggHead(t *testing.T) {
 // appearing only in a rule body, not as any head.
 func TestReservedQueryPredRejectedAsBodyAtom(t *testing.T) {
 	s := &session{}
-	err := s.setRules(`seen(X) :- _q_(X).`)
+	_, err := s.setRules(`seen(X) :- _q_(X).`)
 	if err == nil {
 		t.Fatal("setRules: expected error for _q_ in a rule body, got none")
 	}
@@ -101,7 +101,7 @@ func TestReservedQueryPredRejectedViaSetRulesWithQueries(t *testing.T) {
 // unrelated predicate names.
 func TestNormalProgramStillWorksAfterReservedPredCheck(t *testing.T) {
 	s := &session{}
-	if err := s.setRules(`event("h1", 1, "cmd1").
+	if _, err := s.setRules(`event("h1", 1, "cmd1").
 suspicious(H) :- event(H, _, _).`); err != nil {
 		t.Fatalf("setRules: unexpected error for a normal program: %v", err)
 	}

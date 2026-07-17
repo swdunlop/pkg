@@ -214,6 +214,34 @@ func TestHTTP_RulesRunStopReportedAsStoppedAndPublishes(t *testing.T) {
 	}
 }
 
+// TestHTTP_RulesCheckSurfacesDetachedDocWarning pins the round-trip
+// editor's data-loss tell: a program with a detached '%%' doc block parses
+// and compiles cleanly, but the author almost certainly meant to attach the
+// doc. Check must surface ruleset.Warnings rather than reporting a silent
+// "no errors" that hides the dropped doc -- the workbench rules document
+// round-trips through parse->String on every edit, so a dropped doc is user
+// data loss. If warnings are ever dropped again, this fails.
+func TestHTTP_RulesCheckSurfacesDetachedDocWarning(t *testing.T) {
+	wb := newMordorWorkbench(t)
+	srv := startTestServer(wb)
+	defer srv.Close()
+
+	// Blank line between the doc block and the rule detaches the doc.
+	resp := postSignals(t, srv, "/rules/check", map[string]any{
+		"rulesText": "%% this doc will be dropped\n\nzzz_marker(X) :- event(_, X, _).\n",
+	})
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	joined := string(body)
+
+	if !strings.Contains(joined, "warning:") {
+		t.Fatalf("detached-doc warning not surfaced in Check output:\n%s", joined)
+	}
+	if !strings.Contains(joined, "detached") {
+		t.Fatalf("Check output did not mention the detached doc:\n%s", joined)
+	}
+}
+
 // TestHTTP_RulesRunOverCapDoesNotCache is the regression for item 3: Run
 // must check the fact cap BEFORE caching or publishing, matching the
 // startup evaluation's order (serve.go's newWorkbench). Before this fix,

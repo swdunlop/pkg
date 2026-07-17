@@ -400,18 +400,23 @@ func (s *session) setSchema(text string, format string, fsys fs.FS, confine conf
 // .load), setRules always replaces the whole document — the editing model
 // mcp-server.md specifies for the MCP tool surface. On any error, session
 // state is unchanged.
-func (s *session) setRules(source string) error {
+// The returned warnings are ruleset.Warnings (detached '%%' doc-comment
+// blocks that will be silently dropped from the round-tripped document).
+// They are surfaced -- not swallowed -- so a caller writing documented rules
+// learns a doc block it wrote failed to attach; see setSchema, whose output
+// carries the same Warnings channel.
+func (s *session) setRules(source string) ([]string, error) {
 	ruleset, err := parseUserProgram(source)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(ruleset.Queries) > 0 {
-		return fmt.Errorf("set_rules: source contains %d embedded query statement(s) ('?'); "+
+		return nil, fmt.Errorf("set_rules: source contains %d embedded query statement(s) ('?'); "+
 			"remove them and use the query tool to run queries", len(ruleset.Queries))
 	}
 
 	if _, err := seminaive.New(s.engineOpts...).Compile(ruleset); err != nil {
-		return err
+		return nil, err
 	}
 
 	s.rules = ruleset.Rules
@@ -420,7 +425,7 @@ func (s *session) setRules(source string) error {
 	s.derivedDB = nil
 	s.derivedProv = nil
 	s.gen++
-	return nil
+	return ruleset.Warnings, nil
 }
 
 // setRulesWithQueries replaces the session's Datalog program atomically,

@@ -38,6 +38,12 @@ Workflow loop (repeat as needed):
                        use this to justify a finding instead of inventing
                        a justification for it.
 
+list_predicates is the cheap index; before writing a rule or query against
+an unfamiliar predicate, call describe instead of guessing at its terms or
+meaning - it returns the predicate's declared/assembled documentation,
+term names, current fact count, and every rule that derives or consumes
+it, per arity.
+
 Each of set_schema and set_rules replaces the whole document; there is no
 incremental edit API. Submit the complete schema or ruleset text every
 time, the same way a human would save a file.
@@ -199,7 +205,11 @@ const mcpDatalogSyntaxSummary = `Datalog syntax summary:
                The @ sigil is required: contains(X, P) WITHOUT it names a
                matcher-emitted fact predicate that holds only the patterns
                declared in the schema - silently 0 rows for anything else.
-  Comments start with "%". "?" alone and a bare "_" are anonymous
+  Comments start with "%". A "%%" block on the lines immediately above a
+  statement (no blank line between) is a doc comment attached to it -
+  describe surfaces it, and it explains the predicate. A "%%" block
+  separated by a blank line attaches to nothing and is dropped (set_rules
+  reports these in "warnings"). "?" alone and a bare "_" are anonymous
   variables (each occurrence is distinct, matches anything, binds
   nothing) - legal anywhere in rule bodies; in the query tool's arguments
   they are allowed only inside negated atoms (where they are the required
@@ -323,6 +333,42 @@ set_rules), together with their arity, current fact count, and - when the
 schema declared it - a human-readable "use" description. Call this to
 get an overview before writing rules or queries, or after set_schema/
 set_rules to confirm what changed.`
+
+// mcpDescribeDescription documents describe.
+const mcpDescribeDescription = `Describe one predicate by name: everything known about it, across every
+arity it is defined or referenced under. Use this before writing a rule or
+query against a predicate you have not used yet, instead of guessing at
+its terms from a rule that happens to mention it - list_predicates stays
+the cheap index (name, arity, fact count, one-line "use"); describe is the
+deep dive.
+
+For each arity the predicate is known under, returns:
+  arity        - the arity itself.
+  factCount    - how many facts currently exist for this predicate/arity
+                 (0 for a predicate that is only referenced, never loaded
+                 or derived).
+  declaration  - name, docs ("use", markdown), and per-term names/docs/
+                 types, when known. For a rule-derived predicate this may
+                 be ASSEMBLED automatically: a term gets a name when every
+                 rule with this head uses the same variable name in that
+                 position, and "use" is the concatenation of every
+                 documented rule's %% doc comment for this head - so a
+                 predicate with no explicit jsonfacts declaration can
+                 still come back documented. Omitted entirely if nothing
+                 is known (bare rule reference, no declaration).
+  derivedBy    - every rule (plain or aggregate) whose HEAD is this
+                 predicate/arity: its full source text plus its own %%
+                 doc comment, if any. Empty for a base (EDB) predicate
+                 loaded only from data.
+  consumedBy   - every rule whose BODY references this predicate/arity in
+                 any position, including a negated atom ("not ...") or an
+                 aggregate rule's body: same shape as derivedBy. Use this
+                 to see what would break before changing a predicate's
+                 shape.
+
+An unknown predicate (no facts, no declaration, no rule head or body
+reference at all) is an error - check the name with list_predicates
+first.`
 
 // mcpSampleFactsDescription documents sample_facts.
 const mcpSampleFactsDescription = `Return up to "limit" facts (default 20) for one predicate/arity pair, plus

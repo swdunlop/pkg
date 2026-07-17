@@ -354,6 +354,38 @@ func TestSetRules_TrialCompileError(t *testing.T) {
 	}
 }
 
+// TestSetRules_SurfacesDetachedDocWarning pins the MCP set_rules data-loss
+// tell: a program with a detached '%%' doc block (block, blank line, rule)
+// parses and compiles cleanly, but the detached doc is silently dropped from
+// the stored document. Unlike the workbench, a model driving set_rules over
+// MCP has no Check pane, so set_rules must report ruleset.Warnings in its
+// output or the dropped doc vanishes with no signal at all. Mirrors
+// TestHTTP_RulesCheckSurfacesDetachedDocWarning (rules_editor_test.go) for the
+// MCP surface, and setSchemaOutput.Warnings for the sibling tool.
+func TestSetRules_SurfacesDetachedDocWarning(t *testing.T) {
+	h, done := newTestHandlers(t, t.TempDir())
+	defer done()
+
+	src := "%% this doc is detached\n\nfoo(X) :- event(_, X, _).\n"
+	out, err := h.setRules(setRulesInput{Source: src})
+	if err != nil {
+		t.Fatalf("setRules: %v", err)
+	}
+	joined := strings.Join(out.Warnings, "\n")
+	if !strings.Contains(joined, "detached") {
+		t.Fatalf("set_rules dropped detached-doc warning; Warnings=%v", out.Warnings)
+	}
+
+	// A clean program with attached docs must NOT warn.
+	clean, err := h.setRules(setRulesInput{Source: "%% attached doc\nbar(X) :- event(_, X, _).\n"})
+	if err != nil {
+		t.Fatalf("setRules (clean): %v", err)
+	}
+	if len(clean.Warnings) != 0 {
+		t.Fatalf("clean set_rules should not warn; Warnings=%v", clean.Warnings)
+	}
+}
+
 func TestSetRules_WholeDocumentReplacement(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 3)
@@ -1051,6 +1083,74 @@ tag("e", "f").
 	}
 	if two.Total != 3 {
 		t.Errorf("sample_facts tag/2: total = %d, want 3", two.Total)
+	}
+}
+
+// -- describe -----------------------------------------------------------
+
+// TestDescribeTool_ReturnsDeclarationAndRuleRefs is the MCP frontend test
+// for the describe tool (mcp.go's describe method, session.describe in
+// describe.go): it must surface the declaration's assembled Use, the fact
+// count, and derivedBy/consumedBy entries with their own doc comments —
+// exactly what the session-level describe returns, since the MCP handler
+// is a thin pass-through.
+func TestDescribeTool_ReturnsDeclarationAndRuleRefs(t *testing.T) {
+	dir := t.TempDir()
+	h, done := newTestHandlers(t, dir)
+	defer done()
+
+	src := `
+%% A host observed doing something.
+event(Host, Kind) :- raw(Host, Kind, ?).
+
+%% Hosts with no observed events.
+quiet(Host) :- known_host(Host), not event(Host, ?).
+`
+	if _, err := h.setRules(setRulesInput{Source: src}); err != nil {
+		t.Fatalf("set_rules: %v", err)
+	}
+
+	out, err := h.describe(describeInput{Predicate: "event"})
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	if out.Name != "event" {
+		t.Fatalf("describe: name = %q, want %q", out.Name, "event")
+	}
+	if len(out.Arities) != 1 {
+		t.Fatalf("describe: got %d arities, want 1", len(out.Arities))
+	}
+	a := out.Arities[0]
+	if a.Arity != 2 {
+		t.Fatalf("describe: arity = %d, want 2", a.Arity)
+	}
+	if len(a.DerivedBy) != 1 {
+		t.Fatalf("describe: derivedBy has %d entries, want 1", len(a.DerivedBy))
+	}
+	if !strings.Contains(a.DerivedBy[0].Doc, "observed doing something") {
+		t.Errorf("describe: derivedBy[0].Doc = %q, missing the rule's doc comment", a.DerivedBy[0].Doc)
+	}
+	if len(a.ConsumedBy) != 1 {
+		t.Fatalf("describe: consumedBy has %d entries, want 1 (quiet's negated atom)", len(a.ConsumedBy))
+	}
+	if !strings.Contains(a.ConsumedBy[0].RuleText, "not event") {
+		t.Errorf("describe: consumedBy[0].RuleText = %q, missing the negated atom", a.ConsumedBy[0].RuleText)
+	}
+}
+
+// TestDescribeTool_UnknownPredicateErrors mirrors sample_facts/explain's
+// unknown-input handling: an unrecognized predicate name is a tool error,
+// not a silently empty result — see describeUnknownError.
+func TestDescribeTool_UnknownPredicateErrors(t *testing.T) {
+	dir := t.TempDir()
+	h, done := newTestHandlers(t, dir)
+	defer done()
+
+	if _, err := h.setRules(setRulesInput{Source: `event("h1").`}); err != nil {
+		t.Fatalf("set_rules: %v", err)
+	}
+	if _, err := h.describe(describeInput{Predicate: "nope"}); err == nil {
+		t.Fatal("describe: expected an error for an unknown predicate, got none")
 	}
 }
 

@@ -355,6 +355,17 @@ func (h *mcpHandlers) registerTools(srv *server.MCPServer) {
 		}),
 	)
 	srv.AddTool(
+		mcp.NewTool("describe",
+			mcp.WithDescription(mcpDescribeDescription),
+			mcp.WithInputSchema[describeInput](),
+		),
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in describeInput) (describeOutput, error) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return h.describe(in)
+		}),
+	)
+	srv.AddTool(
 		mcp.NewTool("sample_input",
 			mcp.WithDescription(mcpSampleInputDescription),
 			mcp.WithInputSchema[sampleInputInput](),
@@ -464,13 +475,23 @@ type setRulesInput struct {
 
 type setRulesOutput struct {
 	Predicates []string `json:"predicates"`
+
+	// Warnings carries session.setRules's non-fatal parse diagnostics --
+	// currently detached '%%' doc-comment blocks that were dropped from the
+	// stored document (see syntax.Ruleset.Warnings). A model writing
+	// documented rules over MCP has no workbench Check pane to surface these,
+	// so set_rules must report them here or a doc block that failed to attach
+	// vanishes silently -- the same Warnings channel set_schema already
+	// exposes (setSchemaOutput.Warnings).
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // setRules requires the caller to hold h.mu — unlike h.query, which manages
 // its own locking via lockedSnapshot/cacheDerivedQuery, its safety lives
 // entirely in the tool-handler wrapper that locks around it.
 func (h *mcpHandlers) setRules(in setRulesInput) (setRulesOutput, error) {
-	if err := h.sess.setRules(in.Source); err != nil {
+	warnings, err := h.sess.setRules(in.Source)
+	if err != nil {
 		return setRulesOutput{}, err
 	}
 	seen := map[string]bool{}
@@ -491,7 +512,7 @@ func (h *mcpHandlers) setRules(in setRulesInput) (setRulesOutput, error) {
 	if h.onChange != nil {
 		h.onChange()
 	}
-	return setRulesOutput{Predicates: preds}, nil
+	return setRulesOutput{Predicates: preds, Warnings: warnings}, nil
 }
 
 // -- query ------------------------------------------------------------
@@ -838,6 +859,34 @@ func (h *mcpHandlers) listPredicates(_ listPredicatesInput) (listPredicatesOutpu
 		return out[i].Arity < out[j].Arity
 	})
 	return listPredicatesOutput{Predicates: out}, nil
+}
+
+// -- describe ------------------------------------------------------------
+
+type describeInput struct {
+	Predicate string `json:"predicate" jsonschema:"predicate name to describe"`
+}
+
+type describeOutput struct {
+	Name    string          `json:"name"`
+	Arities []describeArity `json:"arities"`
+}
+
+// describe is the MCP frontend for session.describe (describe.go) — one of
+// three thin frontends over the single session-level implementation (the
+// REPL's .describe, repl.go/commands.go; the Fact Browser's predicate
+// headers, fact_browser.go/view/fact_browser.go), per this repo's "one
+// pipeline, N frontends" doctrine. Takes h.mu because it reads
+// h.sess.rules/aggRules directly (session.describe walks them), mirroring
+// list_predicates/sample_facts rather than query/explain's lock-free split
+// — describe never runs a Transform, so there is nothing expensive to keep
+// outside the lock.
+func (h *mcpHandlers) describe(in describeInput) (describeOutput, error) {
+	result, err := h.sess.describe(in.Predicate)
+	if err != nil {
+		return describeOutput{}, err
+	}
+	return describeOutput{Name: result.Name, Arities: result.Arities}, nil
 }
 
 // -- sample_facts ------------------------------------------------------

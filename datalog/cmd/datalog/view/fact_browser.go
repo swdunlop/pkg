@@ -88,7 +88,16 @@ func FactsContainerID(name string, arity int) string { return factsContainerID(n
 // predicate's whole facts container — including the "Load more" control,
 // keyed by loadMoreID so a later append page can replace just that control
 // with a fresh one carrying the next offset.
-func FactsTable(name string, arity int, header []string, rows [][]html.Content, offset, total int, hasMore bool) html.Content {
+//
+// use is the predicate's declaration.Use text (doc/features/predicate-docs.md
+// "describe: the mechanical access surface" — the Fact Browser's headers
+// render the same assembled/declared Use text describe returns), rendered
+// as a plain caption above the table when non-empty; empty renders nothing,
+// matching the "no invented chrome" instruction for a predicate with no
+// docs at all. header carries the declaration's named term columns when
+// known (session.describe/handleFacts choose the names; this function only
+// renders whatever strings it is given, keeping view engine-type-agnostic).
+func FactsTable(name string, arity int, header []string, rows [][]html.Content, offset, total int, hasMore bool, use string) html.Content {
 	id := factsContainerID(name, arity)
 	tbody := TableBody.Set("id", tbodyID(name, arity)).Add(factRowContents(rows)...)
 
@@ -97,10 +106,13 @@ func FactsTable(name string, arity int, header []string, rows [][]html.Content, 
 		tbody,
 	)
 
-	return tag.New("div").Set("id", id).Add(
-		table,
-		loadMoreControl(name, arity, offset, len(rows), total, hasMore),
-	)
+	children := []html.Content{}
+	if use != "" {
+		children = append(children, tag.New("p.predicate-use", html.Text(use)))
+	}
+	children = append(children, table, loadMoreControl(name, arity, offset, len(rows), total, hasMore))
+
+	return tag.New("div").Set("id", id).Add(children...)
 }
 
 // FactRows renders just the <tr> rows for an appended page (offset > 0).

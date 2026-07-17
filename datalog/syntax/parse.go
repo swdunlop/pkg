@@ -51,6 +51,21 @@ type token struct {
 	kind tokenKind
 	val  string
 	pos  int
+
+	// doc holds the '%%' doc-comment lines (marker-stripped, one string
+	// per line) that immediately precede this token with no blank line or
+	// plain '%' comment breaking the run -- nil if none. Populated once,
+	// at the moment the token is lexed, so it survives the parser's
+	// one-token lookahead (p.current is fetched before parseStatement
+	// runs, so the doc block for a statement lives on its head token, not
+	// on lexer state read later).
+	doc []string
+
+	// detachedDoc holds any '%%' doc block(s) that were seen in the
+	// whitespace run before this token but broken (by a blank line or a
+	// plain '%' comment) before reaching it -- surfaced by the parser as a
+	// warning rather than silently discarded.
+	detachedDoc []string
 }
 
 // lexer tokenizes datalog input.
@@ -60,6 +75,21 @@ type lexer struct {
 	anonID   int       // counter for anonymous variables
 	prevKind tokenKind // kind of the last token returned by next(), for '-' disambiguation
 	hasPrev  bool
+
+	// docLines accumulates the raw (marker-stripped) content of a
+	// contiguous run of '%%' doc-comment lines that immediately precedes
+	// l.pos, with no blank line or plain '%' comment breaking the run. It
+	// is reset to nil the moment a blank line, a plain '%' comment, or a
+	// non-comment/non-blank line is seen, so that by the time
+	// skipWhitespace returns, docLines holds exactly the block (if any)
+	// that is immediately attached to the upcoming token. See takeDoc.
+	docLines []string
+
+	// detachedDoc records doc blocks that were seen but broken (by a
+	// blank line or a plain '%' comment) before reaching the next real
+	// token, for the parser to surface as a warning rather than silently
+	// dropping them. Cleared by takeDetachedDoc.
+	detachedDoc []string
 }
 
 func newLexer(input string) *lexer {
@@ -107,17 +137,77 @@ func (l *lexer) advance() byte {
 	return b
 }
 
+// skipWhitespace advances past whitespace and comments, maintaining
+// l.docLines as the run of '%%' doc-comment lines (if any) that ends up
+// immediately attached to whatever real token follows -- see the doc on
+// docLines. A blank line, a plain '%' comment, or any gap before a '%%'
+// block all break attachment; a broken, non-empty block is appended to
+// l.detachedDoc so the parser can warn about it instead of losing it
+// silently.
 func (l *lexer) skipWhitespace() {
+	atLineStart := true   // true when l.pos is at the first byte of a source line
+	blankPending := false // an empty line was just seen; a second consecutive newline confirms it
+
+	breakDoc := func() {
+		if len(l.docLines) > 0 {
+			l.detachedDoc = append(l.detachedDoc, l.docLines...)
+		}
+		l.docLines = nil
+	}
+
 	for l.pos < len(l.input) {
 		b := l.input[l.pos]
-		if b == '%' {
-			// line comment
+		switch {
+		case b == '%' && l.pos+1 < len(l.input) && l.input[l.pos+1] == '%':
+			// '%%' doc-comment line: capture its content (everything after
+			// the two markers, with exactly one leading space stripped if
+			// present -- the canonical form that Rule.String etc. re-emit
+			// as "%% "+line) up to the newline or EOF.
+			start := l.pos + 2
 			for l.pos < len(l.input) && l.input[l.pos] != '\n' {
 				l.pos++
 			}
+			// Strip EVERY trailing '\r' first (not just one) so CRLF-terminated
+			// input does not bake a stray carriage return into the doc content
+			// (which would then persist through every render/reparse cycle and
+			// leak into describe/provenance output). A trailing '\r' also cannot
+			// survive a print->reparse round trip at all: writeDoc re-emits the
+			// content as "%% "+line+"\n", so a content-final '\r' is printed as
+			// "...\r\n" and the next parse re-reads it as a CRLF line terminator
+			// and strips it -- silent doc-content loss (found by FuzzParseAll on
+			// "%%\r\r\n..."). Normalizing all trailing '\r' away at lex time is
+			// the only round-trip-stable canonical form. A '\r' in the MIDDLE of
+			// the content is not a line-ending artifact and round-trips fine, so
+			// it is left intact. Then strip one leading space, the inverse of
+			// writeDoc's "%% "+line form.
+			raw := strings.TrimRight(l.input[start:l.pos], "\r")
+			content := strings.TrimPrefix(raw, " ")
+			l.docLines = append(l.docLines, content)
+			atLineStart, blankPending = false, false
 			continue
-		}
-		if b == ' ' || b == '\t' || b == '\n' || b == '\r' {
+		case b == '%':
+			// plain '%' comment: discarded as before, but it breaks any
+			// doc block that was accumulating.
+			breakDoc()
+			for l.pos < len(l.input) && l.input[l.pos] != '\n' {
+				l.pos++
+			}
+			atLineStart, blankPending = false, false
+			continue
+		case b == '\n':
+			if atLineStart {
+				// Two consecutive line breaks with nothing but horizontal
+				// whitespace between them: a blank line, which breaks doc
+				// attachment.
+				blankPending = true
+			}
+			if blankPending {
+				breakDoc()
+			}
+			l.pos++
+			atLineStart = true
+			continue
+		case b == ' ' || b == '\t' || b == '\r':
 			l.pos++
 			continue
 		}
@@ -147,8 +237,23 @@ func canEndExpr(k tokenKind) bool {
 	return false
 }
 
+// nextRaw returns the next token, attaching any '%%' doc block that
+// immediately precedes it (and any detached doc block seen along the way)
+// via nextRawInner -- see the token.doc/detachedDoc field docs. This is the
+// single chokepoint every return path through nextRawInner passes through,
+// so no future token kind can be added there without also picking up its
+// doc attachment for free.
 func (l *lexer) nextRaw() token {
 	l.skipWhitespace()
+	doc, detached := l.docLines, l.detachedDoc
+	l.docLines, l.detachedDoc = nil, nil
+	tok := l.nextRawInner()
+	tok.doc = doc
+	tok.detachedDoc = detached
+	return tok
+}
+
+func (l *lexer) nextRawInner() token {
 	if l.pos >= len(l.input) {
 		return token{kind: tokEOF, pos: l.pos}
 	}
@@ -477,6 +582,40 @@ type parser struct {
 	// pattern began, for error reporting when patterns are not allowed.
 	getters    []Atom
 	patternPos int
+
+	// warnings accumulates non-fatal diagnostics -- currently just
+	// detached '%%' doc blocks (see recordDetachedDoc) -- gathered while
+	// parsing a program. ParseAll surfaces these on Ruleset.Warnings;
+	// ParseStatement has no ruleset to attach them to, so its callers
+	// (single-statement REPL/MCP ingest) do not see them, which matches
+	// this feature's scope of documenting rules/facts/queries stored in a
+	// program document rather than one-off interactive statements.
+	warnings []string
+}
+
+// recordDetachedDoc appends a warning for each detached '%%' doc block
+// found in tok's detachedDoc (populated by the lexer whenever a doc block
+// was broken by a blank line or a plain '%' comment before reaching tok, or
+// orphaned at end of input). Called once per token consumed as a
+// statement's leading token, so a detached block is reported exactly once
+// regardless of how many times lookahead re-reads the surrounding tokens.
+func (p *parser) recordDetachedDoc(tok token) {
+	if len(tok.detachedDoc) > 0 {
+		line := 1 + strings.Count(p.lex.input[:tok.pos], "\n")
+		p.warnings = append(p.warnings, fmt.Sprintf(
+			"line %d: detached %%%% doc comment (blank line or plain %% comment before the next statement) is not attached to any statement and will be dropped",
+			line))
+	}
+	// A doc block attached to the end-of-input token precedes no
+	// statement at all -- it is orphaned, not attached, so it gets the
+	// same warning as an ordinary detached block rather than silently
+	// vanishing.
+	if tok.kind == tokEOF && len(tok.doc) > 0 {
+		line := 1 + strings.Count(p.lex.input[:tok.pos], "\n")
+		p.warnings = append(p.warnings, fmt.Sprintf(
+			"line %d: detached %%%% doc comment at end of input is not attached to any statement and will be dropped",
+			line))
+	}
 }
 
 // takeGetters returns and clears the getter atoms desugared from patterns
@@ -682,10 +821,33 @@ func ParseAll(input string) (Ruleset, error) {
 			rs.Queries = append(rs.Queries, *v)
 		}
 	}
+	// A '%%' block at the very end of input, after the last statement, is
+	// attached to nothing (the EOF token carries it as .doc, since it is
+	// the token immediately following the block) -- report it the same way
+	// as any other detached block rather than silently dropping it.
+	p.recordDetachedDoc(p.current)
+	rs.Warnings = p.warnings
 	return rs, nil
 }
 
+// takeDoc returns the doc-comment block (if any) attached to the upcoming
+// statement's head token, joined into the canonical internal Doc form: doc
+// lines newline-joined, with no trailing newline. It also records a warning
+// for any detached block seen along the way (recordDetachedDoc), so the
+// check happens exactly once per statement, at the point the parser commits
+// to starting it -- before parseAtom's own internal lookahead/backtracking
+// re-lexes any of this span.
+func (p *parser) takeDoc() string {
+	p.recordDetachedDoc(p.current)
+	if len(p.current.doc) == 0 {
+		return ""
+	}
+	return strings.Join(p.current.doc, "\n")
+}
+
 func (p *parser) parseStatement() (any, error) {
+	doc := p.takeDoc()
+
 	// Could be a rule, fact, aggregate rule, or query. Patterns are parsed
 	// permissively here because the first atom may turn out to be a query
 	// body atom; they are rejected below once it proves to be a head.
@@ -709,13 +871,13 @@ func (p *parser) parseStatement() (any, error) {
 		if _, err := p.expectStatementEnd(tokDot); err != nil {
 			return nil, err
 		}
-		return &Rule{Head: head}, nil
+		return &Rule{Head: head, Doc: doc}, nil
 	case tokAnon:
 		// single-atom query: atom?
 		if _, err := p.expectStatementEnd(tokAnon); err != nil {
 			return nil, err
 		}
-		return &Query{Body: append([]Atom{head}, headGetters...)}, nil
+		return &Query{Body: append([]Atom{head}, headGetters...), Doc: doc}, nil
 	case tokComma:
 		// multi-atom query: atom, atom, ...?
 		atoms := append([]Atom{head}, headGetters...)
@@ -731,7 +893,7 @@ func (p *parser) parseStatement() (any, error) {
 		if _, err := p.expectStatementEnd(tokAnon); err != nil {
 			return nil, err
 		}
-		return &Query{Body: atoms}, nil
+		return &Query{Body: atoms, Doc: doc}, nil
 	}
 
 	// rule or aggregate: atom :- ...
@@ -786,7 +948,7 @@ func (p *parser) parseStatement() (any, error) {
 						return nil, p.errorf(varTok.pos, "expected variable on left of aggregate '=', got reserved literal %q", varTok.val)
 					}
 					p.advance()
-					return p.parseAggregateBody(head, varTok.val, kind)
+					return p.parseAggregateBody(head, varTok.val, kind, doc)
 				}
 			}
 		}
@@ -807,7 +969,7 @@ func (p *parser) parseStatement() (any, error) {
 	if _, err := p.expectStatementEnd(tokDot); err != nil {
 		return nil, err
 	}
-	return &Rule{Head: head, Body: body}, nil
+	return &Rule{Head: head, Body: body, Doc: doc}, nil
 }
 
 // validateHeadAtom rejects atoms that cannot legally stand as a rule/fact
@@ -832,7 +994,7 @@ func (p *parser) validateHeadAtom(head Atom, pos int) error {
 	return nil
 }
 
-func (p *parser) parseAggregateBody(head Atom, resultVar string, kind AggregateKind) (*AggregateRule, error) {
+func (p *parser) parseAggregateBody(head Atom, resultVar string, kind AggregateKind, doc string) (*AggregateRule, error) {
 	var aggTerm datalog.Term
 	if kind != AggCount {
 		if _, err := p.expect(tokLParen); err != nil {
@@ -863,6 +1025,7 @@ func (p *parser) parseAggregateBody(head Atom, resultVar string, kind AggregateK
 		Kind:      kind,
 		AggTerm:   aggTerm,
 		Body:      body,
+		Doc:       doc,
 	}, nil
 }
 

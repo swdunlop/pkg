@@ -37,9 +37,15 @@ func renderRuleset(rs syntax.Ruleset) []string {
 // string's contents but still produces syntactically valid, re-parseable
 // output would go undetected by parse->print->parse alone -- the fuzzer only
 // ever asserted re-parseability, not that the re-parsed value matched.
+//
+// doc pins the same fidelity for '%%' doc-comment attachment: a doc that
+// silently vanished, migrated to a different statement, or was mangled by
+// String()'s "%% "-prefix rendering across a print->reparse trip would
+// otherwise go undetected the same way a corrupted string literal would.
 type printedStmt struct {
 	src  string
 	strs []string
+	doc  string
 }
 
 // collectAtomStrings gathers every datalog.String term appearing directly in
@@ -64,7 +70,7 @@ func renderRulesetWithStrings(rs syntax.Ruleset) []printedStmt {
 	for _, r := range rs.Rules {
 		strs := collectAtomStrings([]syntax.Atom{r.Head})
 		strs = append(strs, collectAtomStrings(r.Body)...)
-		out = append(out, printedStmt{src: r.String(), strs: strs})
+		out = append(out, printedStmt{src: r.String(), strs: strs, doc: r.Doc})
 	}
 	for _, ar := range rs.AggRules {
 		strs := collectAtomStrings([]syntax.Atom{ar.Head})
@@ -72,10 +78,10 @@ func renderRulesetWithStrings(rs syntax.Ruleset) []printedStmt {
 			strs = append(strs, string(s))
 		}
 		strs = append(strs, collectAtomStrings(ar.Body)...)
-		out = append(out, printedStmt{src: ar.String(), strs: strs})
+		out = append(out, printedStmt{src: ar.String(), strs: strs, doc: ar.Doc})
 	}
 	for _, q := range rs.Queries {
-		out = append(out, printedStmt{src: q.String(), strs: collectAtomStrings(q.Body)})
+		out = append(out, printedStmt{src: q.String(), strs: collectAtomStrings(q.Body), doc: q.Doc})
 	}
 	return out
 }
@@ -214,6 +220,46 @@ func FuzzParseAll(f *testing.F) {
 		`p()`,
 		`p(,)`,
 		`p(1,).`,
+
+		// '%%' doc comments: single-line, on facts/rules/aggregate
+		// rules/queries.
+		"%% a single-line doc\nparent(\"tom\", \"bob\").",
+		"%% derives ancestor from parent\nancestor(X, Y) :- parent(X, Y).",
+		"%% counts distinct ports per source\nc(X, N) :- N = count : d(X).",
+		"%% who is tom's ancestor\nancestor(\"tom\", X)?",
+
+		// multi-line doc blocks.
+		"%% line one\n%% line two\n%% line three\nport_scan(Src, Dst, PortCount) :- conn(Src, Dst, PortCount).",
+
+		// '%%' immediately adjacent to a plain '%' comment: detaches.
+		"% not a doc\n%% looks like a doc\nfact(1).",
+		"%% looks like a doc\n% not a doc\nfact(1).",
+
+		// blank-line detachment.
+		"%% detached by blank line\n\nfact(1).",
+		"%% attached\nfact(1).\n\n%% also attached, separate statement\nfact(2).",
+
+		// docs containing literal '%' characters (including a second
+		// '%%' inside the text).
+		"%% 50%% discount, or use a %-sign\nfact(1).",
+
+		// unicode content and combining/astral characters.
+		"%% café naïve résumé \U0001F600\nfact(1).",
+
+		// a bare (empty) '%%' line, and mixed blank+empty-doc-line blocks.
+		"%%\nfact(1).",
+		"%% a\n%%\n%% b\nfact(1).",
+
+		// trailing/orphaned doc block with no statement after it.
+		"%% orphaned, nothing follows\n",
+
+		// doc immediately preceding an aggregate rule with min/max/sum.
+		"%% total transferred per owner\ntotal(P, T) :- T = sum(S) : score(P, S).",
+
+		// combined multi-statement program mixing documented and
+		// undocumented statements, so attachment can't leak across
+		// statement boundaries.
+		"parent(\"tom\", \"bob\").\n%% ancestor via direct parent\nancestor(X, Y) :- parent(X, Y).\nancestor(X, Y) :- parent(X, Z), ancestor(Z, Y).\n%% who are tom's descendants\nancestor(\"tom\", X)?",
 	}
 	for _, s := range seeds {
 		f.Add(s)
@@ -244,10 +290,20 @@ func FuzzParseAll(f *testing.F) {
 				t.Fatalf("string-literal values changed across print->reparse: original %q, reprinted %q, want strings %#v, got %#v\noriginal input: %q",
 					input, ps.src, ps.strs, ps2s[0].strs, input)
 			}
+			// A '%%' doc comment must survive the same trip unchanged and
+			// attached to the same (now sole) statement -- a doc that
+			// vanishes, mutates, or silently migrates to a different
+			// statement on reparse is exactly the class of silent-wrong-
+			// result bug this fuzzer exists to catch (see
+			// doc/features/predicate-docs.md, "Attachment ambiguity").
+			if len(ps2s) == 1 && ps.doc != ps2s[0].doc {
+				t.Fatalf("doc comment changed across print->reparse: original %q, reprinted %q, want doc %q, got %q\noriginal input: %q",
+					input, ps.src, ps.doc, ps2s[0].doc, input)
+			}
 			// Re-printing again should not itself fail to reprint or panic,
 			// and should produce a re-parseable form (with unchanged string
-			// values) as well (checks stability of the desugared/normalized
-			// form under repeated print/parse cycles).
+			// values and doc) as well (checks stability of the desugared/
+			// normalized form under repeated print/parse cycles).
 			for _, ps2 := range ps2s {
 				rs3, err := syntax.ParseAll(ps2.src)
 				if err != nil {
@@ -258,7 +314,188 @@ func FuzzParseAll(f *testing.F) {
 					t.Fatalf("string-literal values changed across second print->reparse: first reprint %q, second reprint %q, want strings %#v, got %#v\noriginal input: %q",
 						ps2.src, ps3s[0].src, ps2.strs, ps3s[0].strs, input)
 				}
+				if len(ps3s) == 1 && ps2.doc != ps3s[0].doc {
+					t.Fatalf("doc comment changed across second print->reparse: first reprint %q, second reprint %q, want doc %q, got %q\noriginal input: %q",
+						ps2.src, ps3s[0].src, ps2.doc, ps3s[0].doc, input)
+				}
 			}
 		}
 	})
+}
+
+// docStmt is the subset of a parsed Ruleset's statement info a doc-
+// attachment test cares about: how many statements landed in each bucket,
+// and each rule's Doc (the only bucket exercised below -- AggregateRule and
+// Query attachment share the exact same lexer/parser mechanism as Rule, so
+// they are covered by the "docs on facts/rules/aggregate rules/queries"
+// fuzz seeds above rather than duplicated here statement-type by
+// statement-type).
+func docOf(t *testing.T, input string) (doc string, warnings []string) {
+	t.Helper()
+	rs, err := syntax.ParseAll(input)
+	if err != nil {
+		t.Fatalf("parse %q: %v", input, err)
+	}
+	if len(rs.Rules) != 1 {
+		t.Fatalf("parse %q: want exactly one rule, got %d rules, %d agg rules, %d queries",
+			input, len(rs.Rules), len(rs.AggRules), len(rs.Queries))
+	}
+	return rs.Rules[0].Doc, rs.Warnings
+}
+
+// TestDocAttachment pins the attachment-stability property called out in
+// doc/features/predicate-docs.md's "Attachment ambiguity" risk: a '%%'
+// block directly above a statement attaches; a blank line or a plain '%'
+// comment between the block and the statement detaches it (with a warning,
+// not an error); and the result is stable under print->reparse. The fuzzer
+// above checks the print->reparse half of this property on arbitrary input;
+// this test pins the specific attach/detach boundary cases by hand so a
+// regression here fails with a small, readable diff instead of only a fuzz
+// counterexample.
+func TestDocAttachment(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		wantDoc     string
+		wantWarning bool
+	}{
+		{
+			name:    "directly above attaches",
+			input:   "%% doc\nfact(1).",
+			wantDoc: "doc",
+		},
+		{
+			name:    "multiple contiguous lines attach as one block",
+			input:   "%% line one\n%% line two\nfact(1).",
+			wantDoc: "line one\nline two",
+		},
+		{
+			name:        "blank line between block and statement detaches",
+			input:       "%% doc\n\nfact(1).",
+			wantDoc:     "",
+			wantWarning: true,
+		},
+		{
+			name:        "plain % comment between block and statement detaches",
+			input:       "%% doc\n% just a comment\nfact(1).",
+			wantDoc:     "",
+			wantWarning: true,
+		},
+		{
+			name:        "plain % comment then %% block: only the %% block (contiguous with the statement) attaches",
+			input:       "% just a comment\n%% doc\nfact(1).",
+			wantDoc:     "doc",
+			wantWarning: false,
+		},
+		{
+			name:    "trailing spaces on the doc line before the newline do not create a blank-line break",
+			input:   "%% doc   \nfact(1).",
+			wantDoc: "doc   ",
+		},
+		{
+			name:        "two blocks separated by a blank line: only the nearer block attaches, the far one warns",
+			input:       "%% far, detached\n\n%% near, attached\nfact(1).",
+			wantDoc:     "near, attached",
+			wantWarning: true,
+		},
+		{
+			name:    "plain % comment alone (no %%) is not a doc and not a warning",
+			input:   "% just a comment\nfact(1).",
+			wantDoc: "",
+		},
+		{
+			name:    "ordinary %% empty comment with no content is not distinguished from no doc",
+			input:   "%%\nfact(1).",
+			wantDoc: "",
+		},
+		{
+			name:    "doc containing a literal % character",
+			input:   "%% 100% done\nfact(1).",
+			wantDoc: "100% done",
+		},
+		{
+			name:    "doc containing unicode",
+			input:   "%% café \U0001F600\nfact(1).",
+			wantDoc: "café \U0001F600",
+		},
+		{
+			// CRLF-terminated input must not bake a stray carriage return
+			// into the doc content, or it would persist through every
+			// render/reparse cycle and leak into describe/provenance output.
+			name:    "CRLF line endings do not leave a stray carriage return in the doc",
+			input:   "%% doc\r\nfact(1).\r\n",
+			wantDoc: "doc",
+		},
+		{
+			name:    "CRLF multi-line doc strips each carriage return",
+			input:   "%% line one\r\n%% line two\r\nfact(1).\r\n",
+			wantDoc: "line one\nline two",
+		},
+		{
+			// A run of trailing '\r' (e.g. a bare '\r' before a CRLF: "\r\r\n")
+			// must be stripped WHOLE, not one at a time -- a doc line ending in
+			// '\r' cannot survive print->reparse (writeDoc emits "...\r\n",
+			// which the next parse reads as a CRLF terminator), so the canonical
+			// form must never contain a trailing '\r'. Found by FuzzParseAll on
+			// "%%\r\r\nA()."; here the same shape with content ("doc") pins it
+			// readably.
+			name:    "run of trailing carriage returns stripped whole",
+			input:   "%% doc\r\r\nfact(1).",
+			wantDoc: "doc",
+		},
+		{
+			name:    "doc that is only trailing carriage returns collapses to empty",
+			input:   "%%\r\r\nfact(1).",
+			wantDoc: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doc, warnings := docOf(t, tt.input)
+			if doc != tt.wantDoc {
+				t.Errorf("Doc = %q, want %q", doc, tt.wantDoc)
+			}
+			gotWarning := len(warnings) > 0
+			if gotWarning != tt.wantWarning {
+				t.Errorf("warnings = %v (non-empty=%v), want non-empty=%v", warnings, gotWarning, tt.wantWarning)
+			}
+		})
+	}
+}
+
+// TestDocAttachmentStableUnderReparse pins the print->reparse half of the
+// attachment-stability property directly (in addition to the fuzzer's
+// broader, randomized coverage of the same property): parsing, printing,
+// and reparsing a documented statement must reproduce the identical Doc and
+// an identical second printing, for both the attached and the (blank-line)
+// detached cases.
+func TestDocAttachmentStableUnderReparse(t *testing.T) {
+	inputs := []string{
+		"%% doc\nfact(1).",
+		"%% doc\n\nfact(1).", // detaches on first parse; Doc="" must stay stable
+		"%% line one\n%% line two\nfact(1).",
+		"%% café \U0001F600\nfact(1).",
+		"%% 100% done\nfact(1).",
+	}
+	for _, in := range inputs {
+		t.Run(in, func(t *testing.T) {
+			rs1, err := syntax.ParseAll(in)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			printed1 := rs1.Rules[0].String()
+
+			rs2, err := syntax.ParseAll(printed1)
+			if err != nil {
+				t.Fatalf("reparse of %q: %v", printed1, err)
+			}
+			if rs2.Rules[0].Doc != rs1.Rules[0].Doc {
+				t.Fatalf("Doc not stable across reparse: %q -> %q", rs1.Rules[0].Doc, rs2.Rules[0].Doc)
+			}
+			printed2 := rs2.Rules[0].String()
+			if printed1 != printed2 {
+				t.Fatalf("printed form not stable across reparse: %q -> %q", printed1, printed2)
+			}
+		})
+	}
 }

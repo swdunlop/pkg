@@ -7,6 +7,8 @@ import (
 	"os"
 	"sort"
 	"strings"
+
+	"swdunlop.dev/pkg/datalog"
 )
 
 // command represents a meta-command handler.
@@ -24,6 +26,7 @@ func allCommands() []command {
 		{".list", "List all predicates with fact counts", cmdList},
 		{".rules", "Show defined rules", cmdRules},
 		{".facts", "Dump facts for a predicate: .facts <pred>/<arity>", cmdFacts},
+		{".describe", "Describe a predicate: docs, terms, fact counts, and rules that derive/consume it: .describe <pred>", cmdDescribe},
 		{".profile", "Toggle per-stratum evaluation stats: .profile [on|off]", cmdProfile},
 		{".why", "Explain a derived fact's derivation tree: .why concern(\"ws01\", 87)", cmdWhy},
 		{".clear", "Clear rules and/or facts: .clear [rules|facts|all]", cmdClear},
@@ -148,6 +151,80 @@ func cmdFacts(r *repl, args string) error {
 		fmt.Fprintf(r.out, "No facts for %s/%d.\n", pred, arity)
 	}
 	return nil
+}
+
+// cmdDescribe implements .describe: the REPL frontend for session.describe
+// (describe.go), one of three thin frontends over the single
+// session-level implementation (the MCP describe tool, mcp.go; the Fact
+// Browser's predicate headers, fact_browser.go/view/fact_browser.go), per
+// this repo's "one pipeline, N frontends" doctrine. Prints one block per
+// arity: declaration use/terms (when known), fact count, and the rules
+// that derive or consume this predicate/arity, each with its own doc
+// comment if it has one.
+func cmdDescribe(r *repl, args string) error {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		return fmt.Errorf("usage: .describe <predicate>")
+	}
+	result, err := r.describe(args)
+	if err != nil {
+		return err
+	}
+	for _, a := range result.Arities {
+		fmt.Fprintf(r.out, "%s/%d  (%d facts)\n", result.Name, a.Arity, a.FactCount)
+		if a.Declaration != nil {
+			if a.Declaration.Use != "" {
+				fmt.Fprintf(r.out, "  use: %s\n", a.Declaration.Use)
+			}
+			for i, t := range a.Declaration.Terms {
+				if t.Name == "" && t.Use == "" && t.Type == "" {
+					continue
+				}
+				fmt.Fprintf(r.out, "  term %d: %s\n", i, describeTermLine(t))
+			}
+		}
+		if len(a.DerivedBy) > 0 {
+			fmt.Fprintln(r.out, "  derived by:")
+			for _, ref := range a.DerivedBy {
+				printDescribeRuleRef(r, ref)
+			}
+		}
+		if len(a.ConsumedBy) > 0 {
+			fmt.Fprintln(r.out, "  consumed by:")
+			for _, ref := range a.ConsumedBy {
+				printDescribeRuleRef(r, ref)
+			}
+		}
+		fmt.Fprintln(r.out)
+	}
+	return nil
+}
+
+// describeTermLine renders one TermDeclaration for .describe's output:
+// name (or "_" for unnamed), type when constrained, and use text when
+// present.
+func describeTermLine(t datalog.TermDeclaration) string {
+	name := t.Name
+	if name == "" {
+		name = "_"
+	}
+	line := name
+	if t.Type != "" {
+		line += " (" + string(t.Type) + ")"
+	}
+	if t.Use != "" {
+		line += ": " + t.Use
+	}
+	return line
+}
+
+// printDescribeRuleRef prints one derivedBy/consumedBy entry, indenting
+// its doc comment (if any) beneath the rule text.
+func printDescribeRuleRef(r *repl, ref describeRuleRef) {
+	fmt.Fprintf(r.out, "    %s\n", ref.RuleText)
+	if ref.Doc != "" {
+		fmt.Fprintf(r.out, "      %s\n", ref.Doc)
+	}
 }
 
 func cmdClear(r *repl, args string) error {

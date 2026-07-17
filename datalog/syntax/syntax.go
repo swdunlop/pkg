@@ -50,15 +50,48 @@ func isComparisonPred(pred string) bool {
 	return false
 }
 
+// writeDoc renders doc (the canonical internal form: doc-comment lines
+// joined by '\n', no trailing newline, "" meaning no doc) as a '%%'-prefixed
+// block immediately above a statement, one "%% " + line per line, each
+// followed by a newline -- the exact inverse of the parser's lexer, which
+// strips the "%%" marker and one leading space from each line and
+// newline-joins the result (syntax/parse.go, lexer.skipWhitespace and
+// parser.takeDoc). Print->reparse is therefore an exact identity for any doc
+// the parser itself produced: a doc line that happened to start with a second
+// space keeps it (only one leading space is stripped/added), and an empty
+// line round-trips to a bare "%%" line. (The one thing that cannot survive is
+// a doc line ending in '\r' -- writeDoc prints it as "...\r\n", which the next
+// parse reads as a CRLF line terminator -- so the lexer strips every trailing
+// '\r' from each doc line at parse time, guaranteeing no parser-produced doc
+// ever ends in '\r'.) Writes nothing if doc is "".
+func writeDoc(buf *strings.Builder, doc string) {
+	if doc == "" {
+		return
+	}
+	for _, line := range strings.Split(doc, "\n") {
+		buf.WriteString("%% ")
+		buf.WriteString(line)
+		buf.WriteByte('\n')
+	}
+}
+
 // Rule is a datalog rule: Head :- Body.
 // A fact is a rule with an empty body whose head is fully ground.
 type Rule struct {
 	Head Atom
 	Body []Atom
+
+	// Doc is an optional doc comment attached to this rule/fact: the
+	// content of a contiguous '%%' comment block that immediately
+	// preceded it in source, newline-joined with the '%%' markers and one
+	// leading space per line stripped. "" means no doc comment. See
+	// writeDoc for the canonical round-trip form.
+	Doc string
 }
 
 func (r Rule) String() string {
 	var buf strings.Builder
+	writeDoc(&buf, r.Doc)
 	buf.WriteString(r.Head.String())
 	if len(r.Body) > 0 {
 		buf.WriteString(" :- ")
@@ -93,10 +126,14 @@ func (r Rule) ToFact() datalog.Fact {
 // Query is a datalog query: body?
 type Query struct {
 	Body []Atom
+
+	// Doc is an optional doc comment attached to this query. See Rule.Doc.
+	Doc string
 }
 
 func (q Query) String() string {
 	var buf strings.Builder
+	writeDoc(&buf, q.Doc)
 	for i, a := range q.Body {
 		if i > 0 {
 			buf.WriteString(", ")
@@ -139,10 +176,15 @@ type AggregateRule struct {
 	Kind      AggregateKind // count, sum, min, max
 	AggTerm   datalog.Term  // term to aggregate over (ignored for count)
 	Body      []Atom        // body to evaluate
+
+	// Doc is an optional doc comment attached to this aggregate rule. See
+	// Rule.Doc.
+	Doc string
 }
 
 func (ar AggregateRule) String() string {
 	var buf strings.Builder
+	writeDoc(&buf, ar.Doc)
 	buf.WriteString(ar.Head.String())
 	buf.WriteString(" :- ")
 	buf.WriteString(ar.ResultVar)
@@ -185,7 +227,7 @@ type TermExpr struct {
 	Term datalog.Term
 }
 
-func (t TermExpr) isExpr() {}
+func (t TermExpr) isExpr()        {}
 func (t TermExpr) String() string { return t.Term.String() }
 
 // Ruleset collects the output of parsing a Datalog program.
@@ -193,6 +235,15 @@ type Ruleset struct {
 	Rules    []Rule
 	AggRules []AggregateRule
 	Queries  []Query
+
+	// Warnings holds non-fatal parse diagnostics -- currently just
+	// detached '%%' doc-comment blocks (a block that was not immediately
+	// followed by a statement, due to a blank line, a plain '%' comment,
+	// or end of input; see Rule.Doc and the parser's takeDoc/
+	// recordDetachedDoc). Populated by ParseAll only; a detached doc block
+	// is never an error, just a dropped comment the author probably meant
+	// to attach.
+	Warnings []string
 }
 
 // IsGround returns true if all terms are constants.

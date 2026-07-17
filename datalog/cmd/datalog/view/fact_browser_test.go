@@ -33,3 +33,36 @@ func TestWhyButtonLiteralIsInert(t *testing.T) {
 		t.Fatalf("raw backslash from the literal survived into the rendered button:\n%s", out)
 	}
 }
+
+// TestFactsTable_NamedHeaderAndUse pins doc/features/predicate-docs.md work
+// item 4's Fact Browser surface: predicate headers must render a
+// declaration's named term columns (instead of positional col0/col1/...)
+// and its Use text, when known. FactsTable only renders whatever header
+// strings and use text it is given (package main's fact_browser.go decides
+// what those are from the declaration) -- this test pins that FactsTable
+// itself actually emits them, and that an empty use renders no caption at
+// all (no invented chrome for an undocumented predicate).
+func TestFactsTable_NamedHeaderAndUse(t *testing.T) {
+	header := []string{"host", "kind"}
+	out := string(html.Append(nil, FactsTable("event", 2, header, nil, 0, 0, false, "A host observed doing something.")))
+	if !strings.Contains(out, "host") || !strings.Contains(out, "kind") {
+		t.Fatalf("rendered table missing named header columns:\n%s", out)
+	}
+	if strings.Contains(out, "col0") || strings.Contains(out, "col1") {
+		t.Fatalf("rendered table fell back to positional header names despite a named header being given:\n%s", out)
+	}
+	if !strings.Contains(out, "A host observed doing something.") {
+		t.Fatalf("rendered table missing the predicate's use text:\n%s", out)
+	}
+}
+
+// TestFactsTable_EmptyUseRendersNoCaption asserts that an empty use string
+// (a predicate with no declaration at all) renders no caption element --
+// "do not invent new chrome" for a predicate with nothing to say.
+func TestFactsTable_EmptyUseRendersNoCaption(t *testing.T) {
+	header := []string{"col0", "col1"}
+	out := string(html.Append(nil, FactsTable("raw", 2, header, nil, 0, 0, false, "")))
+	if strings.Contains(out, "predicate-use") {
+		t.Fatalf("rendered table has a predicate-use caption despite an empty use string:\n%s", out)
+	}
+}

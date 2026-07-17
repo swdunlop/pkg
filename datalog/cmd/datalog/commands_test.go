@@ -94,3 +94,51 @@ func TestHelpAggregateExampleExactString(t *testing.T) {
 		t.Fatalf("replacement example parsed as %T, want *syntax.AggregateRule", stmt)
 	}
 }
+
+// TestCmdDescribe_PrintsDocAndRuleRefs is the REPL frontend test for
+// .describe (session.describe, describe.go): it must print the
+// declaration's assembled Use (from the rule's %% doc comment, per
+// doc/features/predicate-docs.md), the fact count, and the rule's own doc
+// comment under "derived by".
+func TestCmdDescribe_PrintsDocAndRuleRefs(t *testing.T) {
+	r := &repl{session: &session{}, out: new(bytes.Buffer)}
+	buf := r.out.(*bytes.Buffer)
+
+	src := `
+%% A host observed doing something interesting.
+event(Host, Kind) :- raw(Host, Kind, ?).
+`
+	if _, err := r.session.setRules(src); err != nil {
+		t.Fatalf("setRules: %v", err)
+	}
+
+	if err := cmdDescribe(r, "event"); err != nil {
+		t.Fatalf("cmdDescribe: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "event/2") {
+		t.Errorf(".describe output missing the arity header: %q", out)
+	}
+	if !strings.Contains(out, "derived by:") {
+		t.Errorf(".describe output missing the derived-by section: %q", out)
+	}
+	if !strings.Contains(out, "observed doing something interesting") {
+		t.Errorf(".describe output missing the rule's doc comment: %q", out)
+	}
+}
+
+// TestCmdDescribe_UnknownPredicateErrors asserts .describe with no argument
+// or an unknown predicate returns an error rather than printing nothing —
+// matching .why/.facts' usage-error style for a missing argument.
+func TestCmdDescribe_UnknownPredicateErrors(t *testing.T) {
+	r := &repl{session: &session{}, out: new(bytes.Buffer)}
+	if err := cmdDescribe(r, ""); err == nil {
+		t.Fatal("cmdDescribe: expected a usage error for no argument, got none")
+	}
+	if _, err := r.session.setRules(`event("h1").`); err != nil {
+		t.Fatalf("setRules: %v", err)
+	}
+	if err := cmdDescribe(r, "nope"); err == nil {
+		t.Fatal("cmdDescribe: expected an error for an unknown predicate, got none")
+	}
+}

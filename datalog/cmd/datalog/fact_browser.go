@@ -40,7 +40,7 @@ func (wb *workbench) handleFacts(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("predicate")
 	arity, err := strconv.Atoi(r.PathValue("arity"))
 	if err != nil {
-		_ = stream.Emit(datastar.Elements(view.FactsTable(name, 0, nil, nil, 0, 0, false)))
+		_ = stream.Emit(datastar.Elements(view.FactsTable(name, 0, nil, nil, 0, 0, false, "")))
 		return
 	}
 
@@ -55,9 +55,10 @@ func (wb *workbench) handleFacts(w http.ResponseWriter, r *http.Request) {
 	db, dbErr := wb.h.sess.evaluatedDB()
 	derived := isDerivedPredicate(wb.h.sess, name, arity)
 	provOK := wb.h.sess.provenanceEnabled
+	decl, use := declarationForHeader(wb.h.sess, name, arity)
 	wb.h.mu.Unlock()
 	if dbErr != nil {
-		_ = stream.Emit(datastar.Elements(view.FactsTable(name, arity, nil, nil, offset, 0, false)))
+		_ = stream.Emit(datastar.Elements(view.FactsTable(name, arity, nil, nil, offset, 0, false, "")))
 		return
 	}
 	// The "why?" affordance (doc/features/provenance.md's Fact Browser
@@ -80,10 +81,7 @@ func (wb *workbench) handleFacts(w http.ResponseWriter, r *http.Request) {
 	}
 	hasMore := offset+len(page) < total
 
-	header := make([]string, arity)
-	for i := range header {
-		header[i] = "col" + strconv.Itoa(i)
-	}
+	header := factHeaderNames(decl, arity)
 	if showWhy {
 		// One blank trailing header cell for the "why?" button column
 		// renderFactRow appends to every row when showWhy is true, so the
@@ -92,7 +90,7 @@ func (wb *workbench) handleFacts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if offset == 0 {
-		_ = stream.Emit(datastar.Elements(view.FactsTable(name, arity, header, page, offset, total, hasMore)))
+		_ = stream.Emit(datastar.Elements(view.FactsTable(name, arity, header, page, offset, total, hasMore, use)))
 		return
 	}
 
@@ -242,6 +240,59 @@ func isDerivedPredicate(sess *session, name string, arity int) bool {
 		}
 	}
 	return false
+}
+
+// declarationForHeader looks up name/arity's declaration (if any) from the
+// session's evaluated database — the same source session.describe reads
+// (describe.go) — so the Fact Browser's predicate header renders the exact
+// Use text and term names an agent's describe call would see, per
+// doc/features/predicate-docs.md's "describe: the mechanical access
+// surface": one declaration, read by both surfaces, never two independent
+// renderings that could drift. Returns a nil declaration and empty use
+// string on any lookup failure (session evaluate error, unexpected
+// database type, no declaration for this predicate/arity) — callers must
+// treat that as "no docs known," not an error, since a predicate can be
+// perfectly valid with zero declared documentation. Callers must hold
+// wb.h.mu (mirrors isDerivedPredicate's contract).
+func declarationForHeader(sess *session, name string, arity int) (*datalog.Declaration, string) {
+	db, err := sess.evaluatedDB()
+	if err != nil {
+		return nil, ""
+	}
+	mdb, ok := db.(*memory.Database)
+	if !ok {
+		return nil, ""
+	}
+	for d := range mdb.Declarations() {
+		if d.Name == name && len(d.Terms) == arity {
+			d := d
+			return &d, d.Use
+		}
+	}
+	return nil, ""
+}
+
+// factHeaderNames builds the Fact Browser's header row for one predicate/
+// arity: the declaration's named terms (decl.Terms[i].Name) when a
+// declaration is known and names every position, falling back to
+// positional "col0, col1, ..." exactly as before — per
+// doc/features/predicate-docs.md work item 4, "named term columns instead
+// of positional 0, 1, 2." A declaration with fewer terms than arity (should
+// not happen — DocOnly declarations are assembled per-rule-head arity — but
+// defensively handled) or with an unnamed term at some position falls back
+// to the positional name for that column ONLY, so a partially-named
+// declaration still improves readability instead of being discarded
+// wholesale.
+func factHeaderNames(decl *datalog.Declaration, arity int) []string {
+	header := make([]string, arity)
+	for i := range header {
+		if decl != nil && i < len(decl.Terms) && decl.Terms[i].Name != "" {
+			header[i] = decl.Terms[i].Name
+			continue
+		}
+		header[i] = "col" + strconv.Itoa(i)
+	}
+	return header
 }
 
 // jsonScalarText renders a scalar constantToJSON value as display text: nil

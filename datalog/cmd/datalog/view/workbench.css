@@ -260,6 +260,15 @@ section.pane details pre {
   border-bottom: none;
 }
 
+/* Fact Browser predicate header caption (doc/features/predicate-docs.md):
+ * the declaration's "use" text, rendered above the facts table when known.
+ * Plain text, no card/badge chrome of its own. */
+.predicate-use {
+  font-size: var(--text-7);
+  color: var(--muted-foreground);
+  margin-block: var(--space-1) var(--space-2);
+}
+
 /* Fact Browser "why?" button (doc/features/provenance.md): a small inline
  * action on a derived fact row, distinct from the page-wide Run/Apply
  * BusyActionButton chrome since explaining one fact never rides $busy. */

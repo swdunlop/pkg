@@ -365,7 +365,21 @@ func (p *Provenance) ruleText(idx int) string {
 	if idx < 0 || idx >= len(p.rules) {
 		return ""
 	}
-	return p.rules[idx].String()
+	// Rule.String() renders the %% doc block above the rule (round-trip
+	// fidelity); Derivation splits the two -- Rule carries bare rule text,
+	// Doc carries the doc -- so strip the doc before rendering.
+	r := p.rules[idx]
+	r.Doc = ""
+	return r.String()
+}
+
+// ruleDoc returns the plain rule's %% doc text at the given flat index,
+// "" when undocumented or out of range.
+func (p *Provenance) ruleDoc(idx int) string {
+	if idx < 0 || idx >= len(p.rules) {
+		return ""
+	}
+	return p.rules[idx].Doc
 }
 
 // aggRuleText renders the aggregate rule at the given flat index, the
@@ -374,7 +388,17 @@ func (p *Provenance) aggRuleText(idx int) string {
 	if idx < 0 || idx >= len(p.aggRules) {
 		return ""
 	}
-	return p.aggRules[idx].String()
+	r := p.aggRules[idx]
+	r.Doc = ""
+	return r.String()
+}
+
+// aggRuleDoc is ruleDoc's aggregate mirror.
+func (p *Provenance) aggRuleDoc(idx int) string {
+	if idx < 0 || idx >= len(p.aggRules) {
+		return ""
+	}
+	return p.aggRules[idx].Doc
 }
 
 // Derivation is one step of a witness-provenance explanation: the resolved
@@ -391,8 +415,8 @@ type Derivation struct {
 	// nothing further to explain.
 	Base bool
 
-	Rule string // the deriving rule's rendered text (empty when Base)
-	Doc  string // reserved for the predicate-docs feature's syntax.Rule.Doc; always empty for now
+	Rule string // the deriving rule's rendered text, doc block excluded (empty when Base)
+	Doc  string // the deriving rule's %% doc text (syntax.Rule.Doc / AggregateRule.Doc; empty when undocumented)
 
 	Detail []string // ground renderings of constraints, is-expressions, builtins, and negated atoms
 
@@ -519,6 +543,7 @@ func (p *Provenance) explainLocked(fk uint64, fact datalog.Fact) Derivation {
 	return Derivation{
 		Fact:   fact,
 		Rule:   p.ruleText(w.rule),
+		Doc:    p.ruleDoc(w.rule),
 		Detail: w.detail,
 		Body:   body,
 	}
@@ -548,6 +573,7 @@ func (p *Provenance) explainAggLocked(w witness, fact datalog.Fact, bodyDerive f
 	return Derivation{
 		Fact:       fact,
 		Rule:       p.aggRuleText(w.rule),
+		Doc:        p.aggRuleDoc(w.rule),
 		Body:       samples,
 		Aggregate:  true,
 		GroupCount: w.groupCount,
@@ -641,6 +667,7 @@ func (p *Provenance) explainTreeLocked(fk uint64, fact datalog.Fact, depth int, 
 	d := Derivation{
 		Fact:   fact,
 		Rule:   p.ruleText(w.rule),
+		Doc:    p.ruleDoc(w.rule),
 		Detail: w.detail,
 	}
 
@@ -680,6 +707,7 @@ func (p *Provenance) explainTreeAggLocked(w witness, fact datalog.Fact, depth in
 	d := Derivation{
 		Fact:       fact,
 		Rule:       p.aggRuleText(w.rule),
+		Doc:        p.aggRuleDoc(w.rule),
 		Aggregate:  true,
 		GroupCount: w.groupCount,
 		Sampled:    w.groupCount > len(w.sample),
@@ -764,6 +792,17 @@ func (d Derivation) render(buf *strings.Builder, prefix string, isRoot bool, las
 	}
 
 	detailPrefix := prefix
+	// A documented rule cites its %% doc ahead of the rule text (the spec's
+	// "explanations cite rule docs" payoff) -- the doc is the human "why",
+	// the rule text the mechanical one.
+	if d.Doc != "" {
+		for _, docLine := range strings.Split(d.Doc, "\n") {
+			buf.WriteString(prefix)
+			buf.WriteString("%% ")
+			buf.WriteString(docLine)
+			buf.WriteByte('\n')
+		}
+	}
 	if d.Rule != "" {
 		buf.WriteString(prefix)
 		buf.WriteString("rule: ")

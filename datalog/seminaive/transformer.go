@@ -23,6 +23,126 @@ func declArityKey(name string, arity int) string {
 	return fmt.Sprintf("%s\x00%d", name, arity)
 }
 
+// headKey identifies a rule head by (name, arity) for term-name/doc
+// assembly, keyed the same way as declArityKey but kept as a struct so
+// assembleHeadDocs can build an ordered result without re-parsing the
+// string key.
+type headKey struct {
+	name  string
+	arity int
+}
+
+// assembledHead accumulates the term-name and doc assembly state for one
+// rule head (name, arity) across every rule/aggregate rule that derives it.
+// See assembleHeadDocs.
+type assembledHead struct {
+	arity    int
+	names    []string // names[i] is the agreed variable name at position i, "" if unnamed
+	conflict []bool   // conflict[i] true once position i has seen two different names (or a non-variable)
+	seen     []bool   // seen[i] true once position i has been observed at least once
+	docs     []string // one entry per rule/aggregate rule with a non-empty Doc, in rule order
+}
+
+// assembleHeadDocs derives predicate-level DocOnly declarations for every
+// rule and aggregate-rule head in rules/aggRules, per doc/features/predicate-docs.md:
+//
+//   - Terms: if every rule for a head (same name+arity) uses the same
+//     variable name at position i, that name becomes Terms[i].Name,
+//     lower-cased to match the jsonfacts convention. A position that ever
+//     holds a non-variable term, or holds different variable names across
+//     rules, stays unnamed ("").
+//   - Use: the concatenation of that head's rule docs (Rule.Doc /
+//     AggregateRule.Doc), one paragraph per documented rule, in rule
+//     order, separated by a blank line ("\n\n"). Undocumented rules
+//     contribute nothing to Use; a head whose rules are all undocumented
+//     gets an empty Use (term names only).
+//
+// The returned declarations are always DocOnly: true -- this is assembly
+// from rule shape, never a type constraint (see Declaration's doc comment
+// on why DocOnly must never become an arity-0 schema). The result is
+// ordered by each head's first occurrence across rules then aggRules, so
+// callers get deterministic iteration without re-deriving that order.
+// Callers merge these in *after* explicit declarations and must skip any
+// (name, arity) -- or, at the Declarations() call site, any name at any
+// arity -- an explicit declaration already covers, so the operator's
+// schema always wins outright; see the seen/seenDecl checks at each call
+// site.
+func assembleHeadDocs(rules []syntax.Rule, aggRules []syntax.AggregateRule) []datalog.Declaration {
+	heads := map[headKey]*assembledHead{}
+	var keyOrder []headKey
+	get := func(name string, terms []datalog.Term) *assembledHead {
+		k := headKey{name, len(terms)}
+		h, ok := heads[k]
+		if !ok {
+			h = &assembledHead{
+				arity:    len(terms),
+				names:    make([]string, len(terms)),
+				conflict: make([]bool, len(terms)),
+				seen:     make([]bool, len(terms)),
+			}
+			heads[k] = h
+			keyOrder = append(keyOrder, k)
+		}
+		return h
+	}
+	observe := func(h *assembledHead, terms []datalog.Term, doc string) {
+		for i, term := range terms {
+			v, isVar := term.(datalog.Variable)
+			if !isVar {
+				h.conflict[i] = true
+				h.seen[i] = true
+				continue
+			}
+			// Compare the ORIGINAL variable name case-sensitively -- Src and
+			// SRC are distinct variables in the language, so two rules using
+			// them at the same position genuinely disagree and the position
+			// must stay unnamed rather than silently merging to one lower-cased
+			// name. Lower-casing is a display convention applied to the AGREED
+			// name only (below), not the agreement key.
+			name := string(v)
+			if !h.seen[i] {
+				h.seen[i] = true
+				h.names[i] = name
+			} else if h.names[i] != name {
+				h.conflict[i] = true
+			}
+		}
+		if doc != "" {
+			h.docs = append(h.docs, doc)
+		}
+	}
+
+	for _, r := range rules {
+		h := get(r.Head.Pred, r.Head.Terms)
+		observe(h, r.Head.Terms, r.Doc)
+	}
+	for _, ar := range aggRules {
+		h := get(ar.Head.Pred, ar.Head.Terms)
+		observe(h, ar.Head.Terms, ar.Doc)
+	}
+
+	out := make([]datalog.Declaration, 0, len(keyOrder))
+	for _, k := range keyOrder {
+		h := heads[k]
+		terms := make([]datalog.TermDeclaration, h.arity)
+		for i := range terms {
+			if h.seen[i] && !h.conflict[i] {
+				// Lower-case the agreed name for display, matching the
+				// jsonfacts term-name convention (the agreement check above
+				// used the original case).
+				terms[i] = datalog.TermDeclaration{Name: strings.ToLower(h.names[i])}
+			}
+		}
+		out = append(out, datalog.Declaration{
+			Name:    k.name,
+			Use:     strings.Join(h.docs, "\n\n"),
+			Terms:   terms,
+			DocOnly: true,
+		})
+	}
+	return out
+}
+
 // transformer implements datalog.Transformer using semi-naive evaluation.
 type transformer struct {
 	rules         []syntax.Rule
@@ -58,21 +178,22 @@ func (t *transformer) Declarations(ctx context.Context, input datalog.Database) 
 		}
 	}
 
-	// Add DocOnly declarations for rule-head predicates not already declared
-	// at any arity, purely so the predicate appears in Declarations() for
-	// schema display. DocOnly ensures these never constrain arity/type
-	// checking (see datalog.NewDeclarationSet); one bare marker per name is
-	// enough regardless of how many arities the rule set derives.
-	for _, r := range t.rules {
-		if !seen[r.Head.Pred] {
-			seen[r.Head.Pred] = true
-			decls = append(decls, datalog.Declaration{Name: r.Head.Pred, DocOnly: true})
-		}
-	}
-	for _, ar := range t.aggRules {
-		if !seen[ar.Head.Pred] {
-			seen[ar.Head.Pred] = true
-			decls = append(decls, datalog.Declaration{Name: ar.Head.Pred, DocOnly: true})
+	// Add assembled DocOnly declarations (term names from head variables,
+	// Use from concatenated rule docs -- see assembleHeadDocs) for rule-head
+	// predicates not already EXPLICITLY declared at any arity, purely so the
+	// predicate appears in Declarations() for schema display. DocOnly
+	// ensures these never constrain arity/type checking (see
+	// datalog.NewDeclarationSet); an explicit declaration for the name at
+	// ANY arity wins outright and suppresses assembly for every arity of
+	// that name (matching the pre-assembly bare-marker precedence this
+	// replaces), but two DISTINCT arities of the same rule-derived head
+	// (e.g. p/1 and p/2, both only rule-derived) must both survive -- so
+	// this gates on `seen` (explicit declarations only), never re-marking
+	// `seen` for an assembled entry, unlike the explicit-declaration loop
+	// above.
+	for _, d := range assembleHeadDocs(t.rules, t.aggRules) {
+		if !seen[d.Name] {
+			decls = append(decls, d)
 		}
 	}
 
@@ -196,26 +317,24 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 		}
 	}
 
-	// Merge declarations for derived predicates. seenDecl tracks "any
-	// declaration exists for this name" -- sufficient to skip adding the
-	// DocOnly rule-head marker below, since one bare marker per name is
-	// enough regardless of how many arities are otherwise declared. decls
-	// itself (from loadInput) already preserves distinct arities for the
-	// same name; this loop must not re-collapse it by name.
+	// Merge assembled declarations for derived predicates (term names from
+	// head variables, Use from concatenated rule docs -- see
+	// assembleHeadDocs). seenDecl tracks "an EXPLICIT declaration exists for
+	// this name" (decls here is loadInput's output, entirely explicit
+	// declarations -- assembly hasn't happened yet) -- sufficient to skip
+	// adding the assembled DocOnly declaration below, since an explicit
+	// declaration for the name at ANY arity wins outright and suppresses
+	// assembly for every arity of that name. It must NOT be updated as
+	// assembled entries are appended below, or a second rule-derived arity
+	// of the same name (e.g. p/1 and p/2, both only rule-derived) would be
+	// silently suppressed by the first.
 	seenDecl := map[string]bool{}
 	for _, d := range decls {
 		seenDecl[d.Name] = true
 	}
-	for _, r := range t.rules {
-		if !seenDecl[r.Head.Pred] {
-			seenDecl[r.Head.Pred] = true
-			decls = append(decls, datalog.Declaration{Name: r.Head.Pred, DocOnly: true})
-		}
-	}
-	for _, ar := range t.aggRules {
-		if !seenDecl[ar.Head.Pred] {
-			seenDecl[ar.Head.Pred] = true
-			decls = append(decls, datalog.Declaration{Name: ar.Head.Pred, DocOnly: true})
+	for _, d := range assembleHeadDocs(t.rules, t.aggRules) {
+		if !seenDecl[d.Name] {
+			decls = append(decls, d)
 		}
 	}
 	sort.Slice(decls, func(i, j int) bool { return decls[i].Name < decls[j].Name })

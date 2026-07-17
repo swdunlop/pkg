@@ -193,6 +193,26 @@ total_bytes(Host, T) :- T = sum(Bytes) : traffic(Host, Bytes).
 
 Comments start with `%`. Anonymous variables use `?`.
 
+A contiguous block of lines starting `%%` immediately before a fact, rule,
+aggregate rule, or query attaches to it as a doc comment (`syntax.Rule`/
+`AggregateRule`/`Query`'s `Doc` field) -- a blank line or a plain `%`
+comment breaks attachment, and a `%%` block with nothing following it is a
+parse warning (`syntax.Ruleset.Warnings`), not an error:
+
+```prolog
+%% A source address probed many distinct ports on one target within
+%% the window. PortCount is the number of distinct destination ports.
+port_scan(Src, Dst, PortCount) :-
+    PortCount = count(Port) : conn(Src, ?, Dst, Port, ?),
+    PortCount > 20.
+```
+
+Doc comments round-trip through `String()` and are the source `describe`
+(the MCP tool / REPL `.describe` / workbench Fact Browser headers) reads to
+explain a rule-derived predicate: every rule for a head that shares the
+same variable name at a given position names that term, and a head's
+documented rules concatenate into the predicate's assembled description.
+
 ### Syntax Summary
 
 | Form | Example |
@@ -207,6 +227,7 @@ Comments start with `%`. Anonymous variables use `?`.
 | Builtin (constraint) | `@contains(Str, "needle")` |
 | Builtin (binding) | `@time_diff(T2, T1, D)` |
 | Constant literals | `true`, `false`, `null` (reserved words; not usable as variable names) |
+| Doc comment | `%% explains the following fact/rule/aggregate rule/query` |
 
 ### Custom Builtins
 
@@ -572,6 +593,7 @@ Commands:
 | `.list` | List all predicates with fact counts |
 | `.rules` | Show defined rules |
 | `.facts <pred>/<arity>` | Dump facts for a predicate |
+| `.describe <pred>` | Describe a predicate: docs, terms, fact counts, and the rules that derive/consume it, per arity |
 | `.clear [rules\|facts\|all]` | Clear rules and/or facts |
 | `.quit` | Exit |
 
@@ -601,7 +623,7 @@ datalog mcp -d ./data [-c schema.yaml] [rules.dl ...]
 | `--timeout` | Per-query evaluation timeout (default 60s). |
 | `--proxy <url>` | Instead of serving a local session, bridge stdio to a remote `datalog serve`'s `/mcp` — see "`datalog mcp --proxy`: the stdio shim" under Web Workbench below. All other flags above are ignored when `--proxy` is given. |
 
-The server exposes six tools, meant to be driven in a loop:
+The server exposes eight tools, meant to be driven in a loop:
 
 | Tool | Purpose |
 |------|---------|
@@ -609,7 +631,9 @@ The server exposes six tools, meant to be driven in a loop:
 | `set_schema` | Replace the session's jsonfacts config; returns per-predicate fact counts as feedback on whether the mapping matched anything. |
 | `set_rules` | Replace the session's Datalog program (whole document, no append); returns the defined head predicates or a parse/compile error with line:col. |
 | `query` | Evaluate one query and return rows, variable names, and per-stratum profile stats. |
-| `list_predicates` | Names, arities, fact counts, and declaration docs for every loaded and rule-defined predicate. |
+| `explain` | Given one ground fact from a query result, render its full derivation tree (rule, body facts, recursively down to base facts). |
+| `list_predicates` | Names, arities, fact counts, and declaration docs for every loaded and rule-defined predicate — the cheap index. |
+| `describe` | The deep dive on one predicate: per-arity fact count, declaration (docs/terms/types, possibly assembled from rule-head variable names and `%%` rule docs), and every rule that derives or consumes it. |
 | `sample_facts` | Up to N sample facts for one predicate/arity. |
 
 The intended loop: `sample_input` → `set_schema` (iterate on counts) →
