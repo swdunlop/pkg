@@ -133,14 +133,6 @@ matchers:
       - "172.18.39.0/24"
       - "172.18.38.0/24"
 
-  # Flag admin shares
-  - predicate: share_access
-    term: 2
-    contains:
-      - "C$"
-      - "ADMIN$"
-      - "IPC$"
-
   # Flag executable file paths written via shares
   - predicate: share_file
     term: 3

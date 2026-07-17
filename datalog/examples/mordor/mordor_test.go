@@ -148,7 +148,7 @@ func TestLoadFacts(t *testing.T) {
 		arity int
 		desc  string
 	}{
-		{"contains", 2, "SMB port / admin share matches"},
+		{"contains", 2, "SMB port matches"},
 		{"cidr_match", 2, "subnet matches"},
 		{"ci_ends_with", 2, "executable extension matches"},
 	}

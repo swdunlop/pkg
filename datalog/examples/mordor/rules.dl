@@ -23,16 +23,21 @@ remote_logon(TargetHost, User, SrcIp, Auth) :-
     logon(TargetHost, User, ?, "3", SrcIp, ?, Auth).
 
 % -- Admin share usage -------------------------------------------------
-%% A remote IP accessed an administrative share on Host -- the "C$"
-%% substring test catches both C$ and IPC$ -- the filesystem-level
-%% access attackers use to stage payloads.
+%% A remote IP accessed the C$ administrative share on Host -- the
+%% drive-root share attackers write payloads through. The pattern is
+%% anchored at the path separator so only the share actually named C$
+%% matches, not any share name that happens to contain those bytes.
 admin_share(Host, User, Share, Ip) :-
     share_access(Host, User, Share, Ip),
-    contains(Share, "C$").
-%% ADMIN$ access counts the same as C$.
+    @ends_with(Share, "\\C$").
+%% ADMIN$ (the Windows directory) counts the same as C$.
 admin_share(Host, User, Share, Ip) :-
     share_access(Host, User, Share, Ip),
-    contains(Share, "ADMIN$").
+    @ends_with(Share, "\\ADMIN$").
+%% So does IPC$, the named-pipe share remote service control rides on.
+admin_share(Host, User, Share, Ip) :-
+    share_access(Host, User, Share, Ip),
+    @ends_with(Share, "\\IPC$").
 
 % -- Executable drop via share -----------------------------------------
 %% An executable was written onto Host through a file share from a
