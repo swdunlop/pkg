@@ -58,6 +58,14 @@ func main() {
 }
 ```
 
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [User Guide](./doc/guide.md) | Narrative walkthrough: from raw JSONL to detections and encoded results |
+| [Datalog Language Reference](./doc/reference/datalog.md) | The rule language: syntax, types, builtins, aggregates, semantics |
+| [JSON Fact Extraction Reference](./doc/reference/jsonfacts.md) | The schema layer: sources, mappings, matchers, declarations, encoder |
+
 ## Packages
 
 | Package | Description |
