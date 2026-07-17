@@ -101,6 +101,18 @@
 // scientific notation (1.5e3). The parser normalizes floats that represent
 // exact integers to integer type.
 //
+// The bare identifiers 'true', 'false', and 'null' are reserved constant
+// literals ([datalog.Bool], [datalog.Null]), not variable names, in every
+// position a term may appear (fact/rule arguments, comparison and 'is'
+// constraints, aggregate terms, queries):
+//
+//	flagged(Host, true) :- suspicious(Host).
+//	missing(Field, null) :- record(Field), not present(Field).
+//
+// A variable literally named True, False, or Null (capitalized, as Datalog
+// variables conventionally are) is unaffected — the reserved forms are
+// exact, case-sensitive matches on the lowercase spelling.
+//
 // # Destructuring Patterns
 //
 // Object and array patterns in body-atom argument positions match inside

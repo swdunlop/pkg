@@ -98,6 +98,20 @@ func FuzzParseAll(f *testing.F) {
 		`p(-5).`,
 		`p(_, _).`,
 
+		// true/false/null constant literals
+		`flag(true).`,
+		`flag(false).`,
+		`missing(null).`,
+		`tuple(true, false, null).`,
+		`ok(X) :- flag(X), X = true.`,
+		`ok(X) :- flag(X), true = X.`,
+		`bad(X) :- flag(X), X != false.`,
+		`unset(X) :- missing(X), X = null.`,
+		`g(X) :- val(X), X is true.`,
+		`total(P, T) :- T = sum(S) : flag(true), score(P, S).`,
+		`flag(true)?`,
+		`missing(null)?`,
+
 		// rules
 		`ancestor(X, Y) :- parent(X, Y).`,
 		`ancestor(X, Y) :- parent(X, Z), ancestor(Z, Y).`,

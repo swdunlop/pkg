@@ -773,6 +773,18 @@ func (p *parser) parseStatement() (any, error) {
 					// user. The fallback below is only for a non-aggregate
 					// Var = ident (e.g. R = X), which never reaches here
 					// because parseAggKind returned false.
+					switch varTok.val {
+					case "true", "false", "null":
+						// Same reserved constant literals as parseTerm and
+						// parseIsAtom: the aggregate result variable is a
+						// binding position, and `true = count : ...` makes
+						// no more sense than `true is 1+1`. Without this
+						// guard the reserved word is silently accepted as a
+						// (discarded) result-variable name, the one place a
+						// bare `true`/`false`/`null` from source text does
+						// not flow through parseTerm.
+						return nil, p.errorf(varTok.pos, "expected variable on left of aggregate '=', got reserved literal %q", varTok.val)
+					}
 					p.advance()
 					return p.parseAggregateBody(head, varTok.val, kind)
 				}
@@ -1159,6 +1171,12 @@ func (p *parser) parseIsAtom() (Atom, error) {
 		return Atom{}, p.errorf(p.current.pos, "expected variable on left of 'is'")
 	}
 	varTok := p.advance()
+	switch varTok.val {
+	case "true", "false", "null":
+		// Same reserved constant literals as parseTerm — "true is 1+1"
+		// makes no more sense than assigning to any other constant.
+		return Atom{}, p.errorf(varTok.pos, "expected variable on left of 'is', got reserved literal %q", varTok.val)
+	}
 	if _, err := p.expect(tokIs); err != nil {
 		return Atom{}, err
 	}
@@ -1255,6 +1273,21 @@ func (p *parser) parseTerm() (datalog.Term, error) {
 		// in the lexer because tokAnon doubles as the query terminator.
 		if name == "_" {
 			return p.freshVar(), nil
+		}
+		// true/false/null are reserved constant literals, not variable
+		// names — this is the one chokepoint every bare identifier that
+		// reaches a term position passes through (facts, rule bodies,
+		// expressions/constraints, aggregates, queries), so mapping them
+		// here covers all of those contexts at once. The keyword steal is
+		// deliberate: no public users, and known rulesets don't use these
+		// as variable names (see doc/features/provenance.md).
+		switch name {
+		case "true":
+			return datalog.Bool(true), nil
+		case "false":
+			return datalog.Bool(false), nil
+		case "null":
+			return datalog.Null{}, nil
 		}
 		return datalog.Variable(name), nil
 	case tokAnon:

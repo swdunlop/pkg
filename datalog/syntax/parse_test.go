@@ -215,6 +215,128 @@ func TestParseFloatLiterals(t *testing.T) {
 	}
 }
 
+func TestParseConstantLiterals(t *testing.T) {
+	result, err := syntax.ParseStatement(`flag(true, false, null).`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := result.(*syntax.Rule)
+	if v, ok := r.Head.Terms[0].(datalog.Bool); !ok || bool(v) != true {
+		t.Errorf("expected Bool(true), got %#v", r.Head.Terms[0])
+	}
+	if v, ok := r.Head.Terms[1].(datalog.Bool); !ok || bool(v) != false {
+		t.Errorf("expected Bool(false), got %#v", r.Head.Terms[1])
+	}
+	if _, ok := r.Head.Terms[2].(datalog.Null); !ok {
+		t.Errorf("expected Null{}, got %#v", r.Head.Terms[2])
+	}
+}
+
+func TestParseConstantLiteralsInExpressions(t *testing.T) {
+	// true/false/null must resolve to constants everywhere a bare
+	// identifier reaches parseTerm, not just in atom argument position:
+	// comparison/is constraints, aggregate terms, and query bodies.
+	cases := []struct {
+		src  string
+		want datalog.Term
+	}{
+		{`ok(X) :- flag(X), X = true.`, datalog.Bool(true)},
+		{`ok(X) :- flag(X), true = X.`, datalog.Bool(true)},
+		{`bad(X) :- flag(X), X != false.`, datalog.Bool(false)},
+		{`unset(X) :- missing(X), X = null.`, datalog.Null{}},
+	}
+	for _, c := range cases {
+		result, err := syntax.ParseStatement(c.src)
+		if err != nil {
+			t.Fatalf("%q: %v", c.src, err)
+		}
+		r := result.(*syntax.Rule)
+		cmp := r.Body[1]
+		var got datalog.Term
+		if cmp.Terms[0] == datalog.Variable("X") {
+			got = cmp.Terms[1]
+		} else {
+			got = cmp.Terms[0]
+		}
+		if got != c.want {
+			t.Errorf("%q: expected %#v, got %#v", c.src, c.want, got)
+		}
+	}
+}
+
+func TestParseConstantLiteralRoundTrip(t *testing.T) {
+	// print -> reparse must be an identity for the new constant literals,
+	// in head and body position alike.
+	srcs := []string{
+		`flag(true).`,
+		`flag(false).`,
+		`missing(null).`,
+		`ok(X) :- flag(X), X = true.`,
+	}
+	for _, src := range srcs {
+		result, err := syntax.ParseStatement(src)
+		if err != nil {
+			t.Fatalf("%q: %v", src, err)
+		}
+		r := result.(*syntax.Rule)
+		printed := r.String()
+		reresult, err := syntax.ParseStatement(printed)
+		if err != nil {
+			t.Fatalf("reparse of printed form %q (from %q) failed: %v", printed, src, err)
+		}
+		r2 := reresult.(*syntax.Rule)
+		if r.String() != r2.String() {
+			t.Errorf("round trip not stable: %q -> %q -> %q", src, printed, r2.String())
+		}
+	}
+}
+
+func TestParseIsRejectsReservedLiteralLHS(t *testing.T) {
+	for _, src := range []string{
+		`foo(R) :- true is 1 + 1.`,
+		`foo(R) :- false is 1 + 1.`,
+		`foo(R) :- null is 1 + 1.`,
+	} {
+		_, err := syntax.ParseStatement(src)
+		if err == nil {
+			t.Errorf("%q: expected error, got none", src)
+		}
+	}
+}
+
+func TestParseAggregateRejectsReservedLiteralResultVar(t *testing.T) {
+	// The aggregate result variable is a binding position, like the LHS of
+	// 'is': `true = count : ...` must be rejected the same way `true is ...`
+	// is, so a bare reserved literal from source never becomes a (silently
+	// discarded) result-variable name.
+	for _, src := range []string{
+		`h(R) :- true = count : b(X).`,
+		`h(R) :- false = sum(X) : b(X).`,
+		`h(R) :- null = max(X) : b(X).`,
+		`h(true) :- true = count : b(X).`,
+	} {
+		if _, err := syntax.ParseStatement(src); err == nil {
+			t.Errorf("%q: expected error, got none", src)
+		}
+	}
+	// A real result variable and a `true = X` comparison body are unaffected.
+	if _, err := syntax.ParseStatement(`h(R) :- R = count : b(X).`); err != nil {
+		t.Errorf("normal aggregate rejected: %v", err)
+	}
+	stmt, err := syntax.ParseStatement(`h(X) :- b(X), true = X.`)
+	if err != nil {
+		t.Fatalf("`true = X` comparison rejected: %v", err)
+	}
+	r := stmt.(*syntax.Rule)
+	last := r.Body[len(r.Body)-1]
+	if last.Pred != "=" {
+		t.Fatalf("expected '=' comparison, got %q", last.Pred)
+	}
+	if _, ok := last.Terms[0].(datalog.Bool); !ok {
+		t.Errorf("expected Bool LHS in `true = X`, got %#v", last.Terms[0])
+	}
+}
+
 func TestParseUnquotedVariable(t *testing.T) {
 	result, err := syntax.ParseStatement(`color(red).`)
 	if err != nil {

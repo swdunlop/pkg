@@ -206,6 +206,7 @@ Comments start with `%`. Anonymous variables use `?`.
 | Aggregate | `N = count : pred(X).` / `T = sum(V) : pred(X, V).` |
 | Builtin (constraint) | `@contains(Str, "needle")` |
 | Builtin (binding) | `@time_diff(T2, T1, D)` |
+| Constant literals | `true`, `false`, `null` (reserved words; not usable as variable names) |
 
 ### Custom Builtins
 
