@@ -4,23 +4,29 @@
 %   https://duckdb.org/2025/10/22/duckdb-graph-queries-duckpgq
 
 % -- Base predicates -----------------------------------------------
-% Unify person and company ownership into a single "owns" relation.
+%% Owner holds Account, regardless of whether the owner is a person
+%% or a company -- downstream rules see one ownership relation.
 owns(Owner, Account) :- person_own_account(Owner, Account).
+%% Company-owned accounts join the same relation as personal ones.
 owns(Owner, Account) :- company_own_account(Owner, Account).
 
-% Drop the amount column for transfer reachability.
+%% Money moved from one account to another at least once. The amount
+%% is irrelevant to reachability, so it is dropped here.
 transfer(From, To) :- account_transfer(From, To, _).
 
 % -- Transitive closure of transfers (depth-free) ------------------
-% Bounded by |accounts|^2 -- no exponential blowup from path-length
-% tracking. Use depth-free reachability for cycle detection; add a
-% separate shortest-path aggregate if lengths are needed.
+%% To can be reached from From by a chain of one or more transfers.
+%% Depth-free on purpose: bounded by |accounts|^2, no exponential
+%% blowup from path-length tracking. Add a separate shortest-path
+%% aggregate if lengths are ever needed.
 reachable(From, To) :- transfer(From, To).
+%% Extending a known chain by one more transfer keeps To reachable.
 reachable(From, To) :- reachable(From, Mid), transfer(Mid, To).
 
 % -- Cycle detection -----------------------------------------------
-% An owner has a cycle when two of their accounts are connected
-% by a chain of transfers.
+%% Owner routed money in a loop: two distinct accounts they own are
+%% connected by a chain of transfers, so funds can leave one of
+%% their accounts and return to another.
 cycle(Owner, A1, A2) :-
     owns(Owner, A1),
     owns(Owner, A2),

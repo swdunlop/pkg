@@ -10,39 +10,48 @@
 %   ATT&CK: T1021.002 (Remote Services: SMB/Windows Admin Shares)
 
 % -- Network topology --------------------------------------------------
-% Identify which hosts initiated SMB connections and where.
+%% Host initiated an SMB connection (destination port 445) from SrcIp
+%% to DstIp -- the transport that lateral movement rides on.
 smb_conn(Host, SrcIp, DstIp) :-
     net_conn(Host, ?, SrcIp, ?, DstIp, DstPort, ?, ?),
     contains(DstPort, "445").
 
 % -- Remote logon detection --------------------------------------------
-% A network logon (type 3) from a remote IP.
+%% User authenticated to TargetHost over the network (logon type 3)
+%% from a remote IP, rather than at the console.
 remote_logon(TargetHost, User, SrcIp, Auth) :-
     logon(TargetHost, User, ?, "3", SrcIp, ?, Auth).
 
 % -- Admin share usage -------------------------------------------------
-% Access to an administrative share (C$, ADMIN$, IPC$) from a remote IP.
+%% A remote IP accessed an administrative share on Host -- C$ here --
+%% the filesystem-level access attackers use to stage payloads.
 admin_share(Host, User, Share, Ip) :-
     share_access(Host, User, Share, Ip),
     contains(Share, "C$").
-
+%% ADMIN$ access counts the same as C$.
 admin_share(Host, User, Share, Ip) :-
     share_access(Host, User, Share, Ip),
     contains(Share, "ADMIN$").
 
 % -- Executable drop via share -----------------------------------------
-% An executable written through a file share.
+%% An executable was written onto Host through a file share from a
+%% remote IP -- payload staging, seen from the share telemetry.
 exe_drop(Host, User, Share, Path, Ip) :-
     share_file(Host, User, Share, Path, Ip, ?),
     ci_ends_with(Path, ".exe").
 
 % -- Privilege escalation indicator ------------------------------------
-% User granted special privileges on logon (SeDebugPrivilege etc.)
+%% User was granted special privileges (SeDebugPrivilege etc.) at
+%% logon on Host.
 elevated_logon(Host, User) :-
     special_priv(Host, User, ?, ?).
 
 % -- Kill chain: lateral movement via SMB ------------------------------
-% Ties together: SMB connection + remote logon + admin share + exe drop.
+%% The full SMB lateral-movement kill chain fired for one User and
+%% source IP: an SMB connection from SrcIp, a network logon as User
+%% on TargetHost, admin-share access from the same IP, and an
+%% executable dropped onto the target -- the corroborated shape of
+%% T1021.002 (Remote Services: SMB/Windows Admin Shares).
 lateral_movement(User, SrcIp, TargetHost, Path) :-
     smb_conn(?, SrcIp, DstIp),
     remote_logon(TargetHost, User, SrcIp, ?),
@@ -50,19 +59,24 @@ lateral_movement(User, SrcIp, TargetHost, Path) :-
     exe_drop(TargetHost, User, ?, Path, SrcIp).
 
 % -- Enrichment: elevated lateral movement -----------------------------
-% The lateral movement also involved special privileges on the target.
+%% The lateral movement ran with special privileges on the target,
+%% upgrading it from suspicious to likely hands-on-keyboard
+%% compromise.
 elevated_lateral_movement(User, SrcIp, TargetHost, Path) :-
     lateral_movement(User, SrcIp, TargetHost, Path),
     elevated_logon(TargetHost, User).
 
 % -- File creation on disk (Sysmon-observed) ---------------------------
-% Executable file created on target host, observed by Sysmon.
+%% Sysmon observed an executable created on Host's disk -- host-level
+%% evidence independent of the share telemetry.
 exe_on_disk(Host, Image, Path) :-
     file_create(Host, Image, Path),
     ci_ends_with(Path, ".exe").
 
 % -- Corroboration: share drop matches file on disk --------------------
-% The executable dropped via SMB also appeared as a Sysmon file-create.
+%% The share-dropped executable is corroborated on disk: Sysmon saw a
+%% file create whose path ends with the SMB share path, tying network
+%% and host telemetry to the same artifact.
 confirmed_drop(User, TargetHost, SharePath, DiskPath) :-
     exe_drop(TargetHost, User, ?, SharePath, ?),
     exe_on_disk(TargetHost, ?, DiskPath),
