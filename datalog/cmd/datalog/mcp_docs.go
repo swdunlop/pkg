@@ -33,6 +33,10 @@ Workflow loop (repeat as needed):
                        loaded facts. Fix parse/compile errors and resubmit.
   4. query          - run one query and inspect vars/rows/stats. Iterate
                        on the rules or schema based on what comes back.
+  5. explain        - given one fact from a query result, get its full
+                       derivation tree (rule + body facts, recursively) -
+                       use this to justify a finding instead of inventing
+                       a justification for it.
 
 Each of set_schema and set_rules replaces the whole document; there is no
 incremental edit API. Submit the complete schema or ruleset text every
@@ -285,6 +289,32 @@ iterations it took, and how long it took (duration_ms). Use this to
 diagnose a rule that never reaches a fixpoint (hits the iteration cap) or
 that is unexpectedly slow.`
 }
+
+// mcpExplainDescription documents the explain tool.
+const mcpExplainDescription = `Explain one derived fact: which rule fired, over which body facts, to
+produce it. Use this after query to justify a result to a human reviewer,
+or to narrate why a specific concerning fact was flagged, instead of
+inventing a justification.
+
+"fact" is one ground fact, exactly as it would appear in a rules document
+or a query result row - predicate name plus constant terms, e.g.
+concern("ws01", 87). It must name a fact the CURRENT schema+rules+data
+evaluation actually produced (a query row you just got back, or a fact
+sample_facts returned) - a predicate/arity/term combination that was never
+derived returns an error, not an empty tree.
+
+The response is a rendered derivation tree: the fact, the rule that
+derived it, the ground body facts that satisfied that rule (each in turn
+explained one level, recursively, down to base facts - facts loaded from
+data or asserted directly, marked "[base fact]" with nothing further to
+explain), and any constraint/comparison/negation detail lines the rule's
+body evaluated. An aggregate head (defined with count/sum/min/max) renders
+its group's true solution count and up to 10 sampled contributor tuples,
+each explained the same way.
+
+"depth" caps how many levels deep the tree recurses (default 8) - it only
+affects how much of a large tree prints, never which rule or facts are
+reported at the top level.`
 
 // mcpListPredicatesDescription documents list_predicates.
 const mcpListPredicatesDescription = `List every predicate currently known to the session: predicates loaded

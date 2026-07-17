@@ -13,7 +13,9 @@ import (
 type stratum struct {
 	predicates map[string]bool
 	rules      []syntax.Rule
+	ruleIdx    []int // ruleIdx[i] is rules[i]'s index in the flat rules slice stratify was called with -- see witness.rule / Provenance.rules
 	aggRules   []syntax.AggregateRule
+	aggRuleIdx []int // aggRuleIdx[i] is aggRules[i]'s index in the flat aggRules slice stratify was called with -- the aggregate-rule mirror of ruleIdx, see witness.rule/aggRule and Provenance.aggRules
 }
 
 // depEdge represents a dependency from one predicate to another.
@@ -165,13 +167,15 @@ func stratify(rules []syntax.Rule, aggRules []syntax.AggregateRule, builtins map
 		}
 	}
 
-	for _, r := range rules {
+	for i, r := range rules {
 		s := sccStratum[predToSCC[r.Head.Pred]]
 		strata[s].rules = append(strata[s].rules, r)
+		strata[s].ruleIdx = append(strata[s].ruleIdx, i)
 	}
-	for _, ar := range aggRules {
+	for i, ar := range aggRules {
 		s := sccStratum[predToSCC[ar.Head.Pred]]
 		strata[s].aggRules = append(strata[s].aggRules, ar)
+		strata[s].aggRuleIdx = append(strata[s].aggRuleIdx, i)
 	}
 
 	return strata, nil

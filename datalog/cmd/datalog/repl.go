@@ -31,7 +31,11 @@ func newREPL(opts ...seminaive.Option) *repl {
 	rl := readline.NewInstance()
 
 	r := &repl{
-		session: &session{engineOpts: opts},
+		// provenanceEnabled: true by default, matching every cmd/datalog
+		// entry point (doc/features/provenance.md "Session policy" —
+		// newMCPHandlers sets the same default for `datalog mcp`/`datalog
+		// serve"). Enables the REPL's .why command.
+		session: &session{engineOpts: opts, provenanceEnabled: true},
 		rl:      rl,
 		out:     os.Stdout,
 	}

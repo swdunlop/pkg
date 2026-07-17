@@ -75,6 +75,7 @@ type Engine struct {
 	externals     map[string]externalPredicate
 	decls         datalog.DeclarationSet
 	profile       func([]StratumStats)
+	provenance    *Provenance
 }
 
 var _ syntax.Engine = (*Engine)(nil)
@@ -320,6 +321,7 @@ func (e *Engine) Compile(ruleset syntax.Ruleset) (datalog.Transformer, error) {
 		multiBuiltins: e.multiBuiltins,
 		externals:     e.externals,
 		profile:       e.profile,
+		provenance:    e.provenance,
 	}, nil
 }
 

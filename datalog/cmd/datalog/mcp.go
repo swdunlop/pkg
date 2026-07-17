@@ -135,17 +135,24 @@ func (h *mcpHandlers) lockedSnapshot() (querySnapshot, error) {
 // base is never the synthetic _q_ stage's output — runQuery's cold path
 // populates querySnapshot.derived with the base ruleset's fixpoint BEFORE
 // running the _q_ stage, so what lands here has no _q_ facts in it by
-// construction. snapGen is the gen captured when the snapshot was taken
-// (querySnapshot.gen, itself session.gen as of lockedSnapshot); if the
-// session's current gen no longer matches, a set_rules/set_schema/loadData
-// landed while this query's Transform ran lock-free, and base reflects a
-// ruleset/schema/data that no longer exists, so the write-back is silently
-// dropped — mirroring runApplyRulesDocument's `wb.h.sess.gen == snapGen`
-// guard (rules_editor.go). A base fixpoint that fails checkFactCap
-// (sandbox.go) is refused rather than cached, exactly as the Run/startup
-// paths already refuse to cache one: a query must not be able to cache what
-// Run would refuse.
-func (h *mcpHandlers) cacheDerivedQuery(base datalog.Database, snapGen uint64) {
+// construction. prov is querySnapshot.derivedProv, the recorder for that
+// SAME base-stage Transform (nil when provenance is disabled) — cached
+// beside base in the same critical section as base itself, so an explain
+// after this write-back resolves against the recorder that actually
+// produced the cached database (doc/features/provenance.md "Session cache
+// interaction"), never a later or unrelated run's recorder. snapGen is the
+// gen captured when the snapshot was taken (querySnapshot.gen, itself
+// session.gen as of lockedSnapshot); if the session's current gen no longer
+// matches, a set_rules/set_schema/loadData landed while this query's
+// Transform ran lock-free, and base (and prov) reflect a ruleset/schema/data
+// that no longer exists, so the write-back is silently dropped — mirroring
+// runApplyRulesDocument's `wb.h.sess.gen == snapGen` guard (rules_editor.go).
+// A base fixpoint that fails checkFactCap (sandbox.go) is refused rather
+// than cached, exactly as the Run/startup paths already refuse to cache one:
+// a query must not be able to cache what Run would refuse — and refusing the
+// database means refusing its recorder too, so a cache-admission refusal
+// drops both together, never one without the other.
+func (h *mcpHandlers) cacheDerivedQuery(base datalog.Database, prov *seminaive.Provenance, snapGen uint64) {
 	if base == nil {
 		return
 	}
@@ -156,6 +163,7 @@ func (h *mcpHandlers) cacheDerivedQuery(base datalog.Database, snapGen uint64) {
 	defer h.mu.Unlock()
 	if h.sess.gen == snapGen {
 		h.sess.derivedDB = base
+		h.sess.derivedProv = prov
 	}
 }
 
@@ -210,7 +218,17 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, timeout time
 	// `datalog mcp` (runMCP) and `datalog serve` (newWorkbench) build their
 	// session through this constructor, so both get the cap; the bare REPL
 	// (repl.go's newREPL) is a separate, uncapped surface not in scope here.
-	sess := &session{engineOpts: []seminaive.Option{seminaive.WithFactLimit(factCap)}}
+	// provenanceEnabled: true by default for every cmd/datalog session
+	// (doc/features/provenance.md "Session policy" — interactive scale, the
+	// memory cost is bounded per doc/features/provenance.md's Risks section).
+	// Both `datalog mcp` (runMCP) and `datalog serve` (newWorkbench) build
+	// their session through this constructor, so both get it; the library
+	// default (seminaive.WithProvenance never used unless a caller opts in)
+	// is unchanged for callers outside cmd/datalog.
+	sess := &session{
+		engineOpts:        []seminaive.Option{seminaive.WithFactLimit(factCap)},
+		provenanceEnabled: true,
+	}
 
 	if configPath != "" {
 		data, err := os.ReadFile(configPath)
@@ -321,6 +339,19 @@ func (h *mcpHandlers) registerTools(srv *server.MCPServer) {
 			h.mu.Lock()
 			defer h.mu.Unlock()
 			return h.sampleFacts(in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("explain",
+			mcp.WithDescription(mcpExplainDescription),
+			mcp.WithInputSchema[explainInput](),
+		),
+		// No h.mu here: explain manages its own locking via
+		// lockedSnapshot-style capture inside h.explain, for the same reason
+		// query does — resolving/computing a fixpoint can take a while and
+		// must not freeze every other tool call or workbench pane.
+		mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in explainInput) (explainOutput, error) {
+			return h.explain(ctx, in)
 		}),
 	)
 	srv.AddTool(
@@ -538,7 +569,7 @@ func (h *mcpHandlers) query(ctx context.Context, in queryInput) (queryOutput, er
 		return queryOutput{}, err
 	}
 	if cold {
-		h.cacheDerivedQuery(snap.derived, snap.gen)
+		h.cacheDerivedQuery(snap.derived, snap.derivedProv, snap.gen)
 	}
 
 	n := len(rows)
@@ -652,6 +683,84 @@ func constantToJSON(c datalog.Constant) any {
 	default:
 		return c.String()
 	}
+}
+
+// -- explain ------------------------------------------------------------
+
+type explainInput struct {
+	Fact  string `json:"fact" jsonschema:"one ground fact to explain, e.g. concern(\"ws01\", 87) — the exact predicate and constant terms of a fact the current evaluation produced"`
+	Depth int    `json:"depth,omitempty" jsonschema:"max derivation-tree depth to render (default 8); does not affect correctness, only how much of a deep tree prints"`
+}
+
+type explainOutput struct {
+	Tree string `json:"tree"`
+}
+
+// explain resolves fact's full derivation tree and renders it as the same
+// unicode box-drawing text seminaive.Derivation.String() produces for the
+// REPL's .why — one rendering, shared by every explain surface (this tool,
+// repl.go's .why, cmd/datalog/fact_browser.go's "why?" affordance's
+// underlying call). Mirrors query's own lock-free-Transform-then-writeback
+// split (h.lockedSnapshot/h.cacheDerivedQuery): the potentially-slow part
+// (computing a base fixpoint when none is cached yet) runs with no lock
+// held, and only the cheap write-back takes h.mu again.
+func (h *mcpHandlers) explain(ctx context.Context, in explainInput) (explainOutput, error) {
+	fact, err := parseFactStatement(in.Fact)
+	if err != nil {
+		return explainOutput{}, err
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, h.timeout)
+	defer cancel()
+
+	h.mu.Lock()
+	provEnabled := h.sess.provenanceEnabled
+	ruleset, engineOpts, db, snapGen, buildErr := h.sess.snapshotForEvaluate()
+	cachedProv := h.sess.derivedProv
+	cachedDB := h.sess.derivedDB
+	h.mu.Unlock()
+	if !provEnabled {
+		return explainOutput{}, fmt.Errorf("explain: this session was not started with provenance enabled")
+	}
+	if buildErr != nil {
+		return explainOutput{}, buildErr
+	}
+
+	prov := cachedProv
+	if cachedDB == nil || cachedProv == nil {
+		// Cold path, mirroring query's: no cached base fixpoint (or session
+		// provenance was only just enabled), so compute one — a fresh
+		// Provenance for THIS Transform only (session.newEvalProvenance's
+		// doc comment: a Provenance is most-recent-run-only, never shared
+		// across Transforms whose result might get cached).
+		fresh := seminaive.NewProvenance()
+		out, err := evaluateSnapshot(ctx, ruleset, engineOpts, db, fresh)
+		if err != nil {
+			return explainOutput{}, err
+		}
+		prov = fresh
+		if err := checkFactCap(out); err == nil {
+			h.mu.Lock()
+			if h.sess.gen == snapGen {
+				h.sess.derivedDB = out
+				h.sess.derivedProv = fresh
+			}
+			h.mu.Unlock()
+		}
+	}
+
+	depth := in.Depth
+	var opts []seminaive.TreeOption
+	if depth > 0 {
+		opts = append(opts, seminaive.MaxDepth(depth))
+	}
+	d, found := prov.ExplainTree(fact, opts...)
+	if !found {
+		return explainOutput{}, fmt.Errorf("explain: %s: no such derived fact in the current evaluation "+
+			"(check the predicate name/arity and constant terms with list_predicates/sample_facts, or "+
+			"re-run query — an explain must name a fact the current ruleset actually produced)", in.Fact)
+	}
+	return explainOutput{Tree: d.String()}, nil
 }
 
 // -- list_predicates ------------------------------------------------------

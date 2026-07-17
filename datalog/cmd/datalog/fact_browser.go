@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 
 	html "github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/datastar"
@@ -51,18 +53,27 @@ func (wb *workbench) handleFacts(w http.ResponseWriter, r *http.Request) {
 
 	wb.h.mu.Lock()
 	db, dbErr := wb.h.sess.evaluatedDB()
+	derived := isDerivedPredicate(wb.h.sess, name, arity)
+	provOK := wb.h.sess.provenanceEnabled
 	wb.h.mu.Unlock()
 	if dbErr != nil {
 		_ = stream.Emit(datastar.Elements(view.FactsTable(name, arity, nil, nil, offset, 0, false)))
 		return
 	}
+	// The "why?" affordance (doc/features/provenance.md's Fact Browser
+	// surface) only makes sense for a derived (IDB) predicate with
+	// provenance actually enabled — a base-fact row has no witness to
+	// explain by construction (see seminaive.Provenance's Base marker), and
+	// showing the button when provenance is off would just produce an error
+	// on every click.
+	showWhy := derived && provOK
 
 	total := 0
 	var page [][]html.Content
 	i := 0
 	for row := range db.Facts(name, arity) {
 		if i >= offset && len(page) < factsPageSize {
-			page = append(page, renderFactRow(row))
+			page = append(page, renderFactRow(name, arity, row, showWhy))
 		}
 		i++
 		total = i
@@ -72,6 +83,12 @@ func (wb *workbench) handleFacts(w http.ResponseWriter, r *http.Request) {
 	header := make([]string, arity)
 	for i := range header {
 		header[i] = "col" + strconv.Itoa(i)
+	}
+	if showWhy {
+		// One blank trailing header cell for the "why?" button column
+		// renderFactRow appends to every row when showWhy is true, so the
+		// header row's cell count matches the body rows'.
+		header = append(header, "")
 	}
 
 	if offset == 0 {
@@ -85,12 +102,82 @@ func (wb *workbench) handleFacts(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
+// handleWhy is the Fact Browser's "why?" affordance (POST
+// /why/{predicate}/{arity}?fact=<literal>, view.WhyButton's click target):
+// parse the literal fact text (query string, view.WhyButton's doc comment)
+// with parseFactStatement — the SAME parser the MCP explain tool and the
+// REPL's .why use, so a browser click, an agent's explain call, and a human
+// typing .why all resolve one fact through one code path — explain it
+// against the session, and append the rendered tree to the console
+// drawer's Query tab (kind "explain") so it repaints/persists exactly like
+// every other console entry: the drawer's own SSE fan-out (wb.consoleAppend
+// -> wb.bus.Publish) is what satisfies "the drawer must repaint or close on
+// generation change like every other pane" (doc/features/provenance.md's
+// Risks section) — a set_rules landing after this entry renders does not
+// retroactively invalidate it (same as a completed query result block), but
+// a NEW query or Run after that point resolves against the new generation,
+// and old entries read as historical scrollback like any other console
+// entry, not as a live view.
+//
+// No $busy/job gating: explaining one already-produced fact is a map lookup
+// plus a bounded tree walk (see seminaive.Provenance's doc comment), not a
+// long-running action — matching WhyButton's own doc comment and every
+// other plain-@post row action in this pane (predicateEntry, loadMoreControl).
+func (wb *workbench) handleWhy(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("predicate")
+	arity, arityErr := strconv.Atoi(r.PathValue("arity"))
+	factText := r.URL.Query().Get("fact")
+
+	if _, err := datastar.RequestStream(w, r); err != nil {
+		return
+	}
+
+	if arityErr != nil {
+		wb.consoleAppend("query", "error", html.Text("why: invalid arity in request path"))
+		return
+	}
+	fact, err := parseFactStatement(factText)
+	if err != nil {
+		wb.consoleAppend("query", "error", html.Text("why: "+err.Error()))
+		return
+	}
+	if fact.Name != name || len(fact.Terms) != arity {
+		wb.consoleAppend("query", "error", html.Text(
+			"why: fact does not match the row's predicate/arity"))
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), evalTimeout)
+	defer cancel()
+
+	// Reuse mcpHandlers.explain wholesale — same lock-free-Transform/
+	// writeback split as query (h.lockedSnapshot/h.cacheDerivedQuery), same
+	// cache-beside-generation discipline, same rendering. A browser "why?"
+	// click and an agent's explain tool call are the same operation on the
+	// same session, matching every other workbench action's "one pipeline,
+	// N frontends" rule (serve.go).
+	out, err := wb.h.explain(ctx, explainInput{Fact: factText})
+	if err != nil {
+		wb.consoleAppend("query", "error", html.Text("why: "+err.Error()))
+		return
+	}
+	wb.consoleAppend("query", "explain", view.ExplainEntry(factText, out.Tree))
+}
+
 // renderFactRow renders one fact's terms: scalars via constantToJSON's
 // display conventions, composites as a one-level <details> (design doc:
 // summary ~80 chars of canonical JSON, expansion the full
-// json.MarshalIndent output).
-func renderFactRow(row []datalog.Constant) []html.Content {
-	cells := make([]html.Content, len(row))
+// json.MarshalIndent output). When showWhy is true (a derived predicate,
+// provenance enabled — see handleFacts) AND every term round-trips through
+// Datalog source syntax (see factLiteral), an extra trailing cell carries
+// the row's "why?" button (view.WhyButton), which posts the fact's own
+// literal text to /why/{name}/{arity} and appends the rendered derivation
+// tree to the console drawer's Query tab; a base-fact row, or a derived row
+// whose terms can't round-trip, gets no such cell at all
+// (doc/features/provenance.md's Fact Browser surface: "base-fact rows get
+// none").
+func renderFactRow(name string, arity int, row []datalog.Constant, showWhy bool) []html.Content {
+	cells := make([]html.Content, len(row), len(row)+1)
 	for i, c := range row {
 		if comp, ok := c.(*datalog.Composite); ok {
 			cells[i] = compositeDetail(comp)
@@ -98,7 +185,63 @@ func renderFactRow(row []datalog.Constant) []html.Content {
 		}
 		cells[i] = html.Text(jsonScalarText(constantToJSON(c)))
 	}
+	if showWhy {
+		if lit, ok := factLiteral(name, row); ok {
+			cells = append(cells, view.WhyButton(name, arity, lit))
+		}
+	}
 	return cells
+}
+
+// factLiteral renders name(row...) as Datalog source text — reusing each
+// term's own Constant.String() (the exact rendering syntax.Rule.String()
+// itself uses for a fact) — for /why/{name}/{arity}'s "terms" query
+// parameter, which handleWhy parses back with parseFactStatement (the same
+// parser the REPL's .why and the MCP explain tool use, so a "why?" click
+// resolves through the identical path a human typing the fact would). ok is
+// false when row holds a term type the parser's grammar cannot read back as
+// a literal (datalog.ID, *datalog.Composite — see syntax/parse.go's
+// parseTerm, which has no syntax for a synthetic loader ID and treats a
+// composite's own JSON literal syntax as a destructuring pattern rather
+// than a value): in that case there is nothing valid to post, so the caller
+// omits the button rather than emitting one that would always error.
+func factLiteral(name string, row []datalog.Constant) (string, bool) {
+	var buf strings.Builder
+	buf.WriteString(name)
+	buf.WriteByte('(')
+	for i, c := range row {
+		switch c.(type) {
+		case datalog.String, datalog.Integer, datalog.Float, datalog.Bool, datalog.Null:
+			// round-trippable
+		default:
+			return "", false
+		}
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(c.String())
+	}
+	buf.WriteByte(')')
+	return buf.String(), true
+}
+
+// isDerivedPredicate reports whether name/arity is an IDB predicate — the
+// head of some loaded rule or aggregate rule — mirroring renderPredicates'
+// EDB/IDB labeling rule (fact_browser.go) exactly, so a predicate the Fact
+// Browser's own listing already labels "derived" gets the "why?" button and
+// nothing else does. Callers must hold wb.h.mu.
+func isDerivedPredicate(sess *session, name string, arity int) bool {
+	for _, rule := range sess.rules {
+		if rule.Head.Pred == name && len(rule.Head.Terms) == arity {
+			return true
+		}
+	}
+	for _, ar := range sess.aggRules {
+		if ar.Head.Pred == name && len(ar.Head.Terms) == arity {
+			return true
+		}
+	}
+	return false
 }
 
 // jsonScalarText renders a scalar constantToJSON value as display text: nil

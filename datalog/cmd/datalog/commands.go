@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -24,6 +25,7 @@ func allCommands() []command {
 		{".rules", "Show defined rules", cmdRules},
 		{".facts", "Dump facts for a predicate: .facts <pred>/<arity>", cmdFacts},
 		{".profile", "Toggle per-stratum evaluation stats: .profile [on|off]", cmdProfile},
+		{".why", "Explain a derived fact's derivation tree: .why concern(\"ws01\", 87)", cmdWhy},
 		{".clear", "Clear rules and/or facts: .clear [rules|facts|all]", cmdClear},
 		{".quit", "Exit the REPL", cmdQuit},
 		{".exit", "Exit the REPL", cmdQuit},
@@ -166,6 +168,37 @@ func cmdClear(r *repl, args string) error {
 	default:
 		return fmt.Errorf("usage: .clear [rules|facts|all]")
 	}
+	return nil
+}
+
+// cmdWhy implements .why: parse args as one ground fact (reusing the same
+// syntax package the rest of the REPL parses statements with, via
+// parseFactStatement — see its doc comment for why this is not a
+// hand-rolled parser), explain it against the session (computing and
+// caching a fixpoint if none is cached yet, exactly like a query would —
+// see session.explainTree/explainProvenance), and print the rendered
+// derivation tree via seminaive.Derivation.String().
+func cmdWhy(r *repl, args string) error {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		return fmt.Errorf(`usage: .why <fact>  (e.g., .why concern("ws01", 87))`)
+	}
+	fact, err := parseFactStatement(args)
+	if err != nil {
+		return err
+	}
+	d, ok, found, err := r.explainTree(context.Background(), fact)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("this REPL session does not have provenance enabled")
+	}
+	if !found {
+		return fmt.Errorf("%s: no such derived fact in the current evaluation "+
+			"(check the predicate/arity and terms, or run a query first)", args)
+	}
+	fmt.Fprintln(r.out, d.String())
 	return nil
 }
 

@@ -2,6 +2,7 @@ package view
 
 import (
 	"fmt"
+	"net/url"
 
 	html "github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/tag"
@@ -162,6 +163,34 @@ func loadMoreControl(name string, arity, offset, pageLen, total int, hasMore boo
 			Set("data-on:click", fmt.Sprintf("@get('/facts/%s/%d?offset=%d')", name, arity, next)).
 			Add(html.Text(fmt.Sprintf("Load more (%d of %d)", next, total))),
 	)
+}
+
+// WhyButton renders one derived fact row's "why?" affordance
+// (doc/features/provenance.md's Fact Browser surface): a small inline
+// button that posts the fact's own literal text to
+// /why/{name}/{arity}?fact=<literal>, which appends the rendered derivation
+// tree to the console drawer's Query tab (fact_browser.go's handleWhy).
+// factLiteral is the fact rendered as Datalog source (package main's
+// factLiteral helper — view stays engine-type-agnostic, matching
+// CompositeDetail's split), carried in the query string the same
+// static-per-button way agent.go's permissionEntry carries
+// RequestID/OptionID for /console/answer.
+//
+// Explaining one fact is a map lookup plus a bounded tree walk (see
+// seminaive.Provenance's doc comment) — not a long-running action — so this
+// does not ride the page-wide $busy mutex/BusyActionButton the way Run/Apply
+// do; it follows the same plain @post pattern as every other row-level
+// button in this file (predicateEntry's click-to-expand, loadMoreControl).
+func WhyButton(name string, arity int, factLiteral string) html.Content {
+	href := fmt.Sprintf("/why/%s/%d?fact=%s", name, arity, url.QueryEscape(factLiteral))
+	// Reveal the Query tab before posting: the result lands in the console
+	// scrollback, and this is the one console-writing affordance that lives
+	// outside the drawer — without this, a click with the drawer collapsed
+	// appears to do nothing. Same client-local signal flip as consoleBar's
+	// tab buttons; chrome state stays out of the POST payload.
+	return tag.New("button.action.why").
+		Set("data-on:click", "$_consoleTab = 'query'; $_consoleOpen = true; @post('"+href+"')").
+		Add(html.Text("why?"))
 }
 
 // CompositeDetail renders a composite constant as a one-level <details>:

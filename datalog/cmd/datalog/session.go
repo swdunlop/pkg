@@ -64,6 +64,28 @@ type session struct {
 	// unapplied edit.
 	derivedDB datalog.Database
 
+	// derivedProv is the witness recorder for the Transform that produced
+	// derivedDB, cached BESIDE it (doc/features/provenance.md "Session cache
+	// interaction"): every call site that assigns derivedDB under the
+	// generation guard assigns derivedProv in the same critical section, from
+	// the SAME Transform call, so an explain against a cache hit always
+	// resolves against the recorder that actually produced the cached
+	// database — never a later (or earlier) run's recorder. nil whenever
+	// derivedDB is nil (cleared by the same five mutators) OR when
+	// provenanceEnabled is false. See newEvalProvenance/explainAgainstSession.
+	derivedProv *seminaive.Provenance
+
+	// provenanceEnabled turns on witness recording for every Transform this
+	// session runs whose result gets cached into derivedDB — the session
+	// policy half of doc/features/provenance.md's "Session policy" section
+	// (cmd/datalog sessions default to provenance on; the library default
+	// stays off, per seminaive.WithProvenance's own doc comment). Set once at
+	// construction (newMCPHandlers, newREPL) and never toggled afterward;
+	// left false on a bare &session{} (most tests, and any future caller that
+	// constructs one directly) so provenance stays strictly opt-in outside
+	// the two cmd/datalog entry points that turn it on.
+	provenanceEnabled bool
+
 	// gen counts invalidations of derivedDB: incremented by every mutator
 	// that changes what evaluate() would produce (setSchema, setRules,
 	// setRulesWithQueries, loadProgram, loadData — the same five call sites
@@ -223,6 +245,7 @@ func (s *session) loadData() error {
 	s.schemaText = string(data)
 	s.dataDB = db
 	s.derivedDB = nil
+	s.derivedProv = nil
 	s.gen++
 	return nil
 }
@@ -363,6 +386,7 @@ func (s *session) setSchema(text string, format string, fsys fs.FS, confine conf
 	s.schemaText = text
 	s.dataDB = db
 	s.derivedDB = nil
+	s.derivedProv = nil
 	s.gen++
 	return nil
 }
@@ -394,6 +418,7 @@ func (s *session) setRules(source string) error {
 	s.aggRules = ruleset.AggRules
 	s.rulesText = source
 	s.derivedDB = nil
+	s.derivedProv = nil
 	s.gen++
 	return nil
 }
@@ -424,6 +449,7 @@ func (s *session) setRulesWithQueries(source string) ([]syntax.Query, error) {
 	s.aggRules = ruleset.AggRules
 	s.rulesText = source
 	s.derivedDB = nil
+	s.derivedProv = nil
 	s.gen++
 	return ruleset.Queries, nil
 }
@@ -445,6 +471,7 @@ func (s *session) loadProgram(src string) ([]syntax.Query, error) {
 	}
 	s.aggRules = append(s.aggRules, ruleset.AggRules...)
 	s.derivedDB = nil
+	s.derivedProv = nil
 	s.gen++
 	return ruleset.Queries, nil
 }
@@ -477,12 +504,37 @@ func (s *session) buildDB() (*memory.Database, error) {
 // Callers that must not hold the session's lock across the Transform (Run —
 // see snapshotForEvaluate's doc comment) should call snapshotForEvaluate and
 // evaluateSnapshot directly instead of this method.
-func (s *session) evaluate(ctx context.Context) (datalog.Database, error) {
-	ruleset, engineOpts, db, _, err := s.snapshotForEvaluate()
+//
+// prov is populated with this Transform's witnesses when the session has
+// provenance enabled (nil otherwise) — see newEvalProvenance and
+// evaluateSnapshot's doc comment. Callers that cache the returned database
+// into derivedDB must cache prov into derivedProv in the SAME critical
+// section (doc/features/provenance.md "Session cache interaction"); this
+// method itself does not touch derivedDB/derivedProv, matching
+// evaluateSnapshot's lock-free contract.
+func (s *session) evaluate(ctx context.Context) (db datalog.Database, prov *seminaive.Provenance, err error) {
+	ruleset, engineOpts, edb, _, err := s.snapshotForEvaluate()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return evaluateSnapshot(ctx, ruleset, engineOpts, db)
+	prov = s.newEvalProvenance()
+	db, err = evaluateSnapshot(ctx, ruleset, engineOpts, edb, prov)
+	return db, prov, err
+}
+
+// newEvalProvenance returns a fresh *seminaive.Provenance for a Transform
+// whose result this session might cache, or nil when provenanceEnabled is
+// false. A Provenance is most-recent-run-only (seminaive.Provenance's doc
+// comment), so every Transform that could be cached into derivedDB must get
+// its OWN fresh recorder rather than sharing one across calls — sharing one
+// would leave an earlier cached derivedDB's explanations silently pointing
+// at a LATER run's witnesses (or a Provenance mid-repopulation from a
+// concurrent Transform) the moment a second Transform completed.
+func (s *session) newEvalProvenance() *seminaive.Provenance {
+	if !s.provenanceEnabled {
+		return nil
+	}
+	return seminaive.NewProvenance()
 }
 
 // snapshotForEvaluate captures the state evaluate() needs — the ruleset,
@@ -515,8 +567,20 @@ func (s *session) snapshotForEvaluate() (ruleset syntax.Ruleset, engineOpts []se
 // mid-evaluation with a seminaive.FactLimitError if the ruleset derives too
 // many facts; translateFactLimit reworks that into checkFactCap's familiar
 // "rule too broad" wording before it reaches a caller.
-func evaluateSnapshot(ctx context.Context, ruleset syntax.Ruleset, engineOpts []seminaive.Option, db *memory.Database) (datalog.Database, error) {
-	t, err := seminaive.New(engineOpts...).Compile(ruleset)
+//
+// prov, when non-nil (see newEvalProvenance), is threaded in as an extra
+// seminaive.WithProvenance option for THIS Transform only — engineOpts
+// itself never carries a Provenance (it is shared/reused across many
+// Transforms via session.engineOpts, while a Provenance must be fresh per
+// cached Transform, see newEvalProvenance's doc comment). A caller passing
+// prov == nil gets exactly the pre-provenance behavior: no extra option, no
+// witness recording.
+func evaluateSnapshot(ctx context.Context, ruleset syntax.Ruleset, engineOpts []seminaive.Option, db *memory.Database, prov *seminaive.Provenance) (datalog.Database, error) {
+	opts := engineOpts
+	if prov != nil {
+		opts = append(engineOpts[:len(engineOpts):len(engineOpts)], seminaive.WithProvenance(prov))
+	}
+	t, err := seminaive.New(opts...).Compile(ruleset)
 	if err != nil {
 		return nil, err
 	}
@@ -568,13 +632,27 @@ func (s *session) evaluatedDB() (datalog.Database, error) {
 // captured here — otherwise something invalidated the session while this
 // query's Transform ran lock-free, and writing back would resurrect a
 // fixpoint computed against a ruleset/schema/data that no longer exists.
+//
+// derivedProv rides beside derived exactly like session.derivedProv rides
+// beside session.derivedDB (doc/features/provenance.md "Session cache
+// interaction"): it is the recorder for the SAME Transform that produced
+// derived, nil whenever derived is nil or provEnabled is false, and
+// runQuery's cold path fills it in alongside base the same way it fills in
+// derived. A caller writing derived back to session.derivedDB must write
+// derivedProv back to session.derivedProv in the same critical section.
+// provEnabled mirrors session.provenanceEnabled as of snapshot time, so the
+// cold path knows whether to mint a fresh Provenance for the base stage at
+// all — the synthetic _q_ stage below never gets one regardless (explaining
+// _q_ heads is not a goal; see runQuery's doc comment).
 type querySnapshot struct {
-	rules      []syntax.Rule
-	aggRules   []syntax.AggregateRule
-	engineOpts []seminaive.Option
-	db         *memory.Database
-	derived    datalog.Database
-	gen        uint64
+	rules       []syntax.Rule
+	aggRules    []syntax.AggregateRule
+	engineOpts  []seminaive.Option
+	db          *memory.Database
+	derived     datalog.Database
+	derivedProv *seminaive.Provenance
+	provEnabled bool
+	gen         uint64
 }
 
 // snapshotForQuery captures the state runQuery reads. Callers that share
@@ -587,12 +665,14 @@ func (s *session) snapshotForQuery() (querySnapshot, error) {
 		return querySnapshot{}, err
 	}
 	return querySnapshot{
-		rules:      s.rules,
-		aggRules:   s.aggRules,
-		engineOpts: s.engineOpts,
-		db:         db,
-		derived:    s.derivedDB,
-		gen:        s.gen,
+		rules:       s.rules,
+		aggRules:    s.aggRules,
+		engineOpts:  s.engineOpts,
+		db:          db,
+		derived:     s.derivedDB,
+		derivedProv: s.derivedProv,
+		provEnabled: s.provenanceEnabled,
+		gen:         s.gen,
 	}, nil
 }
 
@@ -652,14 +732,33 @@ func (qs *querySnapshot) runQuery(ctx context.Context, q *syntax.Query) (rows []
 	var baseStats []seminaive.StratumStats
 	base := qs.derived
 	if base == nil {
+		// A fresh Provenance per base-stage Transform, never shared across
+		// calls (seminaive.Provenance is most-recent-run-only — see
+		// session.newEvalProvenance's doc comment). Minted even in the
+		// zero-rule branch below: Provenance.install still runs for a
+		// Transform with no rules (transformer.Transform, unconditional on
+		// t.provenance != nil), and without it a zero-rule ruleset's base
+		// facts would have no Provenance to Explain them as base facts at
+		// all — better to pay one cheap pass-through Transform than to leave
+		// that case unexplainable.
+		var prov *seminaive.Provenance
+		if qs.provEnabled {
+			prov = seminaive.NewProvenance()
+		}
 		switch {
-		case len(qs.rules) == 0 && len(qs.aggRules) == 0:
-			// Nothing to derive: the EDB snapshot IS the whole fixpoint.
+		case len(qs.rules) == 0 && len(qs.aggRules) == 0 && prov == nil:
+			// Nothing to derive and no provenance to record: the EDB
+			// snapshot IS the whole fixpoint, so skip the Transform entirely
+			// (the pre-provenance fast path, preserved when provenance is
+			// off).
 			base = qs.db
 		default:
 			baseRuleset := syntax.Ruleset{Rules: qs.rules, AggRules: qs.aggRules}
 			baseOpts := append(qs.engineOpts[:len(qs.engineOpts):len(qs.engineOpts)],
 				seminaive.WithProfile(func(ss []seminaive.StratumStats) { baseStats = ss }))
+			if prov != nil {
+				baseOpts = append(baseOpts, seminaive.WithProvenance(prov))
+			}
 			bt, cerr := seminaive.New(baseOpts...).Compile(baseRuleset)
 			if cerr != nil {
 				return nil, vars, nil, cerr
@@ -677,11 +776,13 @@ func (qs *querySnapshot) runQuery(ctx context.Context, q *syntax.Query) (rows []
 				return nil, vars, nil, translateFactLimit(err)
 			}
 		}
-		// Leave the freshly-derived fixpoint where the caller (if it holds
-		// the session's lock, e.g. mcp.go's query handler) can find it and
-		// cache it back into session.derivedDB for later queries — see this
+		// Leave the freshly-derived fixpoint (and its recorder, beside it)
+		// where the caller (if it holds the session's lock, e.g. mcp.go's
+		// query handler) can find them and cache them back into
+		// session.derivedDB/derivedProv for later queries — see this
 		// method's doc comment and querySnapshot.derived's.
 		qs.derived = base
+		qs.derivedProv = prov
 	}
 
 	opts := append(qs.engineOpts[:len(qs.engineOpts):len(qs.engineOpts)],
@@ -706,6 +807,102 @@ func (qs *querySnapshot) runQuery(ctx context.Context, q *syntax.Query) (rows []
 		rows = append(rows, row)
 	}
 	return rows, vars, stats, nil
+}
+
+// explainProvenance returns the *seminaive.Provenance an Explain/ExplainTree
+// call should resolve fact against: the recorder cached beside the current
+// derivedDB when one exists and provenance is enabled (the common case — a
+// query or Run has already populated it), or a freshly computed one
+// otherwise (a session that has never evaluated since its last mutation, but
+// whose caller still wants to explain a fact against the CURRENT ruleset).
+// ok is false when provenance is disabled for this session at all — callers
+// should report that distinctly from "fact not found" (see mcp.go's explain
+// tool and repl.go's .why).
+//
+// The freshly-computed path deliberately reuses evaluate()/evaluateSnapshot
+// rather than duplicating Compile+Transform here, and — mirroring every
+// other derivedDB writer (setRules et al., rules_editor.go's Run,
+// mcp.go's cacheDerivedQuery) — caches its result back into
+// derivedDB/derivedProv under the SAME generation guard, so a caller with no
+// cache yet pays for exactly one Transform and every later explain/query on
+// the same generation reuses it.
+func (s *session) explainProvenance(ctx context.Context) (*seminaive.Provenance, bool, error) {
+	if !s.provenanceEnabled {
+		return nil, false, nil
+	}
+	if s.derivedDB != nil && s.derivedProv != nil {
+		return s.derivedProv, true, nil
+	}
+
+	ruleset, engineOpts, db, snapGen, err := s.snapshotForEvaluate()
+	if err != nil {
+		return nil, false, err
+	}
+	prov := seminaive.NewProvenance()
+	out, err := evaluateSnapshot(ctx, ruleset, engineOpts, db, prov)
+	if err != nil {
+		return nil, false, err
+	}
+	// Cache beside the generation it was computed against, exactly like
+	// Run/query's cold path — a mutation landing while this Transform ran
+	// must not resurrect a stale ruleset's derivedDB/derivedProv pair.
+	if s.gen == snapGen {
+		s.derivedDB = out
+		s.derivedProv = prov
+	}
+	return prov, true, nil
+}
+
+// parseFactStatement parses text as one ground Datalog fact — a("b", 3),
+// with or without the trailing "." a full statement requires — for the two
+// surfaces that accept a fact by name rather than by JSON structure: the MCP
+// explain tool (mcp.go's explainInput) and the REPL's .why (repl.go). It
+// reuses syntax.ParseStatement (via syntax.ParseAll's underlying parser)
+// rather than hand-rolling atom parsing, so a fact typed here parses exactly
+// as the same text would inside a rules document or the console — no
+// second, subtly different grammar to keep in sync. Rejects a body (":-
+// ..."), a query ("?"), an aggregate rule, or a head with any unbound
+// variable — explain only makes sense for one fully ground fact.
+func parseFactStatement(text string) (datalog.Fact, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return datalog.Fact{}, fmt.Errorf("explain: empty fact")
+	}
+	if !strings.HasSuffix(text, ".") {
+		text += "."
+	}
+	stmt, err := syntax.ParseStatement(text)
+	if err != nil {
+		return datalog.Fact{}, err
+	}
+	rule, ok := stmt.(*syntax.Rule)
+	if !ok {
+		return datalog.Fact{}, fmt.Errorf("explain: expected a single ground fact like pred(\"a\", 1), got %T", stmt)
+	}
+	if len(rule.Body) > 0 {
+		return datalog.Fact{}, fmt.Errorf("explain: expected a single ground fact with no body, got a rule: %s", rule.String())
+	}
+	if !rule.IsFact() {
+		return datalog.Fact{}, fmt.Errorf("explain: %s is not fully ground (every term must be a constant, not a variable)", rule.String())
+	}
+	return rule.ToFact(), nil
+}
+
+// explainTree resolves fact's full derivation tree against this session's
+// current evaluation, computing (and caching, per explainProvenance's doc
+// comment) one if none is cached yet. ok is false when provenance is
+// disabled for this session; found is false when provenance is enabled but
+// fact is not one this session's most recent evaluation produced at all
+// (seminaive.Provenance.ExplainTree's own not-found case — an unknown fact,
+// not a base fact, which reports found=true with Derivation.Base set). opts
+// forwards directly to seminaive.ExplainTree (MaxDepth/MaxNodes).
+func (s *session) explainTree(ctx context.Context, fact datalog.Fact, opts ...seminaive.TreeOption) (d seminaive.Derivation, ok bool, found bool, err error) {
+	prov, ok, err := s.explainProvenance(ctx)
+	if err != nil || !ok {
+		return seminaive.Derivation{}, ok, false, err
+	}
+	d, found = prov.ExplainTree(fact, opts...)
+	return d, true, found, nil
 }
 
 func (s *session) allPredicateNames() []string {

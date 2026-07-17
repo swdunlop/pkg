@@ -175,6 +175,7 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 	// even momentarily.
 	wb.h.mu.Lock()
 	ruleset, engineOpts, db, snapGen, buildErr := wb.h.sess.snapshotForEvaluate()
+	prov := wb.h.sess.newEvalProvenance()
 	wb.h.mu.Unlock()
 
 	var evaluated datalog.Database
@@ -182,7 +183,7 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 	if buildErr == nil {
 		evalErr = <-runRecovered(func() error {
 			var err error
-			evaluated, err = evaluateSnapshot(ctx, ruleset, engineOpts, db)
+			evaluated, err = evaluateSnapshot(ctx, ruleset, engineOpts, db, prov)
 			return err
 		})
 	}
@@ -194,7 +195,12 @@ func (wb *workbench) handleRulesRun(w http.ResponseWriter, r *http.Request) {
 
 	wb.h.mu.Lock()
 	if ctx.Err() == nil && evalErr == nil && capErr == nil && wb.h.sess.gen == snapGen {
+		// prov, cached beside evaluated in the same critical section under
+		// the same snapGen guard, is the recorder for THIS Transform — see
+		// doc/features/provenance.md "Session cache interaction" and
+		// session.derivedProv's doc comment.
 		wb.h.sess.derivedDB = evaluated
+		wb.h.sess.derivedProv = prov
 	}
 	wb.h.mu.Unlock()
 

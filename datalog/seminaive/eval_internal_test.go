@@ -177,7 +177,7 @@ func TestEvalAggregatesSharesCountStepCounter(t *testing.T) {
 	}
 
 	full := &evaluator{ctx: context.Background(), dict: dict}
-	if _, err := full.evalAggregates(context.Background(), rs.AggRules, memFacts); err != nil {
+	if _, err := full.evalAggregates(context.Background(), rs.AggRules, nil, memFacts); err != nil {
 		t.Fatalf("evalAggregates: %v", err)
 	}
 
@@ -233,7 +233,7 @@ func TestEvalRulesRejectsOverArityHead(t *testing.T) {
 
 	ev := &evaluator{ctx: context.Background(), dict: dict}
 	existing := interned.NewInternedFactSet()
-	if _, _, err := ev.evalRules(context.Background(), rules, existing, 10); err == nil {
+	if _, _, err := ev.evalRules(context.Background(), rules, nil, existing, 10); err == nil {
 		t.Fatalf("expected evalRules to return an error for an over-arity rule head")
 	} else if !strings.Contains(err.Error(), "exceeds maximum") {
 		t.Fatalf("expected a labeled arity-exceeded error, got %v", err)
@@ -253,7 +253,7 @@ func TestEvalRulesRejectsOverArityBodyAtom(t *testing.T) {
 
 	ev := &evaluator{ctx: context.Background(), dict: dict}
 	existing := interned.NewInternedFactSet()
-	if _, _, err := ev.evalRules(context.Background(), rules, existing, 10); err == nil {
+	if _, _, err := ev.evalRules(context.Background(), rules, nil, existing, 10); err == nil {
 		t.Fatalf("expected evalRules to return an error for an over-arity body atom")
 	} else if !strings.Contains(err.Error(), "exceeds maximum") {
 		t.Fatalf("expected a labeled arity-exceeded error, got %v", err)
@@ -298,7 +298,7 @@ func TestEvalAggregatesRejectsOverArityHead(t *testing.T) {
 	}}
 
 	ev := &evaluator{ctx: context.Background(), dict: dict}
-	if _, err := ev.evalAggregates(context.Background(), aggRules, memFacts); err == nil {
+	if _, err := ev.evalAggregates(context.Background(), aggRules, nil, memFacts); err == nil {
 		t.Fatalf("expected evalAggregates to return an error for an over-arity aggregate head")
 	} else if !strings.Contains(err.Error(), "exceeds maximum") {
 		t.Fatalf("expected a labeled arity-exceeded error, got %v", err)

@@ -820,6 +820,13 @@ type evaluator struct {
 	// strata and across plain-rule/aggregate evaluation alike.
 	factLimit    int
 	factsDerived int
+
+	// rec is the per-Transform witness recorder, or nil when provenance is
+	// disabled (WithProvenance not used). evalRules' emit closure checks it
+	// once per newly derived fact -- see the emit closure's doc comment --
+	// so the disabled path costs exactly one nil check there and touches
+	// nothing else in join, reorder, or delta bookkeeping.
+	rec *recorder
 }
 
 // checkFactLimit counts one fact actually added to a result set against the
@@ -901,7 +908,13 @@ func recoverEvalError(ctx context.Context, err *error) {
 // is-expression +, -, or * overflows (see arithmeticOverflowError), or the
 // evaluator's WithFactLimit is exceeded (see checkFactLimit); the
 // partial results are discarded in any case.
-func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existing interned.InternedFactSet, maxIter int) (factCount int, iterations int, err error) {
+//
+// ruleIdx[i] is rules[i]'s index in the compiled Transformer's flat rule
+// list (see stratify.go's stratum.ruleIdx and Provenance.rules) -- carried
+// alongside rules purely so a recorded witness (see the emit closure below)
+// can name which rule fired in a way that survives stratification's
+// regrouping. It is unused when ev.rec is nil.
+func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, ruleIdx []int, existing interned.InternedFactSet, maxIter int) (factCount int, iterations int, err error) {
 	defer recoverEvalError(ctx, &err)
 
 	emitted := interned.NewLightInternedFactSet()
@@ -916,10 +929,25 @@ func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existin
 		joinCount    int
 		joinAtoms    []interned.CompiledAtom // joinIdx -> compiled atom, precomputed once (was a per-iteration linear scan of body)
 		varNames     []string
+
+		// sourceItems and flatIdx exist only to support witness capture
+		// (ev.rec != nil): sourceItems is the body in original source order
+		// (unlike cr.body/bodyByDelta, which are reordered for join
+		// selectivity), so detail lines render in the order the rule author
+		// wrote them; flatIdx is this rule's index into Provenance.rules.
+		// Computing them is cheap (a slice header copy and an int) and
+		// happens once per rule regardless of whether provenance is enabled,
+		// so there is no separate "provenance compile path" to keep in sync
+		// with the ordinary one.
+		sourceItems []bodyItem
+		flatIdx     int
 	}
 	compiled := make([]compiledRule, 0, len(rules))
-	for _, rule := range rules {
+	for ri, rule := range rules {
 		var cr compiledRule
+		if ruleIdx != nil {
+			cr.flatIdx = ruleIdx[ri]
+		}
 		items, negativeBody, joinCount, varMap, err := compileBody(rule.Body, ev.dict, ev.builtins, ev.multiBuiltins)
 		if err != nil {
 			return 0, 0, err
@@ -930,6 +958,9 @@ func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existin
 		}
 		cr.negativeBody = negativeBody
 		cr.joinCount = joinCount
+		if ev.rec != nil {
+			cr.sourceItems = items
+		}
 		// A rule with no positive join atom (body is only is-atoms, bind
 		// builtins, constraints, and/or negation) can't grow across
 		// iterations: negation is already fully decided (stratified), and
@@ -996,6 +1027,17 @@ func (ev *evaluator) evalRules(ctx context.Context, rules []syntax.Rule, existin
 				emitted.AddUnchecked(fact, fk)
 				factCount++
 				ev.checkFactLimit()
+				// First witness wins: this closure only reaches here once per
+				// fk (the existing.Index/emitted.Index checks above already
+				// dedup), so recording unconditionally here matches "first
+				// emission" without a separate presence check -- see
+				// recorder.record's doc comment for the belt-and-suspenders
+				// guard against a future caller that breaks that invariant.
+				// The disabled path (ev.rec == nil) costs exactly this one
+				// nil check.
+				if ev.rec != nil {
+					ev.rec.record(fk, buildWitness(cr.flatIdx, cr.sourceItems, cr.negativeBody, sub, ev.dict))
+				}
 			}
 
 			var sub interned.VarSub

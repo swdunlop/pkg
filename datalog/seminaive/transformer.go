@@ -35,6 +35,7 @@ type transformer struct {
 	multiBuiltins map[string]multiBuiltin
 	externals     map[string]externalPredicate
 	profile       func([]StratumStats)
+	provenance    *Provenance
 }
 
 var _ datalog.Transformer = (*transformer)(nil)
@@ -92,6 +93,19 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 		return nil, err
 	}
 
+	// rec accumulates witnesses for this Transform call only; it is
+	// installed into t.provenance (making it visible to callers) at the very
+	// end, after every stratum has evaluated without error -- see
+	// Provenance.install's doc comment for why a partial rec must never
+	// reach the caller-visible Provenance. When t.provenance is nil
+	// (WithProvenance not used), rec stays nil throughout and every
+	// evaluator/emit-seam check on it is a single nil comparison -- no
+	// allocation, no bookkeeping.
+	var rec *recorder
+	if t.provenance != nil {
+		rec = newRecorder()
+	}
+
 	// Run evaluation if we have rules. Strata were computed at compile time.
 	if len(t.strata) > 0 {
 		strata := t.strata
@@ -102,7 +116,7 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 			}
 		}
 
-		ev := &evaluator{ctx: ctx, dict: dict, maxIter: t.maxIter, factLimit: t.factLimit, builtins: t.builtins, multiBuiltins: t.multiBuiltins}
+		ev := &evaluator{ctx: ctx, dict: dict, maxIter: t.maxIter, factLimit: t.factLimit, builtins: t.builtins, multiBuiltins: t.multiBuiltins, rec: rec}
 
 		var stats []StratumStats
 		if t.profile != nil {
@@ -145,7 +159,7 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 			}
 
 			if len(s.rules) > 0 {
-				factCount, iterations, err := ev.evalRules(ctx, s.rules, existing, t.maxIter)
+				factCount, iterations, err := ev.evalRules(ctx, s.rules, s.ruleIdx, existing, t.maxIter)
 				if err != nil {
 					return nil, stratumErr(err)
 				}
@@ -156,7 +170,12 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 			}
 
 			if len(s.aggRules) > 0 {
-				aggDerived, err := ev.evalAggregates(ctx, s.aggRules, existing)
+				// s.aggRuleIdx mirrors s.ruleIdx for aggregate rules: it
+				// names each aggregate rule's index into t.aggRules (the
+				// flat, Compile-order list), the same numbering pattern
+				// evalRules uses for plain rules -- see
+				// Provenance.aggRuleText.
+				aggDerived, err := ev.evalAggregates(ctx, s.aggRules, s.aggRuleIdx, existing)
 				if err != nil {
 					return nil, stratumErr(err)
 				}
@@ -200,6 +219,22 @@ func (t *transformer) Transform(ctx context.Context, input datalog.Database) (da
 		}
 	}
 	sort.Slice(decls, func(i, j int) bool { return decls[i].Name < decls[j].Name })
+
+	// Every stratum evaluated without error (any error above already
+	// returned), so this Transform succeeded: publish rec as the new
+	// visible state of t.provenance. dict is frozen/immutable from this
+	// point on in the sense that matters for provenance -- callers only
+	// read it via Provenance.Explain/ExplainTree after Transform has
+	// returned, and interned.Dict's own clone-before-publish discipline
+	// means nothing else retains a mutable alias to this dict afterward.
+	if t.provenance != nil {
+		// existing.Index is the produced database's own fact-key set (input,
+		// asserted, and derived facts alike) -- the authority Explain uses to
+		// tell a genuinely-produced witness-less base fact from a fact that
+		// was never produced but whose terms merely happen to be interned.
+		// See Provenance.present.
+		t.provenance.install(t.rules, t.aggRules, dict, rec.witnesses, existing.Index)
+	}
 
 	return interned.Memory.Wrap(dict, existing, decls), nil
 }

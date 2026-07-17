@@ -966,7 +966,7 @@ func TestSampleFacts_DerivedPredicate(t *testing.T) {
 
 	// A Run (session.evaluate + derivedDB cache, as serve startup and the
 	// workbench's Run action both do) makes derived facts visible to both.
-	evaluated, err := h.sess.evaluate(context.Background())
+	evaluated, _, err := h.sess.evaluate(context.Background())
 	if err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
@@ -1015,7 +1015,7 @@ tag("e", "f").
 	if _, err := h.setRules(setRulesInput{Source: src}); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
-	evaluated, err := h.sess.evaluate(context.Background())
+	evaluated, _, err := h.sess.evaluate(context.Background())
 	if err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}

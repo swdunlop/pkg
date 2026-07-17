@@ -176,14 +176,21 @@ func newWorkbench(dataDir, configPath string, ruleFiles []string, tokenFlag stri
 		evalErr := <-runRecovered(func() error {
 			h.mu.Lock()
 			defer h.mu.Unlock()
-			db, err := h.sess.evaluate(ctx)
+			db, prov, err := h.sess.evaluate(ctx)
 			if err != nil {
 				return err
 			}
 			if err := checkFactCap(db); err != nil {
 				return err
 			}
+			// prov rides beside db under the same generation guard every
+			// other derivedDB writer uses (doc/features/provenance.md
+			// "Session cache interaction") — here there is no concurrent
+			// mutation possible (h.mu has been held since before evaluate
+			// started), so the cache is unconditional, unlike Run/query's
+			// snapGen-checked writes.
 			h.sess.derivedDB = db
+			h.sess.derivedProv = prov
 			return nil
 		})
 		cancel()
@@ -414,6 +421,10 @@ func (wb *workbench) routes(mux *http.ServeMux) {
 
 	// Fact Browser (view/fact_browser.go stub; wave 8 fills in).
 	mux.HandleFunc("GET /facts/{predicate}/{arity}", wb.handleFacts)
+
+	// Fact Browser "why?" affordance (doc/features/provenance.md): explains
+	// one derived fact into the console drawer's Query tab.
+	mux.HandleFunc("POST /why/{predicate}/{arity}", wb.handleWhy)
 
 	// Console drawer (console.go, agent.go): the Query tab's ad-hoc probe
 	// and the Agent tab's prompt (doc/features/web-ui.md "Console drawer").

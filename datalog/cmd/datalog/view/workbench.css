@@ -260,6 +260,25 @@ section.pane details pre {
   border-bottom: none;
 }
 
+/* Fact Browser "why?" button (doc/features/provenance.md): a small inline
+ * action on a derived fact row, distinct from the page-wide Run/Apply
+ * BusyActionButton chrome since explaining one fact never rides $busy. */
+button.action.why {
+  font-size: var(--text-7);
+  padding: 0 var(--space-2);
+}
+
+/* Console drawer explain entries (view.ExplainEntry): the rendered
+ * derivation tree is pre-formatted unicode box-drawing text from
+ * seminaive.Derivation.String(), so it must render in a monospace,
+ * whitespace-preserving block like any other console log's query text. */
+.explain-tree {
+  font-family: var(--font-mono);
+  font-size: var(--text-7);
+  white-space: pre;
+  overflow-x: auto;
+}
+
 /* Query result blocks in the Datalog Editor. */
 .result-block {
   margin-block: var(--space-3);

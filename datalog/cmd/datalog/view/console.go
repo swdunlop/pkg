@@ -179,6 +179,19 @@ func promptInputRow() html.Content {
 	)
 }
 
+// ExplainEntry renders one "why?" result for the console drawer's Query tab
+// (fact_browser.go's handleWhy, WhyButton's click target): the fact it
+// explains as a heading (mirroring queryEcho's "echo what this responds to"
+// convention, console.go) and the rendered derivation tree — already
+// box-drawing text from seminaive.Derivation.String() — in a <pre> block so
+// its indentation and unicode connectors render verbatim.
+func ExplainEntry(fact, tree string) html.Content {
+	return html.Group{
+		tag.New("p.query-text", html.Text("why: "+fact)),
+		tag.New("pre.explain-tree", html.Text(tree)),
+	}
+}
+
 // ConsoleEntry wraps one scrollback entry. id is the workbench console
 // log's sequence number — stable across append and every later morph of the
 // same entry — and kind is a CSS hook ("query", "user", "agent", "thought",

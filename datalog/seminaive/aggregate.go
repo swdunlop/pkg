@@ -18,10 +18,20 @@ import (
 // Nothing about a row beyond its group-by key and aggregated value is ever
 // needed, so a group never holds a full VarSub or a name-keyed InternedSub
 // per row -- see evalAggregates.
+//
+// samples is provenance-only (nil for the whole run when ev.rec == nil,
+// see evalAggregates): the first witnessSampleCap solutions' own ground
+// body/detail, captured as the group streams past and never grown beyond
+// the cap -- so a count over 500k solutions costs exactly cap retained
+// samples per group, not 500k. count still tracks the true cardinality
+// independent of how many samples were kept, which is what lets the
+// rendered explanation say "aggregated over 500000 solutions (first 10
+// shown)" honestly.
 type aggGroup struct {
 	keyVals []uint64
 	values  []uint64
 	count   int
+	samples []witnessSample
 }
 
 // evalAggregates evaluates aggregate rules against the current facts,
@@ -45,13 +55,24 @@ type aggGroup struct {
 // rule's body evaluation, so one large aggregate body (e.g. a multi-way self
 // cross-product) or a group loop over many groups can't itself run
 // uncancellably.
-func (ev *evaluator) evalAggregates(ctx context.Context, aggRules []syntax.AggregateRule, memFacts interned.InternedFactSet) (_ interned.InternedFactSet, err error) {
+//
+// aggRuleIdx[i] is aggRules[i]'s index into the compiled Transformer's flat
+// aggRules list (see stratify.go's stratum.aggRuleIdx and
+// Provenance.aggRules) -- the aggregate mirror of evalRules' ruleIdx
+// parameter, carried so a recorded aggregate witness can name which
+// aggregate rule fired in a way that survives stratification's regrouping.
+// Unused when ev.rec is nil.
+func (ev *evaluator) evalAggregates(ctx context.Context, aggRules []syntax.AggregateRule, aggRuleIdx []int, memFacts interned.InternedFactSet) (_ interned.InternedFactSet, err error) {
 	defer recoverEvalError(ctx, &err)
 	result := interned.NewLightInternedFactSet()
 
-	for _, ar := range aggRules {
+	for ari, ar := range aggRules {
 		if err := ctx.Err(); err != nil {
 			return result, err
+		}
+		var flatIdx int
+		if aggRuleIdx != nil {
+			flatIdx = aggRuleIdx[ari]
 		}
 
 		items, negativeBody, varNames, err := ev.compileQueryBody(ar.Body)
@@ -130,6 +151,18 @@ func (ev *evaluator) evalAggregates(ctx context.Context, aggRules []syntax.Aggre
 				}
 				g.values = append(g.values, id)
 			}
+			// Sample capture: only when provenance is enabled, and only
+			// while the group's sample slice is still under the cap -- once
+			// witnessSampleCap solutions have been captured, every later
+			// solution in this group is grounded and discarded (never
+			// appended), so a group of 500k solutions retains exactly cap
+			// samples' worth of memory regardless of how far past the cap
+			// count grows. This is the same "first N in iteration order"
+			// determinism buildWitness relies on for plain rules: fixed
+			// rule/join order makes the retained sample stable across runs.
+			if ev.rec != nil && len(g.samples) < witnessSampleCap {
+				g.samples = append(g.samples, buildAggSample(items, negativeBody, vs, ev.dict))
+			}
 		})
 
 		// Pre-compile head atom for grounding.
@@ -172,6 +205,22 @@ func (ev *evaluator) evalAggregates(ctx context.Context, aggRules []syntax.Aggre
 					// fact per output group, so WithFactLimit applies to
 					// aggregate strata too, not just plain-rule fixpoints.
 					ev.checkFactLimit()
+					// Record the aggregate witness at the same point evalRules'
+					// emit closure records a plain witness: right after the
+					// fact is known to be genuinely produced (GroundCompiled
+					// succeeded). One aggregate fact per group (this loop
+					// never revisits a group), so there is no first-witness
+					// race to guard against the way recorder.record's map
+					// check guards evalRules' iterative re-derivation.
+					if ev.rec != nil {
+						fk := interned.InternedFactHash(fact)
+						ev.rec.record(fk, witness{
+							rule:       flatIdx,
+							isAgg:      true,
+							groupCount: g.count,
+							sample:     g.samples,
+						})
+					}
 				}
 			}
 		}
