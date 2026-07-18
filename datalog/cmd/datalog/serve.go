@@ -35,6 +35,7 @@ func runServe(args []string) {
 	flags := stdflag.NewFlagSet("serve", stdflag.ExitOnError)
 	dataDir := flags.String("d", "", "data directory or .zip file (required; the security boundary for all file access)")
 	configPath := flags.String("c", "", "path to a JSON or YAML jsonfacts config file to preload")
+	rulesDir := flags.String("rules", "", "path to a rules/ directory store (one <head>_<arity>.dl file per rule group); mutually exclusive with positional rule files")
 	listen := flags.String("listen", "127.0.0.1:8080", "address to listen on")
 	mcpToken := flags.String("mcp-token", "", "bearer token required on /mcp (default: generate one and print it to stderr)")
 	model := flags.String("model", "", "embedded agent model, kit-style (e.g. anthropic/claude-sonnet-5, openai/<alias>); empty defers to KIT_MODEL / ~/.kit.yml")
@@ -57,10 +58,20 @@ func runServe(args []string) {
 	// files given on the command line, in order. The first one (if any) is
 	// the Save target for the Datalog Editor's rules document, per the
 	// design's "Session state and persistence" section — see handleSave's
-	// doc comment for the full path-resolution policy.
+	// doc comment for the full path-resolution policy. --rules and
+	// positional rule files are mutually exclusive (doc/features/
+	// workbench-v2.md work item 1): the directory store and the legacy
+	// monolithic-file(s) path both set session.rulesText, and there is no
+	// sensible way to merge "load this directory" with "also load these
+	// specific files" without inventing an ordering the store doesn't have.
 	ruleFiles := flags.Args()
 
-	wb, closeFn, err := newWorkbench(*dataDir, *configPath, ruleFiles, *mcpToken,
+	if err := rulesSourceConflict(*rulesDir, ruleFiles); err != nil {
+		fmt.Fprintf(os.Stderr, "datalog serve: %v\n", err)
+		os.Exit(1)
+	}
+
+	wb, closeFn, err := newWorkbench(*dataDir, *configPath, ruleFiles, *rulesDir, *mcpToken,
 		agentConfig{
 			Model:          *model,
 			ProviderURL:    *providerURL,
@@ -106,9 +117,13 @@ func runServe(args []string) {
 // parsing and the HTTP listener itself. Factored out so tests can build a
 // workbench against a temp directory or the mordor example without going
 // through flag parsing or os.Exit calls. tokenFlag is the --mcp-token
-// flag's value; empty means "generate one".
-func newWorkbench(dataDir, configPath string, ruleFiles []string, tokenFlag string, agentCfg agentConfig) (*workbench, func() error, error) {
-	h, closeFn, err := newMCPHandlers(dataDir, configPath, ruleFiles, evalTimeout)
+// flag's value; empty means "generate one". rulesDir is the --rules
+// directory-store path (empty means "use ruleFiles instead", the legacy
+// monolithic path) — runServe has already rejected the case where both are
+// given, mirroring runMCP's identical check, so newWorkbench itself does
+// not re-validate that here (newMCPHandlers just prefers rulesDir when set).
+func newWorkbench(dataDir, configPath string, ruleFiles []string, rulesDir string, tokenFlag string, agentCfg agentConfig) (*workbench, func() error, error) {
+	h, closeFn, err := newMCPHandlers(dataDir, configPath, ruleFiles, rulesDir, evalTimeout)
 	if err != nil {
 		return nil, nil, err
 	}

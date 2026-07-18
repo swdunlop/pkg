@@ -43,7 +43,7 @@ func newMordorHandlers(t *testing.T) *mcpHandlers {
 	if _, err := os.Stat(zipPath); err != nil {
 		t.Fatalf("mordor zip not found at %s: %v", zipPath, err)
 	}
-	h, closeFn, err := newMCPHandlers(zipPath, "", nil, 5*time.Second)
+	h, closeFn, err := newMCPHandlers(zipPath, "", nil, "", 5*time.Second)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestNewMCPHandlers_WarnsOnEmbeddedQueriesInRuleFiles(t *testing.T) {
 	origStderr := os.Stderr
 	os.Stderr = w
 
-	h, closeFn, err := newMCPHandlers(dir, "", []string{rulesPath}, 5*time.Second)
+	h, closeFn, err := newMCPHandlers(dir, "", []string{rulesPath}, "", 5*time.Second)
 
 	os.Stderr = origStderr
 	w.Close()
@@ -664,7 +664,7 @@ func TestQuery_DoesNotHoldLockDuringTransform(t *testing.T) {
 func TestQuery_ZeroRulesCrossProductExceedsFactCap(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 15)
-	h, closeFn, err := newMCPHandlers(dir, "", nil, 5*time.Second)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -695,7 +695,7 @@ func TestQuery_ZeroRulesCrossProductExceedsFactCap(t *testing.T) {
 func TestQuery_RulesBaseStageExceedsFactCap(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 40) // cross product: 40*40 = 1600 > factCap (1000)
-	h, closeFn, err := newMCPHandlers(dir, "", nil, 5*time.Second)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -724,7 +724,7 @@ func TestQuery_RulesBaseStageExceedsFactCap(t *testing.T) {
 func TestQuery_UnderCapStillSucceeds(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 5)
-	h, closeFn, err := newMCPHandlers(dir, "", nil, 5*time.Second)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -901,7 +901,7 @@ func TestQuery_StaleWriteBackDropped(t *testing.T) {
 func TestQuery_CacheRefusesOverFactCapBase(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 1500)
-	h, closeFn, err := newMCPHandlers(dir, "", nil, 5*time.Second)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}

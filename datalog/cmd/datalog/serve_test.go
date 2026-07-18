@@ -18,6 +18,7 @@ import (
 
 	html "github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/datastar"
+	"swdunlop.dev/pkg/datalog/syntax"
 )
 
 // -- test helpers ----------------------------------------------------------
@@ -28,7 +29,20 @@ import (
 // stderr.
 func newTestWorkbench(t *testing.T, dir, configPath string, ruleFiles []string, token string) *workbench {
 	t.Helper()
-	wb, closeFn, err := newWorkbench(dir, configPath, ruleFiles, token, agentConfig{})
+	wb, closeFn, err := newWorkbench(dir, configPath, ruleFiles, "", token, agentConfig{})
+	if err != nil {
+		t.Fatalf("newWorkbench: %v", err)
+	}
+	t.Cleanup(func() { closeFn() })
+	return wb
+}
+
+// newTestWorkbenchRulesDir is newTestWorkbench's --rules-directory sibling,
+// for tests exercising the rules-directory-store path through the
+// workbench constructor instead of the legacy positional-file(s) path.
+func newTestWorkbenchRulesDir(t *testing.T, dir, configPath, rulesDir, token string) *workbench {
+	t.Helper()
+	wb, closeFn, err := newWorkbench(dir, configPath, nil, rulesDir, token, agentConfig{})
 	if err != nil {
 		t.Fatalf("newWorkbench: %v", err)
 	}
@@ -68,7 +82,7 @@ func TestMcpURL(t *testing.T) {
 		{"0.0.0.0:9090", "http://127.0.0.1:9090/mcp"},
 		{"[::]:9090", "http://127.0.0.1:9090/mcp"},
 		{"example.internal:9090", "http://example.internal:9090/mcp"},
-		{"9090", "http://127.0.0.1:9090/mcp"},        // bare port, no colon at all
+		{"9090", "http://127.0.0.1:9090/mcp"},               // bare port, no colon at all
 		{"not-a-valid-listen", "http://127.0.0.1:8080/mcp"}, // unrecoverable: falls back to the flag default
 		{"[::1]:8080", "http://[::1]:8080/mcp"},             // IPv6 literal must stay bracketed
 		{"[2001:db8::1]:9090", "http://[2001:db8::1]:9090/mcp"},
@@ -98,6 +112,48 @@ func TestStartupEvaluatesRules(t *testing.T) {
 	}
 	if n == 0 {
 		t.Fatalf("derived predicate smb_conn empty after startup evaluation")
+	}
+}
+
+// TestStartupEvaluatesRules_RulesDir mirrors TestStartupEvaluatesRules but
+// builds the workbench from an imported rules/ directory store via --rules
+// instead of the legacy positional rules.dl, confirming the startup-eval
+// path (newWorkbench's "Evaluate the preloaded ruleset once at startup")
+// works identically regardless of which rules source populated the
+// session.
+func TestStartupEvaluatesRules_RulesDir(t *testing.T) {
+	monolith := filepath.Join("..", "..", "examples", "mordor", "rules.dl")
+	data, err := os.ReadFile(monolith)
+	if err != nil {
+		t.Fatalf("reading mordor rules.dl: %v", err)
+	}
+	rs, err := syntax.ParseAll(string(data))
+	if err != nil {
+		t.Fatalf("parsing mordor rules.dl: %v", err)
+	}
+	rulesDir := filepath.Join(t.TempDir(), "rules")
+	if _, err := importRuleset(rs, rulesDir); err != nil {
+		t.Fatalf("importRuleset: %v", err)
+	}
+
+	zipPath := filepath.Join("..", "..", "examples", "mordor", "covenant_copy_smb.zip")
+	schemaPath := filepath.Join("..", "..", "examples", "mordor", "mordor.yaml")
+	wb := newTestWorkbenchRulesDir(t, zipPath, schemaPath, rulesDir, "test-token")
+
+	wb.h.mu.Lock()
+	defer wb.h.mu.Unlock()
+	if wb.h.sess.derivedDB == nil {
+		t.Fatalf("derivedDB not populated at startup")
+	}
+	n := 0
+	for range wb.h.sess.derivedDB.Facts("smb_conn", 3) {
+		n++
+	}
+	if n == 0 {
+		t.Fatalf("derived predicate smb_conn empty after startup evaluation")
+	}
+	if wb.h.rules == nil {
+		t.Fatalf("expected mcpHandlers.rules to be populated when --rules is used")
 	}
 }
 
@@ -350,7 +406,7 @@ func TestHTTP_EventsSubscription(t *testing.T) {
 }
 
 // TestHTTP_EventsReplaysCurrentBusyOnConnect is the regression for item 7:
-// $busy initializes to '' client-side, and before this fix handleEvents
+// $busy initializes to ” client-side, and before this fix handleEvents
 // never replayed the current key, so a browser tab opened while a job was
 // already running showed idle — no Stop control, no visible feedback —
 // until that job happened to finish and publish "". This simulates a job

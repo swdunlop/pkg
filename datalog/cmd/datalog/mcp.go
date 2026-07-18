@@ -38,6 +38,7 @@ func runMCP(args []string) {
 	flags := stdflag.NewFlagSet("mcp", stdflag.ExitOnError)
 	dataDir := flags.String("d", "", "data directory or .zip file (required unless --proxy is given; the security boundary for all file access)")
 	configPath := flags.String("c", "", "path to a JSON or YAML jsonfacts config file to preload")
+	rulesDir := flags.String("rules", "", "path to a rules/ directory store (one <head>_<arity>.dl file per rule group); mutually exclusive with positional rule files")
 	timeout := flags.Duration("timeout", 60*time.Second, "per-query evaluation timeout")
 	proxy := flags.String("proxy", "", "bridge stdio to a remote streamable-HTTP MCP endpoint (e.g. a running datalog serve's /mcp) instead of serving a local session; the bearer token comes from DATALOG_MCP_TOKEN, never a flag — argv is visible to every process listing")
 	if err := flags.Parse(args); err != nil {
@@ -60,7 +61,12 @@ func runMCP(args []string) {
 		os.Exit(1)
 	}
 
-	h, closeFn, err := newMCPHandlers(*dataDir, *configPath, flags.Args(), *timeout)
+	if err := rulesSourceConflict(*rulesDir, flags.Args()); err != nil {
+		fmt.Fprintf(os.Stderr, "datalog mcp: %v\n", err)
+		os.Exit(1)
+	}
+
+	h, closeFn, err := newMCPHandlers(*dataDir, *configPath, flags.Args(), *rulesDir, *timeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "datalog mcp: %v\n", err)
 		os.Exit(1)
@@ -109,6 +115,18 @@ type mcpHandlers struct {
 	// runMCP (stdio `datalog mcp`) leaves this nil, so stdio behavior is
 	// byte-identical to before this field existed.
 	onChange func()
+
+	// rules is the loaded rules/ directory store (rulestore.go), set only
+	// when newMCPHandlers was given --rules instead of positional rule
+	// files. nil means this session's rules came from the legacy monolithic
+	// file(s) (or no rules at all) — h.sess.rulesText/rules/aggRules are the
+	// only source of truth in that case. This is deliberately a thin seam:
+	// a later task adds per-group revision counters and CRUD tool methods
+	// on top of it (doc/features/workbench-v2.md work item 1's "leave a
+	// small, obvious seam, not speculative machinery"); this task only
+	// needs it to keep the loaded groups available for that follow-up and
+	// to know, at load time, which file a parse error belongs to.
+	rules *ruleStore
 }
 
 // lockedSnapshot is the one sanctioned way to read session state for a
@@ -175,7 +193,20 @@ func (h *mcpHandlers) cacheDerivedQuery(base datalog.Database, prov *seminaive.P
 // produce one fs.FS plus one confineRef, threaded uniformly through
 // set_schema's data loading and sample_input's file listing/reading, so
 // the two data-source kinds behave identically to callers.
-func newMCPHandlers(dataDir, configPath string, ruleFiles []string, timeout time.Duration) (*mcpHandlers, func() error, error) {
+//
+// ruleFiles and rulesDir are mutually exclusive (both runMCP and
+// newWorkbench refuse to call this with both non-empty — "use --rules or
+// positional rule files, not both"): ruleFiles is the legacy monolithic-
+// file(s) path (loaded via session.loadProgram, unchanged from before this
+// function grew a rules-directory argument), and rulesDir is the
+// doc/features/workbench-v2.md canonical rules/ directory store
+// (rulestore.go's loadRuleStore), loaded per-file so a parse error names
+// its file, with h.sess.rulesText set to the store's Export-style
+// concatenation so every existing surface (REPL echo, workbench Rules
+// pane, etc.) keeps seeing one document exactly as it did for a monolithic
+// file. The loaded *ruleStore itself is kept on the returned handlers (see
+// mcpHandlers.rules's doc comment) for a later CRUD task to build on.
+func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir string, timeout time.Duration) (*mcpHandlers, func() error, error) {
 	var (
 		fsys    fs.FS
 		confine confineRef
@@ -246,34 +277,68 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, timeout time
 		}
 	}
 
-	var rulesText strings.Builder
-	for _, rf := range ruleFiles {
-		data, err := os.ReadFile(rf)
+	var store *ruleStore
+	if rulesDir != "" {
+		// loadRuleStore validates all-or-nothing and names the offending
+		// file on any error (rulestore.go's doc comment) — a startup failure
+		// here is exactly as fatal as a malformed monolithic rules file
+		// always was, just attributed to one file in the directory instead
+		// of the single positional argument.
+		s, err := loadRuleStore(rulesDir)
 		if err != nil {
 			closeFn()
-			return nil, nil, fmt.Errorf("reading rules %s: %w", rf, err)
+			return nil, nil, fmt.Errorf("loading rules directory %s: %w", rulesDir, err)
 		}
-		queries, err := sess.loadProgram(string(data))
-		if err != nil {
-			closeFn()
-			return nil, nil, fmt.Errorf("loading rules %s: %w", rf, err)
+		store = s
+		// Each group loads through session.loadProgram — the same chokepoint
+		// the positional-file path below uses — never by writing sess.rules/
+		// aggRules/facts directly from here. loadProgram routes ground facts
+		// (body-less rules) into s.facts, where buildDB folds them into the
+		// BASE database; appending them into s.rules instead would evaluate
+		// them as derived rules, silently changing base/derived
+		// classification (listPredicates) and base-DB contents versus
+		// loading the identical statements from a monolith. Queries cannot
+		// occur here (loadRuleStore already rejected them per file), so the
+		// returned queries slice is always empty; errors are wrapped with
+		// the group's filename so attribution survives the shared path.
+		for _, k := range s.Order {
+			g := s.Groups[k]
+			if _, err := sess.loadProgram(g.Text); err != nil {
+				closeFn()
+				return nil, nil, fmt.Errorf("loading rules directory %s: %s: %w", rulesDir, g.File, err)
+			}
 		}
-		// Unlike the REPL's loadProgram (repl.go), which runs embedded '?'
-		// queries and prints their results, mcp/serve mode has nowhere to
-		// print to: stdio's stdout is the JSON-RPC channel, and serve has no
-		// console yet at this point in startup. Silently dropping them was
-		// the bug — warn by name instead, so an operator who pasted a REPL
-		// script wholesale learns why those queries never ran rather than
-		// wondering why nothing happened.
-		if len(queries) > 0 {
-			fmt.Fprintf(os.Stderr, "datalog: %s: %d embedded query statement(s) ignored "+
-				"(startup rule files load rules only; use the query tool to run queries)\n", rf, len(queries))
+		sess.rulesText = s.export()
+	} else {
+		var rulesText strings.Builder
+		for _, rf := range ruleFiles {
+			data, err := os.ReadFile(rf)
+			if err != nil {
+				closeFn()
+				return nil, nil, fmt.Errorf("reading rules %s: %w", rf, err)
+			}
+			queries, err := sess.loadProgram(string(data))
+			if err != nil {
+				closeFn()
+				return nil, nil, fmt.Errorf("loading rules %s: %w", rf, err)
+			}
+			// Unlike the REPL's loadProgram (repl.go), which runs embedded '?'
+			// queries and prints their results, mcp/serve mode has nowhere to
+			// print to: stdio's stdout is the JSON-RPC channel, and serve has no
+			// console yet at this point in startup. Silently dropping them was
+			// the bug — warn by name instead, so an operator who pasted a REPL
+			// script wholesale learns why those queries never ran rather than
+			// wondering why nothing happened.
+			if len(queries) > 0 {
+				fmt.Fprintf(os.Stderr, "datalog: %s: %d embedded query statement(s) ignored "+
+					"(startup rule files load rules only; use the query tool to run queries)\n", rf, len(queries))
+			}
+			rulesText.Write(data)
 		}
-		rulesText.Write(data)
+		sess.rulesText = rulesText.String()
 	}
-	sess.rulesText = rulesText.String()
 
-	return &mcpHandlers{sess: sess, fsys: fsys, confine: confine, timeout: timeout}, closeFn, nil
+	return &mcpHandlers{sess: sess, fsys: fsys, confine: confine, timeout: timeout, rules: store}, closeFn, nil
 }
 
 // registerTools wires the six typed handler methods into srv using

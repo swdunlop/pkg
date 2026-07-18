@@ -348,7 +348,7 @@ func TestParseFactStatement(t *testing.T) {
 // newMCPHandlers) enables provenance by default — the library default
 // (seminaive's own, unchanged) stays off.
 func TestSessionPolicy_MCPHandlersEnableProvenanceByDefault(t *testing.T) {
-	h, closeFn, err := newMCPHandlers(t.TempDir(), "", nil, 5_000_000_000)
+	h, closeFn, err := newMCPHandlers(t.TempDir(), "", nil, "", 5_000_000_000)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}

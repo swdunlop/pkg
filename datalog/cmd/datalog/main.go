@@ -36,6 +36,14 @@ func main() {
 		return
 	}
 
+	// datalog rules dispatches to the Import/Export CLI over the rules/
+	// directory store (rulestore.go, doc/features/workbench-v2.md design
+	// decision 4); see runRules.
+	if len(os.Args) > 1 && os.Args[1] == "rules" {
+		runRules(os.Args[2:])
+		return
+	}
+
 	flag.Parse()
 
 	if *cpuProfile != "" {
