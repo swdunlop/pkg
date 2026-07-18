@@ -6,6 +6,7 @@ require (
 	github.com/coder/acp-go-sdk v0.13.5
 	github.com/expr-lang/expr v1.17.8
 	github.com/fsnotify/fsnotify v1.10.1
+	github.com/google/uuid v1.6.0
 	github.com/lmorg/readline/v4 v4.2.2
 	github.com/mark3labs/kit v0.83.1
 	github.com/mark3labs/mcp-go v0.56.0
@@ -65,7 +66,6 @@ require (
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.17 // indirect
 	github.com/googleapis/gax-go/v2 v2.22.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect

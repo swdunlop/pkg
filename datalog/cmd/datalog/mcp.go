@@ -376,33 +376,48 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir str
 // toolMode scopes which tools registerToolsForMode wires into a server
 // (doc/features/workbench-v2.md design decision 5: "Three conversation
 // modes, chosen at start... the agent's tool surface is scoped server-side,
-// not by instruction"). Modes are NOT user-visible yet (phase 1b only builds
-// the seam — see this task's brief): there is exactly one constant in use
-// today, toolModeRules, wired from both of this package's registration call
-// sites (mcp.go's runMCP, serve.go's newWorkbench) exactly as registerTools
-// was before this type existed. A later phase adds toolModeQuery/
-// toolModeFacts and a real per-conversation mode choice; until then this
-// type exists so that later change is additive (a new case in
-// registerToolsForMode) rather than a rewrite of the registration wiring.
+// not by instruction"). Phase 2 (conversation.go) makes the three modes
+// user-visible at conversation-creation time; registerToolsForMode's switch
+// below is the enforcement point every conversation's MCP registration goes
+// through, so a tool can never leak into the wrong mode by a call site
+// forgetting to gate it.
 type toolMode string
 
-// toolModeRules is Query Mode's surface plus rule-group CRUD AND schema CRUD
-// (design decision 5's "Rules Mode" bullet, plus the schema-write set that
-// properly belongs to the not-yet-built Facts Mode) — every tool this
-// package currently exposes. Schema CRUD (schema_crud.go, design decision 4)
-// is registered here too because modes are not yet user-visible (design
-// decision 10: "toolModeRules currently registers everything"); once Facts
-// Mode is built, registerSchemaWriteSet moves under its own case instead of
-// riding along with rulesWriteSet here.
-const toolModeRules toolMode = "rules"
+const (
+	// toolModeQuery is the read-only investigation surface (design decision
+	// 5's "Query Mode" bullet): query, list_predicates, sample_facts,
+	// explain, explain_fact, describe, predicate_deps, sample_input,
+	// get_config, list_rule_groups, get_rule_group. No write tools at all.
+	toolModeQuery toolMode = "query"
 
-// registerTools wires this handler's full tool surface (today, toolModeRules
-// — the only mode phase 1b builds) into srv. Kept as a thin alias over
-// registerToolsForMode so the two existing call sites (mcp.go's runMCP,
-// serve.go's newWorkbench) don't need to change when a later phase adds a
-// real mode argument at those sites.
+	// toolModeRules is Query Mode's surface plus rule-group CRUD
+	// (put_rule_group, delete_rule_group) — design decision 5's "Rules
+	// Mode" bullet. It does NOT get schema CRUD (that is Facts Mode's).
+	toolModeRules toolMode = "rules"
+
+	// toolModeFacts is oriented entirely around producing facts from JSONL
+	// extraction mappings (design decision 5's "Facts Mode" bullet):
+	// sample_input, schema CRUD (put/delete source/matcher/declaration),
+	// get_config, list_predicates, sample_facts. No query/explain/
+	// explain_fact/predicate_deps/rule tools — Facts Mode verifies
+	// extraction output without touching datalog semantics.
+	toolModeFacts toolMode = "facts"
+)
+
+// registerTools wires this handler's full tool surface — every tool this
+// package exposes, spanning all three modes — into srv. This backs the two
+// pre-conversation-manager call sites that predate per-conversation mode
+// choice (mcp.go's runMCP stdio server and serve.go's newWorkbench, both of
+// which serve a single implicit session with no mode picker): they get
+// everything, matching their pre-phase-2 behavior byte for byte. The
+// conversation manager (conversation.go) calls registerToolsForMode
+// directly with the conversation's own mode instead of going through this
+// alias.
 func (h *mcpHandlers) registerTools(srv *server.MCPServer) {
-	h.registerToolsForMode(srv, toolModeRules)
+	h.registerFactsReadSet(srv)
+	h.registerQueryOnlySet(srv)
+	h.registerRulesWriteSet(srv)
+	h.registerSchemaWriteSet(srv)
 }
 
 // registerToolsForMode wires the mode-appropriate subset of typed handler
@@ -412,255 +427,268 @@ func (h *mcpHandlers) registerTools(srv *server.MCPServer) {
 // binds incoming arguments to that struct and serializes the returned
 // struct as the tool's structured result.
 //
-// The registration list is split into two named groups per design decision
-// 5, even though today only one mode (toolModeRules, "everything") exists to
-// select between them: querySet is the read/query surface every mode gets
-// (query, list_predicates, sample_facts, explain, describe, sample_input,
-// plus the new rule-group reads list_rule_groups/get_rule_group), and
-// rulesWriteSet is the rule-group CRUD surface (put_rule_group,
-// delete_rule_group) that only Rules Mode gets. Splitting the func body this
-// way now — rather than one flat call list — is what makes a later mode
-// addition (Query Mode registering only querySet, Facts Mode registering
-// neither set here) a small diff instead of a rewrite.
+// The registration methods below are named and cut exactly to the task
+// brief's per-mode golden lists (doc/features/workbench-v2.md design
+// decision 5), so a future tool lands in exactly one mode's method body —
+// there is no shared "everything" closure left to silently carry a new tool
+// into a mode it does not belong in.
 func (h *mcpHandlers) registerToolsForMode(srv *server.MCPServer, mode toolMode) {
-	registerQuerySet := func() {
-		srv.AddTool(
-			mcp.NewTool("query",
-				mcp.WithDescription(mcpQueryDescription(h.timeout)),
-				mcp.WithInputSchema[queryInput](),
-			),
-			// No h.mu here: query manages the lock itself, holding it only for
-			// the state snapshot so a long-running Transform does not freeze
-			// the other tools or the workbench panes that share this mutex.
-			mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in queryInput) (queryOutput, error) {
-				return h.query(ctx, in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("list_predicates",
-				mcp.WithDescription(mcpListPredicatesDescription),
-				mcp.WithInputSchema[listPredicatesInput](),
-			),
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in listPredicatesInput) (listPredicatesOutput, error) {
-				h.mu.Lock()
-				defer h.mu.Unlock()
-				return h.listPredicates(in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("sample_facts",
-				mcp.WithDescription(mcpSampleFactsDescription),
-				mcp.WithInputSchema[sampleFactsInput](),
-			),
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in sampleFactsInput) (sampleFactsOutput, error) {
-				h.mu.Lock()
-				defer h.mu.Unlock()
-				return h.sampleFacts(in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("explain",
-				mcp.WithDescription(mcpExplainDescription),
-				mcp.WithInputSchema[explainInput](),
-			),
-			// No h.mu here: explain manages its own locking via
-			// lockedSnapshot-style capture inside h.explain, for the same reason
-			// query does — resolving/computing a fixpoint can take a while and
-			// must not freeze every other tool call or workbench pane.
-			mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in explainInput) (explainOutput, error) {
-				return h.explain(ctx, in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("describe",
-				mcp.WithDescription(mcpDescribeDescription),
-				mcp.WithInputSchema[describeInput](),
-			),
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in describeInput) (describeOutput, error) {
-				h.mu.Lock()
-				defer h.mu.Unlock()
-				return h.describe(in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("sample_input",
-				mcp.WithDescription(mcpSampleInputDescription),
-				mcp.WithInputSchema[sampleInputInput](),
-			),
-			// No h.mu here: sample_input only ever reads h.fsys/h.confine, both
-			// immutable after construction (never reassigned), and touches no
-			// session state at all — see sampleInput's doc comment.
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in sampleInputInput) (sampleInputOutput, error) {
-				return h.sampleInput(in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("list_rule_groups",
-				mcp.WithDescription(mcpListRuleGroupsDescription),
-				mcp.WithInputSchema[listRuleGroupsInput](),
-			),
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in listRuleGroupsInput) (listRuleGroupsOutput, error) {
-				h.mu.Lock()
-				defer h.mu.Unlock()
-				return h.listRuleGroups(in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("get_rule_group",
-				mcp.WithDescription(mcpGetRuleGroupDescription),
-				mcp.WithInputSchema[getRuleGroupInput](),
-			),
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in getRuleGroupInput) (getRuleGroupOutput, error) {
-				h.mu.Lock()
-				defer h.mu.Unlock()
-				return h.getRuleGroup(in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("get_config",
-				mcp.WithDescription(mcpGetConfigDescription),
-				mcp.WithInputSchema[getConfigInput](),
-			),
-			// h.getConfig takes h.mu itself (read-only, cheap — no Transform).
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in getConfigInput) (getConfigOutput, error) {
-				return h.getConfig(in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("predicate_deps",
-				mcp.WithDescription(mcpPredicateDepsDescription),
-				mcp.WithInputSchema[predicateDepsInput](),
-			),
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in predicateDepsInput) (predicateDepsOutput, error) {
-				return h.predicateDeps(in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("explain_fact",
-				mcp.WithDescription(mcpExplainFactDescription),
-				mcp.WithInputSchema[explainFactInput](),
-			),
-			// No h.mu here: explainFact manages its own locking, mirroring
-			// explain's lock-free-Transform-then-writeback split.
-			mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in explainFactInput) (explainFactOutput, error) {
-				return h.explainFact(ctx, in)
-			}),
-		)
-	}
-
-	registerRulesWriteSet := func() {
-		srv.AddTool(
-			mcp.NewTool("put_rule_group",
-				mcp.WithDescription(mcpPutRuleGroupDescription),
-				mcp.WithInputSchema[putRuleGroupInput](),
-			),
-			// h.mu held for the whole call (design decision 4: "Writes happen
-			// under h.mu like the old set_rules did — rule compiles are fast").
-			// Unlike set_schema's data reload (which can be slow enough to be
-			// worth a lock-free prepare phase), a rule group's parse + trial
-			// Compile + file write is fast, so there is no lock-free half worth
-			// splitting out here.
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putRuleGroupInput) (putRuleGroupOutput, error) {
-				h.mu.Lock()
-				defer h.mu.Unlock()
-				return h.putRuleGroup(in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("delete_rule_group",
-				mcp.WithDescription(mcpDeleteRuleGroupDescription),
-				mcp.WithInputSchema[deleteRuleGroupInput](),
-			),
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteRuleGroupInput) (deleteRuleGroupOutput, error) {
-				h.mu.Lock()
-				defer h.mu.Unlock()
-				return h.deleteRuleGroup(in)
-			}),
-		)
-	}
-
-	// registerSchemaWriteSet is the schema CRUD surface (design decision 4's
-	// schema half; schema_crud.go): put_source/delete_source,
-	// put_matcher/delete_matcher, put_declaration/delete_declaration. This is
-	// today registered alongside rulesWriteSet under toolModeRules (design
-	// decision 10: "toolModeRules currently registers everything"); it is
-	// Facts Mode's future surface (design decision 5's "Facts Mode" bullet),
-	// which will register this set WITHOUT registerRulesWriteSet once modes
-	// are user-visible.
-	//
-	// Each write method manages its own locking (unlike put_rule_group's
-	// whole-call h.mu): a schema write's prepareSchema half can be slow
-	// (a full data reload), so — exactly like set_schema before it — the
-	// lock is only taken for the cheap staleness-check-and-swap, never
-	// across the reload itself. See schema_crud.go's commitSchemaWrite.
-	registerSchemaWriteSet := func() {
-		srv.AddTool(
-			mcp.NewTool("put_source",
-				mcp.WithDescription(mcpPutSourceDescription),
-				mcp.WithInputSchema[putSourceInput](),
-			),
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putSourceInput) (putSourceOutput, error) {
-				return h.putSource(in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("delete_source",
-				mcp.WithDescription(mcpDeleteSourceDescription),
-				mcp.WithInputSchema[deleteSourceInput](),
-			),
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteSourceInput) (deleteSourceOutput, error) {
-				return h.deleteSource(in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("put_matcher",
-				mcp.WithDescription(mcpPutMatcherDescription),
-				mcp.WithInputSchema[putMatcherInput](),
-			),
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putMatcherInput) (putMatcherOutput, error) {
-				return h.putMatcher(in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("delete_matcher",
-				mcp.WithDescription(mcpDeleteMatcherDescription),
-				mcp.WithInputSchema[deleteMatcherInput](),
-			),
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteMatcherInput) (deleteMatcherOutput, error) {
-				return h.deleteMatcher(in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("put_declaration",
-				mcp.WithDescription(mcpPutDeclarationDescription),
-				mcp.WithInputSchema[putDeclarationInput](),
-			),
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putDeclarationInput) (putDeclarationOutput, error) {
-				return h.putDeclaration(in)
-			}),
-		)
-		srv.AddTool(
-			mcp.NewTool("delete_declaration",
-				mcp.WithDescription(mcpDeleteDeclarationDescription),
-				mcp.WithInputSchema[deleteDeclarationInput](),
-			),
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteDeclarationInput) (deleteDeclarationOutput, error) {
-				return h.deleteDeclaration(in)
-			}),
-		)
-	}
-
 	switch mode {
+	case toolModeQuery:
+		h.registerFactsReadSet(srv)
+		h.registerQueryOnlySet(srv)
 	case toolModeRules:
-		registerQuerySet()
-		registerRulesWriteSet()
-		registerSchemaWriteSet()
+		h.registerFactsReadSet(srv)
+		h.registerQueryOnlySet(srv)
+		h.registerRulesWriteSet(srv)
+	case toolModeFacts:
+		h.registerFactsReadSet(srv)
+		h.registerSchemaWriteSet(srv)
 	default:
-		// No other mode exists yet (see toolMode's doc comment) — an unknown
-		// mode value is a programming error in this package, not a runtime
-		// condition a caller can trigger, so it registers nothing rather than
-		// guessing at a fallback surface.
+		// An unknown mode value is a programming error in this package, not
+		// a runtime condition a caller can trigger, so it registers nothing
+		// rather than guessing at a fallback surface.
 	}
+}
+
+// registerFactsReadSet wires the reads every mode gets, including Facts
+// Mode (design decision 5's "Facts Mode" bullet: "list_predicates and
+// sample_facts to verify what its mappings produced"): sample_input,
+// list_predicates, sample_facts, get_config. Query and Rules Mode layer
+// registerQueryOnlySet on top; Facts Mode does not.
+func (h *mcpHandlers) registerFactsReadSet(srv *server.MCPServer) {
+	srv.AddTool(
+		mcp.NewTool("sample_input",
+			mcp.WithDescription(mcpSampleInputDescription),
+			mcp.WithInputSchema[sampleInputInput](),
+		),
+		// No h.mu here: sample_input only ever reads h.fsys/h.confine, both
+		// immutable after construction (never reassigned), and touches no
+		// session state at all — see sampleInput's doc comment.
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in sampleInputInput) (sampleInputOutput, error) {
+			return h.sampleInput(in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("list_predicates",
+			mcp.WithDescription(mcpListPredicatesDescription),
+			mcp.WithInputSchema[listPredicatesInput](),
+		),
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in listPredicatesInput) (listPredicatesOutput, error) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return h.listPredicates(in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("sample_facts",
+			mcp.WithDescription(mcpSampleFactsDescription),
+			mcp.WithInputSchema[sampleFactsInput](),
+		),
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in sampleFactsInput) (sampleFactsOutput, error) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return h.sampleFacts(in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("get_config",
+			mcp.WithDescription(mcpGetConfigDescription),
+			mcp.WithInputSchema[getConfigInput](),
+		),
+		// h.getConfig takes h.mu itself (read-only, cheap — no Transform).
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in getConfigInput) (getConfigOutput, error) {
+			return h.getConfig(in)
+		}),
+	)
+}
+
+// registerQueryOnlySet wires the rest of Query Mode's surface — the tools
+// Facts Mode deliberately does NOT get (design decision 5: "No
+// query/explain — it verifies extraction output without touching datalog
+// semantics"): query, explain, describe, predicate_deps, explain_fact,
+// list_rule_groups, get_rule_group. Query and Rules Mode both register this
+// alongside registerFactsReadSet.
+func (h *mcpHandlers) registerQueryOnlySet(srv *server.MCPServer) {
+	srv.AddTool(
+		mcp.NewTool("query",
+			mcp.WithDescription(mcpQueryDescription(h.timeout)),
+			mcp.WithInputSchema[queryInput](),
+		),
+		// No h.mu here: query manages the lock itself, holding it only for
+		// the state snapshot so a long-running Transform does not freeze
+		// the other tools or the workbench panes that share this mutex.
+		mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in queryInput) (queryOutput, error) {
+			return h.query(ctx, in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("explain",
+			mcp.WithDescription(mcpExplainDescription),
+			mcp.WithInputSchema[explainInput](),
+		),
+		// No h.mu here: explain manages its own locking via
+		// lockedSnapshot-style capture inside h.explain, for the same reason
+		// query does — resolving/computing a fixpoint can take a while and
+		// must not freeze every other tool call or workbench pane.
+		mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in explainInput) (explainOutput, error) {
+			return h.explain(ctx, in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("describe",
+			mcp.WithDescription(mcpDescribeDescription),
+			mcp.WithInputSchema[describeInput](),
+		),
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in describeInput) (describeOutput, error) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return h.describe(in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("list_rule_groups",
+			mcp.WithDescription(mcpListRuleGroupsDescription),
+			mcp.WithInputSchema[listRuleGroupsInput](),
+		),
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in listRuleGroupsInput) (listRuleGroupsOutput, error) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return h.listRuleGroups(in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("get_rule_group",
+			mcp.WithDescription(mcpGetRuleGroupDescription),
+			mcp.WithInputSchema[getRuleGroupInput](),
+		),
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in getRuleGroupInput) (getRuleGroupOutput, error) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return h.getRuleGroup(in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("predicate_deps",
+			mcp.WithDescription(mcpPredicateDepsDescription),
+			mcp.WithInputSchema[predicateDepsInput](),
+		),
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in predicateDepsInput) (predicateDepsOutput, error) {
+			return h.predicateDeps(in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("explain_fact",
+			mcp.WithDescription(mcpExplainFactDescription),
+			mcp.WithInputSchema[explainFactInput](),
+		),
+		// No h.mu here: explainFact manages its own locking, mirroring
+		// explain's lock-free-Transform-then-writeback split.
+		mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in explainFactInput) (explainFactOutput, error) {
+			return h.explainFact(ctx, in)
+		}),
+	)
+}
+
+// registerRulesWriteSet is the rule-group CRUD surface (put_rule_group,
+// delete_rule_group) that only Rules Mode gets (design decision 5).
+func (h *mcpHandlers) registerRulesWriteSet(srv *server.MCPServer) {
+	srv.AddTool(
+		mcp.NewTool("put_rule_group",
+			mcp.WithDescription(mcpPutRuleGroupDescription),
+			mcp.WithInputSchema[putRuleGroupInput](),
+		),
+		// h.mu held for the whole call (design decision 4: "Writes happen
+		// under h.mu like the old set_rules did — rule compiles are fast").
+		// Unlike set_schema's data reload (which can be slow enough to be
+		// worth a lock-free prepare phase), a rule group's parse + trial
+		// Compile + file write is fast, so there is no lock-free half worth
+		// splitting out here.
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putRuleGroupInput) (putRuleGroupOutput, error) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return h.putRuleGroup(in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("delete_rule_group",
+			mcp.WithDescription(mcpDeleteRuleGroupDescription),
+			mcp.WithInputSchema[deleteRuleGroupInput](),
+		),
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteRuleGroupInput) (deleteRuleGroupOutput, error) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return h.deleteRuleGroup(in)
+		}),
+	)
+}
+
+// registerSchemaWriteSet is the schema CRUD surface (design decision 4's
+// schema half; schema_crud.go): put_source/delete_source,
+// put_matcher/delete_matcher, put_declaration/delete_declaration. This is
+// Facts Mode's surface (design decision 5's "Facts Mode" bullet) — Query
+// and Rules Mode never register it.
+//
+// Each write method manages its own locking (unlike put_rule_group's
+// whole-call h.mu): a schema write's prepareSchema half can be slow
+// (a full data reload), so — exactly like set_schema before it — the
+// lock is only taken for the cheap staleness-check-and-swap, never
+// across the reload itself. See schema_crud.go's commitSchemaWrite.
+func (h *mcpHandlers) registerSchemaWriteSet(srv *server.MCPServer) {
+	srv.AddTool(
+		mcp.NewTool("put_source",
+			mcp.WithDescription(mcpPutSourceDescription),
+			mcp.WithInputSchema[putSourceInput](),
+		),
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putSourceInput) (putSourceOutput, error) {
+			return h.putSource(in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("delete_source",
+			mcp.WithDescription(mcpDeleteSourceDescription),
+			mcp.WithInputSchema[deleteSourceInput](),
+		),
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteSourceInput) (deleteSourceOutput, error) {
+			return h.deleteSource(in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("put_matcher",
+			mcp.WithDescription(mcpPutMatcherDescription),
+			mcp.WithInputSchema[putMatcherInput](),
+		),
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putMatcherInput) (putMatcherOutput, error) {
+			return h.putMatcher(in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("delete_matcher",
+			mcp.WithDescription(mcpDeleteMatcherDescription),
+			mcp.WithInputSchema[deleteMatcherInput](),
+		),
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteMatcherInput) (deleteMatcherOutput, error) {
+			return h.deleteMatcher(in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("put_declaration",
+			mcp.WithDescription(mcpPutDeclarationDescription),
+			mcp.WithInputSchema[putDeclarationInput](),
+		),
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putDeclarationInput) (putDeclarationOutput, error) {
+			return h.putDeclaration(in)
+		}),
+	)
+	srv.AddTool(
+		mcp.NewTool("delete_declaration",
+			mcp.WithDescription(mcpDeleteDeclarationDescription),
+			mcp.WithInputSchema[deleteDeclarationInput](),
+		),
+		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteDeclarationInput) (deleteDeclarationOutput, error) {
+			return h.deleteDeclaration(in)
+		}),
+	)
 }
 
 // -- schema output shapes -------------------------------------------------

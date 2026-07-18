@@ -176,6 +176,24 @@ func newWorkbench(dataDir, configPath string, ruleFiles []string, rulesDir strin
 		mcpToken:    token,
 		pendingPerm: map[string]pendingPermission{},
 	}
+	wb.turnGate = newConversationTurnGate(wb.jobs)
+
+	// Conversation manager (doc/features/workbench-v2.md design decision 6):
+	// rooted at .datalog/sessions beside the schema file (or the rules
+	// directory, or cwd — see conversationSessionsDir). Phase 2a wires the
+	// manager onto the workbench so it is reachable and testable end to
+	// end; no route yet calls it (this task's brief: "do NOT rebuild any
+	// UI" — the v1 Agent tab is untouched). A failure here is non-fatal and
+	// logged rather than aborting startup: it would only block the
+	// not-yet-built conversation UI, and the v1 tab must keep working
+	// regardless.
+	if convDir, err := conversationSessionsDir(configPath, rulesDir); err != nil {
+		fmt.Fprintf(os.Stderr, "datalog serve: conversation directory: %v\n", err)
+	} else if cm, err := newConversationManager(convDir); err != nil {
+		fmt.Fprintf(os.Stderr, "datalog serve: conversation directory: %v\n", err)
+	} else {
+		wb.conversations = cm
+	}
 
 	// The patch-back seam (doc/features/web-ui.md Deployment section): an
 	// agent mutating via /mcp must repaint the human's browser. onChange
@@ -353,6 +371,17 @@ type workbench struct {
 	agentMu  sync.Mutex
 	agent    agentDriver
 	agentCfg agentConfig
+
+	// conversations is the phase-2 conversation manager (conversation.go,
+	// doc/features/workbench-v2.md design decision 6), nil only if its
+	// directory could not be created at startup (see newWorkbench). turnGate
+	// is the global one-turn-at-a-time gate every conversation's prompt path
+	// acquires before running, sharing jobs (the SAME *jobs the v1 Agent tab
+	// and the fsnotify watcher's re-evaluation register under, so Global
+	// Cancel reaches a conversation turn too) so its "busy" state rides the
+	// existing $busy machinery rather than a parallel mechanism.
+	conversations *conversationManager
+	turnGate      *conversationTurnGate
 
 	// permMu guards pendingPerm, the RequestID→pendingPermission map a
 	// running turn's sink populates (agent.go's runAgentTurn) and
