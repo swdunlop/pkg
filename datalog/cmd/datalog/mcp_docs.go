@@ -392,10 +392,10 @@ const mcpDatalogSyntaxSummary = `Datalog syntax summary:
 // design decision 4).
 const mcpPutRuleGroupDescription = `Create or replace ONE rule group: every statement sharing one head
 predicate/arity, e.g. every rule (and fact) whose head is alert/2. Part of
-the workflow loop: after set_schema produces the predicates you need,
-write one or more rule groups deriving higher-level observations from
-them, then use the query tool to inspect results and iterate here on
-parse/compile errors.
+the workflow loop: after the schema tools (put_source/put_matcher/
+put_declaration) produce the predicates you need, write one or more rule
+groups deriving higher-level observations from them, then use the query
+tool to inspect results and iterate here on parse/compile errors.
 
 ` + mcpDatalogSyntaxSummary + `
 
@@ -477,9 +477,10 @@ what's on disk right now, including comments and formatting).`
 func mcpQueryDescription(timeout time.Duration) string {
 	return `Evaluate one Datalog query against the current schema + rules + loaded
 data, and return matching rows plus per-stratum evaluation stats. This is
-the last step of the workflow loop: sample_input -> set_schema (check fact
-counts) -> put_rule_group (check parse/compile errors) -> query (check
-results and stats, then go back and adjust schema/rules as needed).
+the last step of the workflow loop: sample_input -> put_source/put_matcher/
+put_declaration (check fact counts) -> put_rule_group (check parse/compile
+errors) -> query (check results and stats, then go back and adjust
+schema/rules as needed).
 
 ` + mcpDatalogSyntaxSummary + `
 
@@ -555,12 +556,12 @@ reported at the top level.`
 
 // mcpListPredicatesDescription documents list_predicates.
 const mcpListPredicatesDescription = `List every predicate currently known to the session: predicates loaded
-from data (via set_schema) and predicates defined by rules (via
-put_rule_group or the rules the operator loaded at startup), together with
-their arity, current fact count, and - when the schema declared it - a
-human-readable "use" description. Call this to get an overview before
-writing rules or queries, or after set_schema/put_rule_group to confirm
-what changed.`
+from data (via the schema's sources/matchers) and predicates defined by
+rules (via put_rule_group or the rules the operator loaded at startup),
+together with their arity, current fact count, and - when the schema
+declared it - a human-readable "use" description. Call this to get an
+overview before writing rules or queries, or after a schema or rule-group
+write to confirm what changed.`
 
 // mcpDescribeDescription documents describe.
 const mcpDescribeDescription = `Describe one predicate by name: everything known about it, across every
@@ -608,9 +609,9 @@ query against a predicate.`
 // mcpSampleInputDescription documents sample_input.
 const mcpSampleInputDescription = `Read raw lines from a file in the operator's data directory, or - when
 "file" is omitted - list the files available there. This is the first
-step of the workflow loop: look at raw records before writing a
-set_schema mapping, so field names in "args"/"expr" expressions
-(value.foo, value.bar.baz, ...) are not guesses.
+step of the workflow loop: look at raw records before writing a source
+mapping (put_source) or matcher (put_matcher), so field names in
+"args"/"expr" expressions (value.foo, value.bar.baz, ...) are not guesses.
 
 With "file" set: returns up to "limit" lines (default 10) starting at
 0-based line "offset" (default 0). Individual lines longer than about
