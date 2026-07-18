@@ -68,6 +68,62 @@ func matchPred(base string, ci, wd bool) string {
 	return prefix + base
 }
 
+// Base64/CIDR emit fixed predicate names: no ci_/wd_ prefixes ever apply
+// (base64 search strings are case-significant by construction, and CIDR
+// containment has no case or windash notion).
+const (
+	base64ContainsPredicate      = "base64_contains"
+	base64UTF16ContainsPredicate = "base64_utf16le_contains"
+	cidrMatchPredicate           = "cidr_match"
+)
+
+// Per-kind produced predicate names. compileMatchers and
+// ProducedPredicates both go through these, so the emit-time naming and
+// the statically reported naming cannot drift. Note the per-kind quirks:
+// ends_with and regex_match never take the wd_ prefix (windash expansion
+// only applies to contains/starts_with).
+func (m Matcher) containsPredicate() string   { return matchPred("contains", m.CaseInsensitive, m.Windash) }
+func (m Matcher) startsWithPredicate() string { return matchPred("starts_with", m.CaseInsensitive, m.Windash) }
+func (m Matcher) endsWithPredicate() string   { return matchPred("ends_with", m.CaseInsensitive, false) }
+func (m Matcher) regexMatchPredicate() string { return matchPred("regex_match", m.CaseInsensitive, false) }
+
+// ProducedPredicates returns the names of the predicates this matcher
+// emits facts for — one per populated pattern kind, every one of arity 2
+// (value, pattern). This is the single source of truth for matcher output
+// naming: a matcher CONSUMES its configured (Predicate, Term) and
+// PRODUCES these match-kind predicates, never its own Predicate. Static
+// dependency analysis (cmd/datalog's predicate_deps/explain_fact) must
+// use this rather than re-deriving the naming table. A kind counts as
+// populated if its inline pattern list is non-empty OR its unresolved
+// *_from field still names a pattern file (resolution appends into the
+// inline list and clears the field, so post-resolution only the list
+// matters).
+func (m Matcher) ProducedPredicates() []string {
+	var out []string
+	if len(m.Contains) > 0 || m.ContainsFrom != "" {
+		out = append(out, m.containsPredicate())
+	}
+	if len(m.StartsWith) > 0 || m.StartsWithFrom != "" {
+		out = append(out, m.startsWithPredicate())
+	}
+	if len(m.EndsWith) > 0 || m.EndsWithFrom != "" {
+		out = append(out, m.endsWithPredicate())
+	}
+	if len(m.RegexMatch) > 0 || m.RegexMatchFrom != "" {
+		out = append(out, m.regexMatchPredicate())
+	}
+	if len(m.Base64) > 0 || m.Base64From != "" {
+		out = append(out, base64ContainsPredicate)
+	}
+	if len(m.Base64UTF16) > 0 || m.Base64UTF16From != "" {
+		out = append(out, base64UTF16ContainsPredicate)
+	}
+	if len(m.CIDR) > 0 || m.CIDRFrom != "" {
+		out = append(out, cidrMatchPredicate)
+	}
+	return out
+}
+
 func expandWindash(pattern string) (string, bool) {
 	if len(pattern) == 0 {
 		return "", false
@@ -120,10 +176,10 @@ func compileMatchers(matchers []Matcher, onWarning func(error)) ([]compiledMatch
 			predicate:       mc.Predicate,
 			term:            mc.Term,
 			caseInsensitive: mc.CaseInsensitive,
-			containsPred:    matchPred("contains", mc.CaseInsensitive, mc.Windash),
-			startsWithPred:  matchPred("starts_with", mc.CaseInsensitive, mc.Windash),
-			endsWithPred:    matchPred("ends_with", mc.CaseInsensitive, false),
-			regexMatchPred:  matchPred("regex_match", mc.CaseInsensitive, false),
+			containsPred:    mc.containsPredicate(),
+			startsWithPred:  mc.startsWithPredicate(),
+			endsWithPred:    mc.endsWithPredicate(),
+			regexMatchPred:  mc.regexMatchPredicate(),
 		}
 
 		ci := mc.CaseInsensitive
@@ -226,10 +282,10 @@ func compileMatchers(matchers []Matcher, onWarning func(error)) ([]compiledMatch
 
 		var allBase64 []base64Variant
 		if len(mc.Base64) > 0 {
-			allBase64 = append(allBase64, compileBase64Patterns(mc.Base64, false, "base64_contains")...)
+			allBase64 = append(allBase64, compileBase64Patterns(mc.Base64, false, base64ContainsPredicate)...)
 		}
 		if len(mc.Base64UTF16) > 0 {
-			allBase64 = append(allBase64, compileBase64Patterns(mc.Base64UTF16, true, "base64_utf16le_contains")...)
+			allBase64 = append(allBase64, compileBase64Patterns(mc.Base64UTF16, true, base64UTF16ContainsPredicate)...)
 		}
 		if len(allBase64) > 0 {
 			cm.base64Variants = allBase64
@@ -458,7 +514,7 @@ func applyMatchers(facts []datalog.Fact, matchers []Matcher, onWarning func(erro
 					if err == nil {
 						for j, prefix := range cm.cidrNetworks {
 							if prefix.Contains(addr) {
-								emit("cidr_match", s, cm.cidrNetworkStrs[j])
+								emit(cidrMatchPredicate, s, cm.cidrNetworkStrs[j])
 							}
 						}
 					}

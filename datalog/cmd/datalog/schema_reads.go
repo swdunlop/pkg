@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 
 	"swdunlop.dev/pkg/datalog"
@@ -97,15 +98,24 @@ type ruleGroupAddress struct {
 	File  string `json:"file,omitempty"`
 }
 
-// matcherRef names one schema matcher that could produce facts for a base
-// predicate: its full key tuple plus current revision, the same shape
-// put_matcher/delete_matcher key on.
+// matcherRef names one schema matcher: its full key tuple plus current
+// revision, the same shape put_matcher/delete_matcher key on. The key's
+// Predicate/Term is the (predicate, term) the matcher READS — so when a
+// matcherRef appears as a producer of some match-kind predicate (e.g.
+// contains/2), Predicate/Term here name the upstream source it scanned,
+// which is exactly the annotation a why-walk needs to keep going.
 type matcherRef struct {
 	Predicate       string `json:"predicate"`
 	Term            int    `json:"term"`
 	CaseInsensitive bool   `json:"case_insensitive,omitempty"`
 	Windash         bool   `json:"windash,omitempty"`
 	Revision        int    `json:"revision"`
+
+	// Produces lists the arity-2 match-kind predicates this matcher emits
+	// (jsonfacts.Matcher.ProducedPredicates), so an agent holding either
+	// end of the edge can navigate to the other without knowing the
+	// matcher naming rules.
+	Produces []string `json:"produces,omitempty"`
 }
 
 // declarationRef names the schema declaration for a base predicate, if any.
@@ -120,21 +130,25 @@ type predicateDepsOutput struct {
 	// the rule groups whose HEAD is this predicate/arity (each such rule's
 	// body predicates are what it depends on, but the address returned here
 	// is the group producing THIS predicate, exactly as list_rule_groups/
-	// get_rule_group key a group), plus, for a base predicate, the schema
-	// matchers/declarations that produce it. A predicate that is both
-	// base-loaded AND rule-derived (unusual, but not rejected anywhere else
-	// in this codebase) reports both.
+	// get_rule_group key a group), plus the schema matchers that PRODUCE
+	// it: a matcher consumes its configured (predicate, term) and emits
+	// arity-2 match-kind facts (contains/2, regex_match/2, ... — see
+	// jsonfacts.Matcher.ProducedPredicates), so it appears here only for
+	// those match-kind predicates at arity 2, never for the predicate it
+	// reads. Each matcherRef's own Predicate/Term name the source it read.
+	// A predicate produced by several of these at once (rules + matchers +
+	// a source mapping sharing the name) reports all of them.
 	DependsOnGroups   []ruleGroupAddress `json:"depends_on_groups,omitempty"`
 	DependsOnMatchers []matcherRef       `json:"depends_on_matchers,omitempty"`
 	Declaration       *declarationRef    `json:"declaration,omitempty"`
 
 	// DependedOnBy: every rule group whose BODY references this predicate
 	// (in any position, including a negated atom or an aggregate rule's
-	// body) — matchers never depend on predicates the way rules do (a
-	// matcher only ever reads ITS OWN configured predicate/term, never
-	// another predicate's output), so this list is rule-group addresses
-	// only, per design decision 8's "matchers never depend on predicates."
-	DependedOnBy []ruleGroupAddress `json:"depended_on_by,omitempty"`
+	// body), plus every matcher that READS it — a matcher with Predicate ==
+	// this name consumes term Term of its facts, so it is a downstream
+	// consumer at any arity where that term exists (arity > Term).
+	DependedOnBy         []ruleGroupAddress `json:"depended_on_by,omitempty"`
+	DependedOnByMatchers []matcherRef       `json:"depended_on_by_matchers,omitempty"`
 }
 
 // predicateDeps performs static dependency analysis over the loaded rules
@@ -175,14 +189,23 @@ func (h *mcpHandlers) predicateDeps(in predicateDepsInput) (predicateDepsOutput,
 		}
 	}
 
-	// Base-side production: schema matchers/declaration for this predicate.
+	// Matcher edges, both directions. A matcher is a PRODUCER of its
+	// arity-2 match-kind predicates (ProducedPredicates) and a CONSUMER of
+	// its configured (Predicate, Term) — never a producer of the predicate
+	// it reads. See doc/features/predicate-deps-matcher-direction.md for
+	// the why-walk this orientation serves.
 	for _, m := range h.sess.authoringCfg.Matchers {
-		if m.Predicate == name {
-			key := matcherKeyOf(m)
-			out.DependsOnMatchers = append(out.DependsOnMatchers, matcherRef{
-				Predicate: m.Predicate, Term: m.Term, CaseInsensitive: m.CaseInsensitive, Windash: m.Windash,
-				Revision: h.schemaRev.matchers[key],
-			})
+		produced := m.ProducedPredicates()
+		ref := matcherRef{
+			Predicate: m.Predicate, Term: m.Term, CaseInsensitive: m.CaseInsensitive, Windash: m.Windash,
+			Revision: h.schemaRev.matchers[matcherKeyOf(m)],
+			Produces: produced,
+		}
+		if arity == 2 && slices.Contains(produced, name) {
+			out.DependsOnMatchers = append(out.DependsOnMatchers, ref)
+		}
+		if m.Predicate == name && arity > m.Term {
+			out.DependedOnByMatchers = append(out.DependedOnByMatchers, ref)
 		}
 	}
 	if d, ok := findDeclaration(h.sess.authoringCfg.Declarations, declarationKey{Name: name, Arity: arity}); ok {
@@ -218,7 +241,8 @@ func (h *mcpHandlers) predicateDeps(in predicateDepsInput) (predicateDepsOutput,
 		}
 	}
 
-	if len(out.DependsOnGroups) == 0 && len(out.DependsOnMatchers) == 0 && out.Declaration == nil && len(out.DependedOnBy) == 0 {
+	if len(out.DependsOnGroups) == 0 && len(out.DependsOnMatchers) == 0 && out.Declaration == nil &&
+		len(out.DependedOnBy) == 0 && len(out.DependedOnByMatchers) == 0 {
 		// Mirror describe's "no such predicate" gate (describe.go) rather
 		// than silently returning an all-empty struct: an unknown predicate
 		// name/arity is far more likely a typo than a genuinely
@@ -233,17 +257,24 @@ func (h *mcpHandlers) predicateDeps(in predicateDepsInput) (predicateDepsOutput,
 
 	sortRuleGroupAddresses(out.DependsOnGroups)
 	sortRuleGroupAddresses(out.DependedOnBy)
-	sort.Slice(out.DependsOnMatchers, func(i, j int) bool {
-		return matcherKeyLess(jsonfacts.Matcher{
-			Predicate: out.DependsOnMatchers[i].Predicate, Term: out.DependsOnMatchers[i].Term,
-			CaseInsensitive: out.DependsOnMatchers[i].CaseInsensitive, Windash: out.DependsOnMatchers[i].Windash,
-		}, jsonfacts.Matcher{
-			Predicate: out.DependsOnMatchers[j].Predicate, Term: out.DependsOnMatchers[j].Term,
-			CaseInsensitive: out.DependsOnMatchers[j].CaseInsensitive, Windash: out.DependsOnMatchers[j].Windash,
-		})
-	})
+	sortMatcherRefs(out.DependsOnMatchers)
+	sortMatcherRefs(out.DependedOnByMatchers)
 
 	return out, nil
+}
+
+// sortMatcherRefs sorts in place by the matcher key tuple for
+// deterministic output — the same ordering serializeConfigYAML writes.
+func sortMatcherRefs(refs []matcherRef) {
+	sort.Slice(refs, func(i, j int) bool {
+		return matcherKeyLess(jsonfacts.Matcher{
+			Predicate: refs[i].Predicate, Term: refs[i].Term,
+			CaseInsensitive: refs[i].CaseInsensitive, Windash: refs[i].Windash,
+		}, jsonfacts.Matcher{
+			Predicate: refs[j].Predicate, Term: refs[j].Term,
+			CaseInsensitive: refs[j].CaseInsensitive, Windash: refs[j].Windash,
+		})
+	})
 }
 
 // predicateKnown mirrors describe.go's describe unknown-predicate gate: is
@@ -268,7 +299,14 @@ func predicateKnown(s *session, name string, arity int) bool {
 		}
 	}
 	for _, m := range s.authoringCfg.Matchers {
-		if m.Predicate == name {
+		// Known via a matcher in either direction, arity-consistent with
+		// predicateDeps: as the predicate a matcher reads (only at arities
+		// where its term exists), or as an arity-2 match-kind predicate it
+		// produces.
+		if m.Predicate == name && arity > m.Term {
+			return true
+		}
+		if arity == 2 && slices.Contains(m.ProducedPredicates(), name) {
 			return true
 		}
 	}
@@ -346,7 +384,7 @@ type explainFactOutput struct {
 
 	// -- Kind == "base" --
 	Declaration       *declarationRef `json:"declaration,omitempty"`        // the schema declaration for this predicate, if any
-	CandidateMatchers []matcherRef    `json:"candidate_matchers,omitempty"` // every matcher whose Predicate could have produced this fact (static: not narrowed to the exact source record — see doc comment)
+	CandidateMatchers []matcherRef    `json:"candidate_matchers,omitempty"` // every matcher that PRODUCES this fact's predicate, each keyed by the (predicate, term) it reads (static: not narrowed to the exact source record — see doc comment)
 }
 
 // explainFact resolves fact's post-hoc ONE-step derivation (design decision
@@ -358,11 +396,12 @@ type explainFactOutput struct {
 // again on a premise it wants to dig into — this tool never recurses
 // itself, unlike the `explain` tool's full ExplainTree); if base, "kind":
 // "base" plus the schema-side editable address: the declaration (if any)
-// and every matcher whose Predicate matches (a static, name-only match —
-// provenance to the EXACT source record that produced this specific base
-// fact is out of scope here, per the task brief: "do not build it" — a
-// base fact may have come from a plain source mapping with no matcher
-// involvement at all, in which case CandidateMatchers is simply empty).
+// and every matcher that produces this fact's predicate (a static match
+// on produced names — provenance to the EXACT source record that produced
+// this specific base fact is out of scope here, per the task brief: "do
+// not build it" — a base fact may have come from a plain source mapping
+// with no matcher involvement at all, in which case CandidateMatchers is
+// simply empty).
 //
 // Reuses the existing session.explainProvenance/Provenance.Explain
 // machinery (session.go, seminaive/provenance.go) — the SAME one-step
@@ -444,12 +483,16 @@ func (h *mcpHandlers) explainDerivedFactLocked(d seminaive.Derivation) explainFa
 }
 
 // explainBaseFactLocked builds explain_fact's "base" branch: the schema
-// declaration for this predicate (if any) and every matcher whose
-// Predicate field names it — a STATIC match over the schema's configured
-// matchers, not a trace back to which matcher (if any) actually produced
-// THIS fact from THIS source record; see explainFact's doc comment for why
-// that finer-grained provenance is explicitly out of scope. Callers must
-// hold h.mu.
+// declaration for this predicate (if any) and every matcher that PRODUCES
+// this fact's predicate — i.e. whose arity-2 match-kind output set
+// (jsonfacts.Matcher.ProducedPredicates) contains it, each reported with
+// the (predicate, term) it reads so the why-walk can continue upstream. A
+// plain source-mapped fact (e.g. event/3) lists no matchers: matchers
+// consume such predicates, they never produce them. This is a STATIC
+// match over the schema's configured matchers, not a trace back to which
+// matcher (if any) actually produced THIS fact from THIS source record;
+// see explainFact's doc comment for why that finer-grained provenance is
+// explicitly out of scope. Callers must hold h.mu.
 func (h *mcpHandlers) explainBaseFactLocked(fact datalog.Fact) explainFactOutput {
 	out := explainFactOutput{Exists: true, Kind: "base"}
 
@@ -457,25 +500,20 @@ func (h *mcpHandlers) explainBaseFactLocked(fact datalog.Fact) explainFactOutput
 		key := declarationKeyOf(*d)
 		out.Declaration = &declarationRef{Name: d.Name, Arity: len(fact.Terms), Revision: h.schemaRev.declarations[key]}
 	}
-	for _, m := range h.sess.authoringCfg.Matchers {
-		if m.Predicate != fact.Name {
-			continue
+	if len(fact.Terms) == 2 { // every matcher-produced fact is (value, pattern)
+		for _, m := range h.sess.authoringCfg.Matchers {
+			produced := m.ProducedPredicates()
+			if !slices.Contains(produced, fact.Name) {
+				continue
+			}
+			out.CandidateMatchers = append(out.CandidateMatchers, matcherRef{
+				Predicate: m.Predicate, Term: m.Term, CaseInsensitive: m.CaseInsensitive, Windash: m.Windash,
+				Revision: h.schemaRev.matchers[matcherKeyOf(m)],
+				Produces: produced,
+			})
 		}
-		key := matcherKeyOf(m)
-		out.CandidateMatchers = append(out.CandidateMatchers, matcherRef{
-			Predicate: m.Predicate, Term: m.Term, CaseInsensitive: m.CaseInsensitive, Windash: m.Windash,
-			Revision: h.schemaRev.matchers[key],
-		})
 	}
-	sort.Slice(out.CandidateMatchers, func(i, j int) bool {
-		return matcherKeyLess(jsonfacts.Matcher{
-			Predicate: out.CandidateMatchers[i].Predicate, Term: out.CandidateMatchers[i].Term,
-			CaseInsensitive: out.CandidateMatchers[i].CaseInsensitive, Windash: out.CandidateMatchers[i].Windash,
-		}, jsonfacts.Matcher{
-			Predicate: out.CandidateMatchers[j].Predicate, Term: out.CandidateMatchers[j].Term,
-			CaseInsensitive: out.CandidateMatchers[j].CaseInsensitive, Windash: out.CandidateMatchers[j].Windash,
-		})
-	})
+	sortMatcherRefs(out.CandidateMatchers)
 	return out
 }
 

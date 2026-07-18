@@ -1,9 +1,25 @@
 # predicate_deps / explain_fact model matcher dependency direction backwards
 
-Status: **analysis, not yet fixed.** Discovered 2026-07-18 while validating
-workbench-v2 phase 1c (commit 69560a8). Scott confirmed the feature's intent
-(why-trees). This note is self-contained so a fresh context can implement the
-fix without re-deriving anything.
+Status: **FIXED 2026-07-18** on `fix/phase1cd-validation`, per the
+Recommended fix below: `jsonfacts.Matcher.ProducedPredicates()` is the
+single source of truth for matcher output naming (compileMatchers and the
+emit sites share it; `TestProducedPredicatesMatchEmittedFacts` pins them
+together), `predicate_deps` reports matchers as producers of their
+match-kind predicates (arity 2) and as consumers under the new
+`depended_on_by_matchers` field, `explain_fact`'s base branch lists the
+matchers that PRODUCE the fact's predicate, and `predicateKnown` checks
+both directions with arity gates. Regressions:
+`TestPredicateDeps_MatcherDirection`,
+`TestPredicateDeps_ProducedPredicateKnownWithoutFacts`,
+`TestExplainFact_MatcherDirection`. One deviation from the analysis: the
+wrong wording quoted under "workbench-v2.md decision 8" actually lived in
+schema_reads.go/mcp_docs.go comments (corrected there);
+doc/features/workbench-v2.md itself contained neither statement.
+
+Originally discovered 2026-07-18 while validating workbench-v2 phase 1c
+(commit 69560a8). Scott confirmed the feature's intent (why-trees). This
+note was self-contained so a fresh context could implement the fix without
+re-deriving anything.
 
 ## TL;DR
 

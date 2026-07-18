@@ -1092,7 +1092,13 @@ func TestSerializeConfigYAML_StableAndSorted(t *testing.T) {
 
 // -- predicate_deps ------------------------------------------------------------
 
-func TestPredicateDeps_BaseWithMatcherAndDeclaration(t *testing.T) {
+// TestPredicateDeps_MatcherDirection pins the matcher dependency
+// orientation (doc/features/predicate-deps-matcher-direction.md): a
+// matcher on (event, term 2) CONSUMES event and PRODUCES contains/2, so
+// the why-walk from contains/2 must find it under DependsOnMatchers and
+// the walk from event/3 must see it only as a downstream consumer
+// (DependedOnByMatchers), never as a producer.
+func TestPredicateDeps_MatcherDirection(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 2)
 	h, _ := newSchemaCrudTestHandlers(t, dir, "")
@@ -1106,15 +1112,66 @@ func TestPredicateDeps_BaseWithMatcherAndDeclaration(t *testing.T) {
 		t.Fatalf("put_declaration: %v", err)
 	}
 
+	// The read predicate: the matcher is a consumer of event/3, not a producer.
 	out, err := h.predicateDeps(predicateDepsInput{Predicate: "event", Arity: 3})
 	if err != nil {
-		t.Fatalf("predicate_deps: %v", err)
+		t.Fatalf("predicate_deps (event/3): %v", err)
 	}
-	if len(out.DependsOnMatchers) != 1 || out.DependsOnMatchers[0].Predicate != "event" {
-		t.Errorf("predicate_deps: DependsOnMatchers = %+v, want one event matcher", out.DependsOnMatchers)
+	if len(out.DependsOnMatchers) != 0 {
+		t.Errorf("predicate_deps (event/3): DependsOnMatchers = %+v, want none — the matcher reads event, it does not produce it", out.DependsOnMatchers)
+	}
+	if len(out.DependedOnByMatchers) != 1 || out.DependedOnByMatchers[0].Predicate != "event" || out.DependedOnByMatchers[0].Term != 2 {
+		t.Errorf("predicate_deps (event/3): DependedOnByMatchers = %+v, want the (event, 2) matcher as a consumer", out.DependedOnByMatchers)
 	}
 	if out.Declaration == nil || out.Declaration.Name != "event" {
-		t.Errorf("predicate_deps: Declaration = %+v, want event/3", out.Declaration)
+		t.Errorf("predicate_deps (event/3): Declaration = %+v, want event/3", out.Declaration)
+	}
+
+	// The produced predicate: contains/2's producer is the matcher, reported
+	// with the source (predicate, term) it reads so the walk can continue.
+	dep, err := h.predicateDeps(predicateDepsInput{Predicate: "contains", Arity: 2})
+	if err != nil {
+		t.Fatalf("predicate_deps (contains/2): %v", err)
+	}
+	if len(dep.DependsOnMatchers) != 1 || dep.DependsOnMatchers[0].Predicate != "event" || dep.DependsOnMatchers[0].Term != 2 {
+		t.Fatalf("predicate_deps (contains/2): DependsOnMatchers = %+v, want the (event, 2) matcher as producer", dep.DependsOnMatchers)
+	}
+	if got := dep.DependsOnMatchers[0].Produces; len(got) != 1 || got[0] != "contains" {
+		t.Errorf("predicate_deps (contains/2): Produces = %v, want [contains]", got)
+	}
+	if len(dep.DependedOnByMatchers) != 0 {
+		t.Errorf("predicate_deps (contains/2): DependedOnByMatchers = %+v, want none", dep.DependedOnByMatchers)
+	}
+}
+
+// TestPredicateDeps_ProducedPredicateKnownWithoutFacts pins the
+// predicateKnown gate's produced-direction branch: a match-kind predicate
+// is addressable at arity 2 even when its matcher matched nothing (no
+// contains facts exist), while the read predicate at an arity where the
+// matcher's term does not exist stays unknown.
+func TestPredicateDeps_ProducedPredicateKnownWithoutFacts(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 2)
+	h, _ := newSchemaCrudTestHandlers(t, dir, "")
+	if _, err := h.putSource(putSourceInput{File: "events.jsonl", Mappings: jsonMapping("event", "value.host", "value.pid", "value.cmd"), Revision: 0}); err != nil {
+		t.Fatalf("put_source: %v", err)
+	}
+	if _, err := h.putMatcher(putMatcherInput{Matcher: matcherWithContains("event", 2, "no-such-substring")}); err != nil {
+		t.Fatalf("put_matcher: %v", err)
+	}
+
+	out, err := h.predicateDeps(predicateDepsInput{Predicate: "contains", Arity: 2})
+	if err != nil {
+		t.Fatalf("predicate_deps (contains/2, zero facts): %v", err)
+	}
+	if len(out.DependsOnMatchers) != 1 {
+		t.Errorf("predicate_deps (contains/2): DependsOnMatchers = %+v, want the matcher even with zero match facts", out.DependsOnMatchers)
+	}
+
+	// event/2 has no facts, and the matcher's term 2 does not exist at
+	// arity 2 — the matcher must not make event/2 "known".
+	if _, err := h.predicateDeps(predicateDepsInput{Predicate: "event", Arity: 2}); err == nil {
+		t.Error("predicate_deps (event/2): expected an unknown-predicate error; the matcher reads term 2, which needs arity > 2")
 	}
 }
 
@@ -1189,7 +1246,12 @@ func TestExplainFact_DerivedOneStepWithAddress(t *testing.T) {
 	}
 }
 
-func TestExplainFact_BaseWithDeclarationAndMatchers(t *testing.T) {
+// TestExplainFact_MatcherDirection pins explain_fact's base branch to the
+// corrected matcher orientation: a source-mapped event fact lists NO
+// candidate matchers (the matcher reads event, it did not produce it),
+// while a matcher-produced contains fact names the matcher — keyed by the
+// (predicate, term) it reads — so the why-walk can continue upstream.
+func TestExplainFact_MatcherDirection(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 2)
 	h, _ := newSchemaCrudTestHandlers(t, dir, "")
@@ -1205,16 +1267,27 @@ func TestExplainFact_BaseWithDeclarationAndMatchers(t *testing.T) {
 
 	out, err := h.explainFact(context.Background(), explainFactInput{Fact: `event("h0", 0, "cmd0")`})
 	if err != nil {
-		t.Fatalf("explain_fact: %v", err)
+		t.Fatalf("explain_fact (event): %v", err)
 	}
 	if !out.Exists || out.Kind != "base" {
-		t.Fatalf("explain_fact: got %+v, want an existing base fact", out)
+		t.Fatalf("explain_fact (event): got %+v, want an existing base fact", out)
 	}
 	if out.Declaration == nil || out.Declaration.Name != "event" {
-		t.Errorf("explain_fact: Declaration = %+v, want event/3", out.Declaration)
+		t.Errorf("explain_fact (event): Declaration = %+v, want event/3", out.Declaration)
 	}
-	if len(out.CandidateMatchers) != 1 || out.CandidateMatchers[0].Predicate != "event" {
-		t.Errorf("explain_fact: CandidateMatchers = %+v, want one event matcher", out.CandidateMatchers)
+	if len(out.CandidateMatchers) != 0 {
+		t.Errorf("explain_fact (event): CandidateMatchers = %+v, want none — the matcher reads event facts, it does not produce them", out.CandidateMatchers)
+	}
+
+	prod, err := h.explainFact(context.Background(), explainFactInput{Fact: `contains("cmd0", "cmd0")`})
+	if err != nil {
+		t.Fatalf("explain_fact (contains): %v", err)
+	}
+	if !prod.Exists || prod.Kind != "base" {
+		t.Fatalf("explain_fact (contains): got %+v, want an existing base fact (matcher output loads as a base fact)", prod)
+	}
+	if len(prod.CandidateMatchers) != 1 || prod.CandidateMatchers[0].Predicate != "event" || prod.CandidateMatchers[0].Term != 2 {
+		t.Errorf("explain_fact (contains): CandidateMatchers = %+v, want the (event, 2) matcher that produced it", prod.CandidateMatchers)
 	}
 }
 

@@ -300,18 +300,24 @@ derivedBy/consumedBy fields render full rule source) — use this when you
 need to know WHERE to make a change, not just what a predicate means.
 
 "depends_on_groups" - rule groups (head/arity/file) whose HEAD is this
-predicate: what DERIVES it via rules. "depends_on_matchers" /
-"declaration" - for a base predicate, the schema matchers and/or
-declaration that produce or document it (their exact keys, ready for
-put_matcher/put_declaration/delete_matcher/delete_declaration). A predicate
-that is both loaded from data AND rule-derived reports both.
+predicate: what DERIVES it via rules. "depends_on_matchers" - the schema
+matchers that PRODUCE this predicate: a matcher reads its configured
+(predicate, term) and emits arity-2 match-kind facts (contains/2,
+ci_contains/2, regex_match/2, base64_contains/2, cidr_match/2, ...), so
+it appears here only for those match-kind predicates at arity 2 — never
+for the predicate it reads. Each entry's predicate/term is the SOURCE the
+matcher reads (walk there to continue upstream), its "produces" lists its
+match-kind outputs, and the whole key is ready for put_matcher/
+delete_matcher. "declaration" - the schema declaration documenting this
+predicate/arity, if any. A predicate produced several ways at once
+reports all of them.
 
 "depended_on_by" - every rule group whose BODY references this predicate
-in any position (including a negated atom or an aggregate rule's body):
-what would break, or need re-checking, if you changed this predicate's
-shape. Matchers never depend on predicates the way rules do (a matcher
-only ever reads its own configured predicate/term), so this list is always
-rule-group addresses.
+in any position (including a negated atom or an aggregate rule's body),
+and "depended_on_by_matchers" - every matcher that READS this predicate
+(its configured predicate names it and its term exists at this arity):
+together, what would break, or need re-checking, if you changed this
+predicate's shape.
 
 An unknown predicate/arity (no facts, no declaration, no matcher, no rule
 head or body reference at all) is an error — check the name/arity with
@@ -342,12 +348,13 @@ list_predicates/sample_facts. When true, "kind" is:
 
   "base" - this fact was loaded from data or asserted directly, not derived
   by a rule. "declaration" names the schema declaration for this predicate,
-  if any. "candidate_matchers" lists every matcher whose "predicate" field
-  names this fact's predicate (a STATIC match on the schema's configured
-  matchers, not a trace to the exact source record/mapping that produced
-  THIS specific fact — a base fact may have come from a plain source
-  mapping with no matcher involved at all, in which case this list is
-  simply empty).`
+  if any. "candidate_matchers" lists every matcher that PRODUCES this
+  fact's predicate (match-kind predicates like contains/2 are emitted by
+  matchers), each keyed by the (predicate, term) it READS — recurse the
+  why-walk by looking at facts of that source predicate. A plain
+  source-mapped fact lists no matchers. This is a STATIC match on the
+  schema's configured matchers, not a trace to the exact source
+  record/mapping that produced THIS specific fact.`
 
 // mcpDatalogSyntaxSummary is the condensed Datalog syntax reference shared
 // by put_rule_group and query descriptions, condensed from README.md.
