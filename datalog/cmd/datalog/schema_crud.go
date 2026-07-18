@@ -218,23 +218,63 @@ func (h *mcpHandlers) prepareSchemaWrite(prospective jsonfacts.Config) (text str
 // session-guarded state — e.g. re-deriving "does the key still exist" — in
 // the SAME critical section as the recheck below).
 //
+// snapshotSchemaText is h.sess.schemaText AS OF the write's step-1 snapshot
+// (the same h.mu critical section each put/delete_* method already takes to
+// read h.sess.authoringCfg before calling prepareSchemaWrite) — the WHOLE
+// document's identity at the moment this write decided what to change.
+// commitSchemaWrite rejects the write (ok=false, no error) if
+// h.sess.schemaText no longer equals snapshotSchemaText when the commit lock
+// is finally held, even when recheck (the touched KEY's revision check)
+// would otherwise pass.
+//
+// This closes the gap recheck alone cannot: commitSchemaWrite rewrites the
+// ENTIRE serialized schema file on every write (schema_serialize.go's
+// "Deterministic serialization... the WHOLE file is rewritten"), but recheck
+// only re-validates the ONE key this write touched. If a vim-save
+// (watch.go's reloadSchema) or a concurrent agent write changes a DIFFERENT
+// item during prepareSchemaWrite's lock-free window, that item's revision is
+// untouched, so recheck alone would pass — and the whole-file rewrite below
+// would silently revert the concurrent edit, in memory and on disk, with no
+// error at all (see TODO.md's 2026-07-18 phase 1c/1d validation entry: seed
+// decl alpha, vim-edit it via reloadSchema, then an agent write adding decl
+// beta from the PRE-vim-edit snapshot must not resurrect the old alpha).
+// Gating on the whole document's identity, not just the touched key's
+// revision, is what makes ANY concurrent schema change — touching the same
+// key or a different one — turn into a clean stale rejection instead of a
+// silent lost update.
+//
 // recheck re-validates the touched key's revision against h.sess/h.schemaRev
 // as they stand RIGHT NOW (which may have changed since prepareSchemaWrite's
 // lock-free window ran) and, if still valid, mutates newRevs (a clone of
 // h.schemaRev — see schemaRevisions.clone) to reflect this write's outcome;
 // it must NOT mutate h.schemaRev directly, so a rejected recheck (returning
 // false) leaves the live state completely untouched. Returns ok=false (no
-// error) when recheck rejects — the caller turns that into a fresh
-// IsStale-with-current-content output by re-reading h.sess/h.schemaRev
-// itself, exactly as putRuleGroup's own staleness paths do.
+// error) when either the whole-file guard or recheck rejects — the caller
+// turns that into a fresh IsStale-with-current-content output by re-reading
+// h.sess/h.schemaRev itself, exactly as putRuleGroup's own staleness paths
+// do; a caller cannot distinguish which guard fired, by design (both mean
+// the same thing to the agent: re-read get_config and retry).
 //
 // On ok=true, this writes the file atomically (writeFileAtomic) and swaps
 // the session via applySchemaLocked (set_schema's own mechanism), then
 // installs newRevs as h.schemaRev.
 func (h *mcpHandlers) commitSchemaWrite(
+	snapshotSchemaText string,
 	text string, authoring, runtime jsonfacts.Config, db *memory.Database,
 	recheck func(newRevs *schemaRevisions) bool,
 ) (result schemaWriteResult, ok bool, err error) {
+	if h.sess.schemaText != snapshotSchemaText {
+		// The whole document moved on since this write's step-1 snapshot —
+		// a vim save, another agent write, or anything else that reached
+		// applySchemaLocked in between. Reject unconditionally: the touched
+		// key's own revision may still look valid (recheck would pass), but
+		// committing now would silently discard whatever changed the OTHER
+		// parts of the document. No error, matching every other stale
+		// rejection in this file: the caller re-reads get_config and retries
+		// against current content.
+		return schemaWriteResult{}, false, nil
+	}
+
 	newRevs := h.schemaRev.clone()
 	if !recheck(newRevs) {
 		return schemaWriteResult{}, false, nil
@@ -330,6 +370,7 @@ func (h *mcpHandlers) putSource(in putSourceInput) (putSourceOutput, error) {
 	}
 
 	h.mu.Lock()
+	snapshotText := h.sess.schemaText
 	cfg := h.sess.authoringCfg
 	current, exists := findSource(cfg.Sources, in.File)
 	rev := h.schemaRev.sources[in.File]
@@ -352,7 +393,7 @@ func (h *mcpHandlers) putSource(in putSourceInput) (putSourceOutput, error) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	result, ok, err := h.commitSchemaWrite(text, authoring, runtime, db, func(newRevs *schemaRevisions) bool {
+	result, ok, err := h.commitSchemaWrite(snapshotText, text, authoring, runtime, db, func(newRevs *schemaRevisions) bool {
 		_, stillExists := findSource(h.sess.authoringCfg.Sources, in.File)
 		wantRev := 0
 		if stillExists {
@@ -404,6 +445,7 @@ func (h *mcpHandlers) deleteSource(in deleteSourceInput) (deleteSourceOutput, er
 	}
 
 	h.mu.Lock()
+	snapshotText := h.sess.schemaText
 	cfg := h.sess.authoringCfg
 	current, exists := findSource(cfg.Sources, in.File)
 	if !exists || in.Revision != h.schemaRev.sources[in.File] {
@@ -425,7 +467,7 @@ func (h *mcpHandlers) deleteSource(in deleteSourceInput) (deleteSourceOutput, er
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	result, ok, err := h.commitSchemaWrite(text, authoring, runtime, db, func(newRevs *schemaRevisions) bool {
+	result, ok, err := h.commitSchemaWrite(snapshotText, text, authoring, runtime, db, func(newRevs *schemaRevisions) bool {
 		_, stillExists := findSource(h.sess.authoringCfg.Sources, in.File)
 		if !stillExists || in.Revision != h.schemaRev.sources[in.File] {
 			return false
@@ -523,6 +565,7 @@ func (h *mcpHandlers) putMatcher(in putMatcherInput) (putMatcherOutput, error) {
 	key := matcherKeyOf(in.Matcher)
 
 	h.mu.Lock()
+	snapshotText := h.sess.schemaText
 	cfg := h.sess.authoringCfg
 	current, exists := findMatcher(cfg.Matchers, key)
 	rev := h.schemaRev.matchers[key]
@@ -545,7 +588,7 @@ func (h *mcpHandlers) putMatcher(in putMatcherInput) (putMatcherOutput, error) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	result, ok, err := h.commitSchemaWrite(text, authoring, runtime, db, func(newRevs *schemaRevisions) bool {
+	result, ok, err := h.commitSchemaWrite(snapshotText, text, authoring, runtime, db, func(newRevs *schemaRevisions) bool {
 		_, stillExists := findMatcher(h.sess.authoringCfg.Matchers, key)
 		wantRev := 0
 		if stillExists {
@@ -599,6 +642,7 @@ func (h *mcpHandlers) deleteMatcher(in deleteMatcherInput) (deleteMatcherOutput,
 	key := matcherKey{Predicate: in.Predicate, Term: in.Term, CaseInsensitive: in.CaseInsensitive, Windash: in.Windash}
 
 	h.mu.Lock()
+	snapshotText := h.sess.schemaText
 	cfg := h.sess.authoringCfg
 	current, exists := findMatcher(cfg.Matchers, key)
 	if !exists || in.Revision != h.schemaRev.matchers[key] {
@@ -620,7 +664,7 @@ func (h *mcpHandlers) deleteMatcher(in deleteMatcherInput) (deleteMatcherOutput,
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	result, ok, err := h.commitSchemaWrite(text, authoring, runtime, db, func(newRevs *schemaRevisions) bool {
+	result, ok, err := h.commitSchemaWrite(snapshotText, text, authoring, runtime, db, func(newRevs *schemaRevisions) bool {
 		_, stillExists := findMatcher(h.sess.authoringCfg.Matchers, key)
 		if !stillExists || in.Revision != h.schemaRev.matchers[key] {
 			return false
@@ -714,6 +758,7 @@ func (h *mcpHandlers) putDeclaration(in putDeclarationInput) (putDeclarationOutp
 	key := declarationKeyOf(in.Declaration)
 
 	h.mu.Lock()
+	snapshotText := h.sess.schemaText
 	cfg := h.sess.authoringCfg
 	current, exists := findDeclaration(cfg.Declarations, key)
 	rev := h.schemaRev.declarations[key]
@@ -736,7 +781,7 @@ func (h *mcpHandlers) putDeclaration(in putDeclarationInput) (putDeclarationOutp
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	result, ok, err := h.commitSchemaWrite(text, authoring, runtime, db, func(newRevs *schemaRevisions) bool {
+	result, ok, err := h.commitSchemaWrite(snapshotText, text, authoring, runtime, db, func(newRevs *schemaRevisions) bool {
 		_, stillExists := findDeclaration(h.sess.authoringCfg.Declarations, key)
 		wantRev := 0
 		if stillExists {
@@ -788,6 +833,7 @@ func (h *mcpHandlers) deleteDeclaration(in deleteDeclarationInput) (deleteDeclar
 	key := declarationKey{Name: in.Name, Arity: in.Arity}
 
 	h.mu.Lock()
+	snapshotText := h.sess.schemaText
 	cfg := h.sess.authoringCfg
 	current, exists := findDeclaration(cfg.Declarations, key)
 	if !exists || in.Revision != h.schemaRev.declarations[key] {
@@ -809,7 +855,7 @@ func (h *mcpHandlers) deleteDeclaration(in deleteDeclarationInput) (deleteDeclar
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	result, ok, err := h.commitSchemaWrite(text, authoring, runtime, db, func(newRevs *schemaRevisions) bool {
+	result, ok, err := h.commitSchemaWrite(snapshotText, text, authoring, runtime, db, func(newRevs *schemaRevisions) bool {
 		_, stillExists := findDeclaration(h.sess.authoringCfg.Declarations, key)
 		if !stillExists || in.Revision != h.schemaRev.declarations[key] {
 			return false

@@ -49,6 +49,14 @@ type listRuleGroupsOutput struct {
 // "list_rule_groups returns [{head, arity, file, revision, statements}] in
 // filename order"), so a caller browsing the store sees the same ordering a
 // directory listing (or the concatenated export()) would show.
+//
+// Reads h.rules with NO lock of its own — callers must hold h.mu. Production
+// is race-clean today because every registered caller (mcp.go's dispatch
+// wrappers) already holds h.mu, and the watcher's reloadRules swap
+// (watch.go) also runs under h.mu, but a future direct caller that skips the
+// dispatch wrapper would race that swap. Do not add locking inside this
+// method: the dispatch wrappers already hold h.mu, and a lock here would
+// double-lock and deadlock against them.
 func (h *mcpHandlers) listRuleGroups(_ listRuleGroupsInput) (listRuleGroupsOutput, error) {
 	if h.rules == nil {
 		return listRuleGroupsOutput{}, errRulesStoreRequired
@@ -86,6 +94,10 @@ type getRuleGroupOutput struct {
 // revision — the shape a caller needs to build a put_rule_group edit (design
 // decision 5: "get_rule_group returns {head, arity, file, revision, text}
 // with text = the verbatim on-disk content").
+//
+// Reads h.rules with NO lock of its own — callers must hold h.mu, exactly
+// like listRuleGroups above (see its doc comment for the caller-holds-h.mu
+// contract and why no lock belongs inside this method).
 func (h *mcpHandlers) getRuleGroup(in getRuleGroupInput) (getRuleGroupOutput, error) {
 	if h.rules == nil {
 		return getRuleGroupOutput{}, errRulesStoreRequired

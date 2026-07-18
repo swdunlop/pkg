@@ -698,6 +698,7 @@ func (h *mcpHandlers) applySchemaLocked(schemaText string, authoring, runtime js
 	h.sess.schemaText = schemaText
 	h.sess.dataDB = db
 	h.sess.derivedDB = nil
+	h.sess.derivedProv = nil // keep paired with derivedDB, per session.derivedProv's doc comment (mirrors loadRuleStore/setSchema/loadProgram)
 	h.sess.gen++
 	full, err := h.sess.buildDB()
 	if err != nil {

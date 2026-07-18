@@ -300,6 +300,127 @@ func TestReloadFromDisk_SchemaEditSwapsAndBumps(t *testing.T) {
 	}
 }
 
+// TestReloadFromDisk_CrossItemVimEditNotClobberedByStaleAgentWrite is the
+// TODO.md 2026-07-18 phase 1c/1d repro for "whole-file schema write clobbers
+// a concurrent cross-item edit": the schema is a SINGLE file, so
+// commitSchemaWrite's whole-file rewrite (schema_serialize.go's
+// serializeConfigYAML, run on every write) can revert a vim edit to a
+// DIFFERENT item than the one an agent write's revision check covers.
+//
+// Sequence: seed declaration alpha; an agent snapshots the whole-file
+// schemaText and the authoring config (exactly as put_declaration's step 1
+// does under h.mu, before its own lock-free prepare); a vim save (driven
+// through reloadFromDisk, the same seam every other reload test in this
+// file uses) edits alpha's Use text and reloads; the agent's write — adding
+// a NEW declaration beta, built from the PRE-vim-edit snapshot — must now be
+// rejected as stale, and alpha's vim edit must survive untouched in both
+// memory (get_config) and on disk. Before the fix, alpha's own revision was
+// untouched by the agent's beta write, so the per-key recheck alone passed:
+// the whole-file rewrite silently reverted alpha to its pre-vim-edit content.
+func TestReloadFromDisk_CrossItemVimEditNotClobberedByStaleAgentWrite(t *testing.T) {
+	wb, schemaPath, _ := watchTestWorkbench(t)
+
+	// Seed declaration alpha alongside the fixture's existing event/0 decl.
+	seeded, err := wb.h.putDeclaration(putDeclarationInput{Declaration: declWithUse("alpha", "before vim")})
+	if err != nil {
+		t.Fatalf("put_declaration (seed alpha): %v", err)
+	}
+	if seeded.IsStale {
+		t.Fatalf("put_declaration (seed alpha): unexpected stale rejection: %+v", seeded)
+	}
+
+	// Agent's step 1: snapshot the whole-file schemaText and the authoring
+	// config BEFORE the vim save, exactly as putDeclaration's own step 1
+	// does under h.mu (schema_crud.go's snapshotText capture).
+	wb.h.mu.Lock()
+	agentSnapshotText := wb.h.sess.schemaText
+	agentCfg := wb.h.sess.authoringCfg
+	agentCfg.Declarations = replaceDeclaration(agentCfg.Declarations, declarationKey{Name: "beta", Arity: 0},
+		declWithUse("beta", "added by the agent"))
+	wb.h.mu.Unlock()
+
+	// Vim save: alpha's Use text changes. Driven through reloadFromDisk, the
+	// same seam every other reload test in this file uses.
+	data, err := os.ReadFile(schemaPath)
+	if err != nil {
+		t.Fatalf("reading schema: %v", err)
+	}
+	vimText := strings.Replace(string(data), "before vim", "EDITED BY VIM", 1)
+	if vimText == string(data) {
+		t.Fatal("fixture broken: alpha's 'before vim' Use text not found in the on-disk schema")
+	}
+	mustWriteFile(t, schemaPath, vimText)
+	wb.reloadFromDisk(true, false)
+
+	wb.reloadMu.Lock()
+	reloadStatus := wb.lastReload
+	wb.reloadMu.Unlock()
+	if reloadStatus.Err != "" {
+		t.Fatalf("vim-save reload failed: %s", reloadStatus.Err)
+	}
+
+	// The agent's write now lands, using its PRE-vim-edit snapshot — the
+	// lock-free prepare phase, then the locked commit gated on
+	// agentSnapshotText (which the vim save already invalidated).
+	text, authoring, runtime, db, err := wb.h.prepareSchemaWrite(agentCfg)
+	if err != nil {
+		t.Fatalf("prepareSchemaWrite (agent beta write): %v", err)
+	}
+
+	wb.h.mu.Lock()
+	result, ok, err := wb.h.commitSchemaWrite(agentSnapshotText, text, authoring, runtime, db,
+		func(newRevs *schemaRevisions) bool {
+			key := declarationKey{Name: "beta", Arity: 0}
+			_, stillExists := findDeclaration(wb.h.sess.authoringCfg.Declarations, key)
+			wantRev := 0
+			if stillExists {
+				wantRev = wb.h.schemaRev.declarations[key]
+			}
+			if wantRev != 0 {
+				return false
+			}
+			newRevs.declarations[key] = nextRevision(stillExists, 0, wb.h.schemaRev.deletedDeclarations[key])
+			return true
+		})
+	wb.h.mu.Unlock()
+	if err != nil {
+		t.Fatalf("commitSchemaWrite (agent beta write): %v", err)
+	}
+	if ok {
+		t.Fatalf("commitSchemaWrite (agent beta write): expected a stale rejection (vim edited a DIFFERENT item"+
+			" during the lock-free window), got %+v", result)
+	}
+
+	// alpha's vim edit must survive, both in memory (get_config) and on disk.
+	cfg, err := wb.h.getConfig(getConfigInput{})
+	if err != nil {
+		t.Fatalf("get_config: %v", err)
+	}
+	var alpha *configDeclaration
+	for i := range cfg.Declarations {
+		if cfg.Declarations[i].Name == "alpha" {
+			alpha = &cfg.Declarations[i]
+		}
+	}
+	if alpha == nil {
+		t.Fatal("get_config: alpha declaration missing after the rejected agent write")
+	}
+	if alpha.Use != "EDITED BY VIM" {
+		t.Errorf("get_config: alpha.Use = %q, want the vim edit %q (must not be reverted)", alpha.Use, "EDITED BY VIM")
+	}
+
+	onDisk, err := os.ReadFile(schemaPath)
+	if err != nil {
+		t.Fatalf("reading schema after rejected write: %v", err)
+	}
+	if !strings.Contains(string(onDisk), "EDITED BY VIM") {
+		t.Errorf("schema file lost the vim edit after the stale agent write was rejected:\n%s", onDisk)
+	}
+	if strings.Contains(string(onDisk), "beta") {
+		t.Errorf("schema file has the agent's rejected beta declaration:\n%s", onDisk)
+	}
+}
+
 // TestReloadFromDisk_InvalidSchemaKeepsLastGoodState mirrors the rules
 // torn-write test on the schema side.
 func TestReloadFromDisk_InvalidSchemaKeepsLastGoodState(t *testing.T) {

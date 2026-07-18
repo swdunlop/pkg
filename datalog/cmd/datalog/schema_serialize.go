@@ -139,3 +139,73 @@ func declarationKeyLess(a, b datalog.Declaration) bool {
 	}
 	return ka.Arity < kb.Arity
 }
+
+// validateConfigKeyUniqueness rejects a jsonfacts.Config in which two
+// sources share a File key, two matchers share a (predicate, term,
+// case_insensitive, windash) key, or two declarations share a (name, arity)
+// key — the CRUD keys schema_crud.go's put_source/put_matcher/
+// put_declaration address one item by (matcherKey/declarationKey above;
+// Source.File is already its own key). This is the analogue of
+// validateDeclarationTermNames (jsonfacts/config.go:187), which rejects a
+// duplicate term-name key WITHIN one declaration; this rejects a duplicate
+// CRUD key ACROSS a Config's own Sources/Matchers/Declarations slices, a
+// case jsonfacts.Config.validate() does not check at all (a Config may
+// legitimately hold two Source/Matcher/Declaration values whose OTHER
+// fields differ, and nothing in that package's loader ever needed to
+// address one of them individually — only this package's keyed CRUD
+// surface does).
+//
+// Without this check, a config that already has a colliding pair (hand-
+// authored, or produced before this validation existed) makes every keyed
+// write on that key silently corrupt data: replaceMatcher/replaceSource/
+// replaceDeclaration (schema_crud.go) match by key and replace EVERY
+// colliding entry, so a single put_matcher/put_source/put_declaration
+// against a duplicated key produces two IDENTICAL copies of the new content
+// and silently drops both originals; the delete_ counterparts remove every
+// colliding entry at once. See TODO.md's 2026-07-18 phase 1c/1d validation
+// entry for the full repro.
+//
+// Called from the ONE chokepoint both config-load paths share:
+// parseConfigFormat (used directly by both loadData's parseConfig call and
+// prepareSchema, which is itself shared by startup/reload/every schema CRUD
+// write's prepareSchemaWrite) — so neither entry point can forget it. A
+// pre-existing config with a genuine collision (see this repo's
+// examples/mordor.yaml and examples/finbench.yaml, both checked clean) would
+// now fail to load; the operator's fix is to merge the colliding entries
+// into one (a single Matcher already carries contains+regex+cidr+... at
+// once, so the union is always expressible), never to widen a key or patch
+// the replace/remove helpers to touch only one of the colliding entries
+// (see schema_crud.go's putMatcher doc comment for why key-widening breaks
+// "edit the matcher for predicate/term" addressing).
+func validateConfigKeyUniqueness(cfg jsonfacts.Config) error {
+	seenSources := make(map[string]bool, len(cfg.Sources))
+	for _, s := range cfg.Sources {
+		if seenSources[s.File] {
+			return fmt.Errorf("config: duplicate source file %q: two sources share this key; merge their mappings into one source", s.File)
+		}
+		seenSources[s.File] = true
+	}
+
+	seenMatchers := make(map[matcherKey]bool, len(cfg.Matchers))
+	for _, m := range cfg.Matchers {
+		key := matcherKeyOf(m)
+		if seenMatchers[key] {
+			return fmt.Errorf("config: duplicate matcher for predicate %q term %d (case_insensitive=%v windash=%v): "+
+				"two matchers share this key; merge their pattern lists into one matcher",
+				key.Predicate, key.Term, key.CaseInsensitive, key.Windash)
+		}
+		seenMatchers[key] = true
+	}
+
+	seenDeclarations := make(map[declarationKey]bool, len(cfg.Declarations))
+	for _, d := range cfg.Declarations {
+		key := declarationKeyOf(d)
+		if seenDeclarations[key] {
+			return fmt.Errorf("config: duplicate declaration for predicate %q arity %d: "+
+				"two declarations share this key; merge them into one declaration", key.Name, key.Arity)
+		}
+		seenDeclarations[key] = true
+	}
+
+	return nil
+}

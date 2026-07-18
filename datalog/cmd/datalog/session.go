@@ -342,6 +342,9 @@ func parseConfigFormat(data []byte, format string) (jsonfacts.Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return jsonfacts.Config{}, fmt.Errorf("parsing config: %w", err)
 	}
+	if err := validateConfigKeyUniqueness(cfg); err != nil {
+		return jsonfacts.Config{}, err
+	}
 	return cfg, nil
 }
 

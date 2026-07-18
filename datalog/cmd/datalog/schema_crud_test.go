@@ -262,6 +262,135 @@ func TestDeleteSource_AbsentSource(t *testing.T) {
 	}
 }
 
+// -- duplicate CRUD-key configs are rejected at load, not silently corrupted -
+
+// duplicateMatcherKeySchemaYAML seeds two matchers sharing the exact CRUD
+// key (event, term 2, case_insensitive=false, windash=false) with different
+// pattern content — a config jsonfacts.Config.validate() does not reject
+// (compileMatchers applies both independently and unions their facts), but
+// which corrupts every put_matcher/delete_matcher on that key: replaceMatcher
+// replaces BOTH colliding entries with duplicate copies of the new content,
+// losing both originals, and removeMatcher removes both at once. See
+// TODO.md's 2026-07-18 phase 1c/1d validation entry and
+// validateConfigKeyUniqueness's doc comment (schema_serialize.go).
+const duplicateMatcherKeySchemaYAML = `
+matchers:
+  - predicate: event
+    term: 2
+    contains: ["alpha"]
+  - predicate: event
+    term: 2
+    contains: ["beta"]
+`
+
+// TestNewMCPHandlers_RejectsDuplicateMatcherKey pins the load-time rejection
+// itself: constructing handlers from a seed config with two matchers sharing
+// a CRUD key must fail outright, naming the offending predicate/term, rather
+// than silently loading a corruptible config.
+func TestNewMCPHandlers_RejectsDuplicateMatcherKey(t *testing.T) {
+	dir := t.TempDir()
+	schemaPath := filepath.Join(dir, "schema.yaml")
+	mustWriteFile(t, schemaPath, duplicateMatcherKeySchemaYAML)
+
+	_, _, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000)
+	if err == nil {
+		t.Fatal("newMCPHandlers: expected an error for a config with two matchers sharing a CRUD key")
+	}
+	if !strings.Contains(err.Error(), "event") || !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("newMCPHandlers: error = %v, want it to name the duplicate matcher's predicate (event) and call out the duplication", err)
+	}
+}
+
+// TestPutMatcher_DuplicateKeySeedNeverReachesCorruption is the repro from
+// TODO.md verified end to end: without the load-time rejection, seeding two
+// event/term-2 matchers (alpha, beta) and then put_matcher-ing a THIRD
+// (gamma) at revision 1 would leave TWO gamma matchers on disk with alpha
+// and beta both silently gone (replaceMatcher replaces every colliding
+// entry). With the fix, the seed itself must never load, so there is no
+// handlers value to call put_matcher against in the first place — this test
+// asserts exactly that: the corrupting sequence is unreachable because
+// construction fails first.
+func TestPutMatcher_DuplicateKeySeedNeverReachesCorruption(t *testing.T) {
+	dir := t.TempDir()
+	schemaPath := filepath.Join(dir, "schema.yaml")
+	mustWriteFile(t, schemaPath, duplicateMatcherKeySchemaYAML)
+
+	h, _, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000)
+	if err == nil {
+		// If construction ever stops erroring (a regression in the fix
+		// itself), demonstrate the corruption explicitly rather than passing
+		// silently: put_matcher(gamma, rev=1) must NOT produce two gamma
+		// matchers with alpha/beta gone.
+		out, err := h.putMatcher(putMatcherInput{Matcher: matcherWithContains("event", 2, "gamma"), Revision: 1})
+		if err != nil {
+			t.Fatalf("put_matcher: %v", err)
+		}
+		cfg, err := h.getConfig(getConfigInput{})
+		if err != nil {
+			t.Fatalf("get_config: %v", err)
+		}
+		t.Fatalf("newMCPHandlers unexpectedly accepted a duplicate-key config (fix regressed); "+
+			"put_matcher(gamma, rev=1) = %+v, resulting matchers = %+v", out, cfg.Matchers)
+	}
+}
+
+// duplicateSourceKeySchemaYAML / duplicateDeclarationKeySchemaYAML pin the
+// analogous checks for sources (keyed by File) and declarations (keyed by
+// name, arity) validateConfigKeyUniqueness also enforces, for the same
+// corruption class via replaceSource/replaceDeclaration.
+const duplicateSourceKeySchemaYAML = `
+sources:
+  - file: events.jsonl
+    mappings:
+      - predicate: eventA
+        args: ["value.host"]
+  - file: events.jsonl
+    mappings:
+      - predicate: eventB
+        args: ["value.host"]
+`
+
+func TestNewMCPHandlers_RejectsDuplicateSourceKey(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 1)
+	schemaPath := filepath.Join(dir, "schema.yaml")
+	mustWriteFile(t, schemaPath, duplicateSourceKeySchemaYAML)
+
+	_, _, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000)
+	if err == nil {
+		t.Fatal("newMCPHandlers: expected an error for a config with two sources sharing a File key")
+	}
+	if !strings.Contains(err.Error(), "events.jsonl") || !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("newMCPHandlers: error = %v, want it to name the duplicate source file", err)
+	}
+}
+
+const duplicateDeclarationKeySchemaYAML = `
+declarations:
+  - name: process
+    use: first
+    terms:
+      - name: pid
+  - name: process
+    use: second
+    terms:
+      - name: pid
+`
+
+func TestNewMCPHandlers_RejectsDuplicateDeclarationKey(t *testing.T) {
+	dir := t.TempDir()
+	schemaPath := filepath.Join(dir, "schema.yaml")
+	mustWriteFile(t, schemaPath, duplicateDeclarationKeySchemaYAML)
+
+	_, _, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000)
+	if err == nil {
+		t.Fatal("newMCPHandlers: expected an error for a config with two declarations sharing a (name, arity) key")
+	}
+	if !strings.Contains(err.Error(), "process") || !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("newMCPHandlers: error = %v, want it to name the duplicate declaration (process)", err)
+	}
+}
+
 // -- put_matcher / delete_matcher ---------------------------------------------
 
 func TestPutMatcher_CreateAndEdit(t *testing.T) {
@@ -557,6 +686,7 @@ func TestPutSource_ConcurrentWriteDuringPrepareTurnsStale(t *testing.T) {
 	// prospective is built from the AUTHORING config, exactly as the real
 	// write paths do (see prepareSchemaWrite's doc comment).
 	h.mu.Lock()
+	snapshotTextA := h.sess.schemaText
 	cfgA := h.sess.authoringCfg
 	cfgA.Sources = replaceSource(cfgA.Sources, jsonfacts.Source{File: "events.jsonl", Mappings: jsonMapping("eventA", "value.host")})
 	h.mu.Unlock()
@@ -580,7 +710,7 @@ func TestPutSource_ConcurrentWriteDuringPrepareTurnsStale(t *testing.T) {
 	// must be rejected as stale (B already bumped the key to revision 2),
 	// not silently overwrite B's write.
 	h.mu.Lock()
-	result, ok, err := h.commitSchemaWrite(textA, authoringA, runtimeA, dbA, func(newRevs *schemaRevisions) bool {
+	result, ok, err := h.commitSchemaWrite(snapshotTextA, textA, authoringA, runtimeA, dbA, func(newRevs *schemaRevisions) bool {
 		_, stillExists := findSource(h.sess.authoringCfg.Sources, "events.jsonl")
 		wantRev := 0
 		if stillExists {
