@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"swdunlop.dev/pkg/datalog/jsonfacts"
 	"swdunlop.dev/pkg/datalog/seminaive"
 )
 
@@ -54,10 +55,11 @@ func newTestHandlers(t *testing.T, dir string) (*mcpHandlers, func()) {
 		t.Fatalf("openDataRoot: %v", err)
 	}
 	h := &mcpHandlers{
-		sess:    &session{},
-		fsys:    root.FS(),
-		confine: root.Confine,
-		timeout: 5 * time.Second,
+		sess:      &session{},
+		fsys:      root.FS(),
+		confine:   root.Confine,
+		timeout:   5 * time.Second,
+		schemaRev: newSchemaRevisions(jsonfacts.Config{}),
 	}
 	return h, func() { root.Close() }
 }
@@ -114,9 +116,12 @@ func TestMordorGoldenLoop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading mordor.yaml: %v", err)
 	}
-	schemaOut, err := h.setSchema(setSchemaInput{Schema: string(schemaData), Format: "yaml"})
-	if err != nil {
+	if err := h.sess.setSchema(string(schemaData), "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
+	}
+	listOut, err := h.listPredicates(listPredicatesInput{})
+	if err != nil {
+		t.Fatalf("list_predicates: %v", err)
 	}
 	wantCounts := map[string]int{
 		"net_conn":     3,
@@ -130,7 +135,7 @@ func TestMordorGoldenLoop(t *testing.T) {
 		"share_file":   3,
 	}
 	gotCounts := map[string]int{}
-	for _, p := range schemaOut.Predicates {
+	for _, p := range listOut.Predicates {
 		gotCounts[p.Name] = p.Facts
 	}
 	for name, want := range wantCounts {
@@ -239,14 +244,21 @@ func itoa(n int) string {
 	return string(buf[i:])
 }
 
-// -- set_schema -------------------------------------------------------------
+// -- set_schema (removed as an MCP tool; see schema_crud_test.go) -----------
+//
+// The whole-document set_schema MCP tool was removed in favor of the schema
+// CRUD tools (doc/features/workbench-v2.md design decision 4). Its
+// malformed-input and escaping-source-file rejection coverage stays here as
+// session.setSchema tests (a plain Go helper, not MCP-wired — see
+// session.setSchema's doc comment) since that validation logic
+// (prepareSchema) is shared unchanged by every schema CRUD write.
 
 func TestSetSchema_MalformedYAML(t *testing.T) {
 	dir := t.TempDir()
 	h, done := newTestHandlers(t, dir)
 	defer done()
 
-	_, err := h.setSchema(setSchemaInput{Schema: "sources: [this is not: valid: yaml: at: all", Format: "yaml"})
+	err := h.sess.setSchema("sources: [this is not: valid: yaml: at: all", "yaml", h.fsys, h.confine)
 	if err == nil {
 		t.Fatal("set_schema: expected error for malformed YAML, got none")
 	}
@@ -269,7 +281,7 @@ sources:
       - predicate: event
         args: ["value.host"]
 `
-	_, err := h.setSchema(setSchemaInput{Schema: badSchema, Format: "yaml"})
+	err := h.sess.setSchema(badSchema, "yaml", h.fsys, h.confine)
 	if err == nil {
 		t.Fatal("set_schema: expected error for source file escaping data dir, got none")
 	}
@@ -350,9 +362,12 @@ func TestSetSchema_Valid(t *testing.T) {
 	h, done := newTestHandlers(t, dir)
 	defer done()
 
-	out, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"})
-	if err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
+	}
+	out, err := h.listPredicates(listPredicatesInput{})
+	if err != nil {
+		t.Fatalf("list_predicates: %v", err)
 	}
 	if len(out.Predicates) != 1 || out.Predicates[0].Name != "event" || out.Predicates[0].Facts != 5 {
 		t.Fatalf("set_schema: got %+v, want one event/3 predicate with 5 facts", out.Predicates)
@@ -387,7 +402,7 @@ func TestQuery_DefaultLimitAndTruncation(t *testing.T) {
 	h, done := newTestHandlers(t, dir)
 	defer done()
 
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
 
@@ -412,7 +427,7 @@ func TestQuery_RejectsAnonymousVariables(t *testing.T) {
 	h, done := newTestHandlers(t, dir)
 	defer done()
 
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
 
@@ -461,7 +476,7 @@ func TestQuery_HardCap(t *testing.T) {
 	h, done := newTestHandlers(t, dir)
 	defer done()
 
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
 
@@ -486,7 +501,7 @@ func TestQuery_UnderLimitNotTruncated(t *testing.T) {
 	h, done := newTestHandlers(t, dir)
 	defer done()
 
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
 
@@ -518,7 +533,7 @@ func TestQuery_CancelledContext(t *testing.T) {
 	h, done := newTestHandlers(t, dir)
 	defer done()
 
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
 
@@ -617,7 +632,7 @@ func TestQuery_ZeroRulesCrossProductExceedsFactCap(t *testing.T) {
 	}
 	defer closeFn()
 
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
 
@@ -648,7 +663,7 @@ func TestQuery_RulesBaseStageExceedsFactCap(t *testing.T) {
 	}
 	defer closeFn()
 
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
 	if _, err := h.sess.setRules("pair(A,B) :- event(A,_,_), event(B,_,_).\n"); err != nil {
@@ -677,7 +692,7 @@ func TestQuery_UnderCapStillSucceeds(t *testing.T) {
 	}
 	defer closeFn()
 
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
 
@@ -716,7 +731,7 @@ func TestQuery_PopulatesAndReusesDerivedCache(t *testing.T) {
 	h, done := newTestHandlers(t, dir)
 	defer done()
 
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
 	if _, err := h.sess.setRules(`derived(X) :- event(X, _, _).` + "\n"); err != nil {
@@ -759,7 +774,7 @@ func TestQuery_CachedDerivedExcludesSyntheticQueryPredicate(t *testing.T) {
 	h, done := newTestHandlers(t, dir)
 	defer done()
 
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
 	if _, err := h.sess.setRules(`derived(X) :- event(X, _, _).` + "\n"); err != nil {
@@ -854,7 +869,7 @@ func TestQuery_CacheRefusesOverFactCapBase(t *testing.T) {
 	}
 	defer closeFn()
 
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
 
@@ -878,7 +893,7 @@ func TestSampleFacts_Limit(t *testing.T) {
 	h, done := newTestHandlers(t, dir)
 	defer done()
 
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
 
@@ -903,7 +918,7 @@ func TestSampleFacts_DefaultLimit(t *testing.T) {
 	h, done := newTestHandlers(t, dir)
 	defer done()
 
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
 
@@ -926,7 +941,7 @@ func TestSampleFacts_DerivedPredicate(t *testing.T) {
 	h, done := newTestHandlers(t, dir)
 	defer done()
 
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
 	if _, err := h.sess.setRules(`active(Host) :- event(Host, Pid, Cmd).`); err != nil {
@@ -1225,7 +1240,7 @@ func TestConcurrentHandlerCalls(t *testing.T) {
 	h, done := newTestHandlers(t, dir)
 	defer done()
 
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
 	if _, err := h.sess.setRules(`foo(X) :- event(_, X, _).` + "\n"); err != nil {

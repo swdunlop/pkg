@@ -151,7 +151,7 @@ type putRuleGroupOutput struct {
 //     statements) — a group that breaks stratification/safety ANYWHERE is
 //     refused here, before any disk write;
 //  5. only then: write the file (temp-in-same-dir + rename, see
-//     writeGroupFile) and rebuild the session via session.loadRuleStore.
+//     writeFileAtomic) and rebuild the session via session.loadRuleStore.
 //
 // Staleness (design decision 1): if the group does not exist, Revision must
 // be 0 (create); if it exists, Revision must equal its CURRENT revision
@@ -221,7 +221,7 @@ func (h *mcpHandlers) putRuleGroup(in putRuleGroupInput) (putRuleGroupOutput, er
 
 	// A CREATE must not introduce a key whose filename folds onto an existing
 	// group's under case-insensitivity ({Foo,1} beside {foo,1}): on a
-	// case-insensitive filesystem (macOS/Windows) writeGroupFile's rename
+	// case-insensitive filesystem (macOS/Windows) writeFileAtomic's rename
 	// would silently clobber the OTHER group's file while both stayed live in
 	// memory — the same hazard splitRuleset/loadRuleStore already reject at
 	// import/load time (rulestore.go's checkFilenameCollisions), enforced
@@ -267,7 +267,7 @@ func (h *mcpHandlers) putRuleGroup(in putRuleGroupInput) (putRuleGroupOutput, er
 		newRevision = h.rules.deletedHighWater[wantKey] + 1
 	}
 
-	if err := writeGroupFile(h.rules.Dir, wantKey.filename(), verbatimText); err != nil {
+	if err := writeFileAtomic(h.rules.Dir, wantKey.filename(), verbatimText); err != nil {
 		return putRuleGroupOutput{}, err
 	}
 
@@ -316,55 +316,6 @@ func (h *mcpHandlers) putRuleGroup(in putRuleGroupInput) (putRuleGroupOutput, er
 		Predicates: countPredicates(full),
 		Warnings:   ruleset.Warnings,
 	}, nil
-}
-
-// writeGroupFile atomically writes text (with a trailing newline added if
-// missing, matching importRuleset's convention — rulestore.go) to
-// filepath.Join(dir, name): a temp file created IN THE SAME DIRECTORY (so
-// os.Rename is guaranteed atomic — a cross-filesystem rename is not) is
-// written and fsynced, then renamed over the target. This is the discipline
-// design decision 4 requires: phase 1d's fsnotify watcher must never observe
-// a half-written file, and a failed write here must leave no `.tmp`-suffixed
-// stray file behind in the directory listing (a bare os.WriteFile followed
-// by a crash mid-write would instead leave a truncated GROUP file itself
-// corrupted, which is strictly worse).
-func writeGroupFile(dir, name, text string) error {
-	if len(text) == 0 || text[len(text)-1] != '\n' {
-		text += "\n"
-	}
-	f, err := os.CreateTemp(dir, name+".tmp-*")
-	if err != nil {
-		return fmt.Errorf("rules store: creating temp file for %s: %w", name, err)
-	}
-	tmpName := f.Name()
-	// On any failure path below, remove the temp file so a rejected write
-	// leaves no droppings in the directory — the rename below is the ONLY
-	// path that consumes tmpName; every other exit removes it.
-	succeeded := false
-	defer func() {
-		if !succeeded {
-			os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := f.WriteString(text); err != nil {
-		f.Close()
-		return fmt.Errorf("rules store: writing %s: %w", name, err)
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return fmt.Errorf("rules store: syncing %s: %w", name, err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("rules store: closing %s: %w", name, err)
-	}
-
-	full := filepath.Join(dir, name)
-	if err := os.Rename(tmpName, full); err != nil {
-		return fmt.Errorf("rules store: renaming into %s: %w", full, err)
-	}
-	succeeded = true
-	return nil
 }
 
 // -- delete_rule_group ----------------------------------------------------

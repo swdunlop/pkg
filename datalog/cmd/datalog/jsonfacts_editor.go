@@ -186,9 +186,11 @@ func (wb *workbench) handleJSONFactsPreview(w http.ResponseWriter, r *http.Reque
 // explicit full Transform (doc/notes/datastar.md §9 shape). Gated by
 // wb.jobs.Begin so a second Apply click while one is in flight is a no-op;
 // the actual work runs through runRecovered under evalTimeout; on success
-// it calls the SAME typed MCP handler wb.h.setSchema the MCP tools use
-// (design constraint 1 — one pipeline, N frontends) and publishes the
-// session-changed notification so every tab's Fact Browser repaints.
+// it commits through the SAME prepareSchema/applySchemaLocked mechanism the
+// schema CRUD tools use (design constraint 1 — one pipeline, N frontends;
+// the whole-document set_schema wrapper those shared halves once backed was
+// removed in phase 1c) and publishes the session-changed notification so
+// every tab's Fact Browser repaints.
 func (wb *workbench) handleJSONFactsApply(w http.ResponseWriter, r *http.Request) {
 	// Decode signals BEFORE upgrading to an SSE stream — see
 	// handleJSONFactsPreview's comment: the request body is unreadable
@@ -287,25 +289,24 @@ func runApplySchema(ctx context.Context, wb *workbench, schemaText string) <-cha
 	done := runRecovered(func() error {
 		// The whole Apply — prepare and swap — runs under wb.h.mu, so an
 		// abandoned Apply parks HERE and the ctx guard below is the single
-		// gate between acquiring the lock and mutating anything. (The MCP
-		// set_schema path runs prepareSchema before locking instead; doing
-		// that here would let a prepare failure resolve the job before an
+		// gate between acquiring the lock and mutating anything. (The schema
+		// CRUD tools run prepareSchema before locking instead; doing that
+		// here would let a prepare failure resolve the job before an
 		// in-flight Stop's ctx guard ever ran. The pane-freeze cost of
-		// loading under the lock is tracked in TODO.md.) h.setSchema is
-		// self-locking and must not be called with wb.h.mu held.
+		// loading under the lock is tracked in TODO.md.)
 		wb.h.mu.Lock()
 		defer wb.h.mu.Unlock()
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		cfg, db, err := prepareSchema(schemaText, "yaml", wb.h.fsys, wb.h.confine)
+		authoring, runtime, db, err := prepareSchema(schemaText, "yaml", wb.h.fsys, wb.h.confine)
 		if err != nil {
 			return err
 		}
 		// applySchemaLocked fires h.onChange (wired to publishSessionChanged
 		// by newWorkbench) on success, so no explicit publish here — a second
 		// one would fan out the same #predicates fragment twice per Apply.
-		result, err = wb.h.applySchemaLocked(schemaText, cfg, db)
+		result, err = wb.h.applySchemaLocked(schemaText, authoring, runtime, db)
 		return err
 	})
 	go func() {

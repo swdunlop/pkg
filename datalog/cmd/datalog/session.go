@@ -44,6 +44,33 @@ type session struct {
 	cfg        jsonfacts.Config
 	dataDB     *memory.Database // facts loaded from data source (replaced on reload)
 
+	// authoringCfg is the AUTHORING-form config: parsed from the same schema
+	// text as cfg but NOT run through ResolveFromFS, so every matcher's
+	// *_from field still names its pattern file instead of having that
+	// file's patterns merged inline and the field cleared (resolveFromFS
+	// does both, mutating the matcher in place). cfg above is the RESOLVED
+	// runtime form — the one LoadFS and single-row extraction
+	// (jsonfacts_editor.go's extractRecord) must use, since matching runs
+	// against resolved pattern lists.
+	//
+	// The split exists because the schema CRUD surface (schema_crud.go,
+	// schema_reads.go) writes the config BACK to disk: building a
+	// prospective write (or a get_config/current-item handback) from the
+	// resolved form would serialize the baked-inline patterns and DROP the
+	// *_from indirection on the very first agent write — a silent, persisted
+	// behavior change (future edits to the pattern file would stop affecting
+	// extraction, with nothing in the YAML hinting why). So the rule is:
+	// every surface that ROUND-TRIPS the config (CRUD staleness lookups,
+	// prospective building, current-item handbacks, get_config,
+	// predicate_deps' matcher/declaration listings, explain_fact's
+	// schema-side addresses) reads authoringCfg; only loading/matching reads
+	// cfg. Item keys (source File, matcher predicate/term/flags, declaration
+	// name/arity) are identical between the two forms — resolution never
+	// touches them — so revision bookkeeping keyed off either form agrees.
+	// Both fields are always assigned together, from the same source text,
+	// by the same mutators (setSchema, loadData, applySchemaLocked).
+	authoringCfg jsonfacts.Config
+
 	// Canonical document texts. The session owns the documents, not just
 	// their compiled artifacts: the web workbench renders and patches
 	// these, and set_schema/set_rules update them, so a human typing in
@@ -217,6 +244,15 @@ func (s *session) loadData() error {
 	if err != nil {
 		return fmt.Errorf("config %s: %w", s.configPath, err)
 	}
+	// authoring is a second, independent parse of the same bytes — the
+	// unresolved AUTHORING form kept beside the resolved runtime cfg below;
+	// see prepareSchema's doc comment for why parse-twice is the chosen
+	// deep-copy (ResolveFromFS mutates matchers in place) and
+	// session.authoringCfg's for why both forms must exist.
+	authoring, err := parseConfig(data, s.configPath)
+	if err != nil {
+		return fmt.Errorf("config %s: %w", s.configPath, err)
+	}
 
 	var db *memory.Database
 	if strings.HasSuffix(s.dataDir, ".zip") {
@@ -242,6 +278,7 @@ func (s *session) loadData() error {
 	}
 
 	s.cfg = cfg
+	s.authoringCfg = authoring
 	s.schemaText = string(data)
 	s.dataDB = db
 	s.derivedDB = nil
@@ -319,26 +356,44 @@ type confineRef func(ref string) (string, error)
 // parsing the config, validating every file reference through confine,
 // resolving *_from pattern files, and loading the data via fsys. It touches
 // no session state at all, so a caller that shares the session across
-// goroutines (mcpHandlers.setSchema in mcp.go) can run this WITHOUT holding
-// its lock, taking the lock only for the cheap field swap setSchema (or the
-// caller itself) performs afterward — the fix for set_schema holding h.mu
-// across a full data reload. Returns the parsed config and loaded database
-// on success; on any error, nothing has been touched yet, so there is
-// nothing for a caller to unwind.
-func prepareSchema(text string, format string, fsys fs.FS, confine confineRef) (jsonfacts.Config, *memory.Database, error) {
-	cfg, err := parseConfigFormat([]byte(text), format)
+// goroutines (the schema CRUD writes in schema_crud.go) can run this
+// WITHOUT holding its lock, taking the lock only for the cheap field swap
+// setSchema (or the caller itself) performs afterward — the fix for
+// set_schema holding h.mu across a full data reload. On any error, nothing
+// has been touched yet, so there is nothing for a caller to unwind.
+//
+// It returns TWO configs (see session.authoringCfg's doc comment for the
+// full rationale): authoring is the parsed config exactly as written, with
+// every matcher's *_from field intact; runtime is a resolved copy —
+// ResolveFromFS merges each *_from pattern file into the inline lists and
+// clears the field, mutating matchers in place — which is what LoadFS
+// matches against. The deep copy is obtained by simply parsing text a
+// SECOND time rather than by a reflective/manual clone: the text is already
+// in hand, parseConfigFormat is cheap next to the LoadFS that follows, and
+// a second parse is guaranteed to share no slice backing arrays with the
+// authoring value — the exact property the in-place resolution would
+// otherwise violate — with no clone helper to keep in sync as Config grows
+// fields.
+func prepareSchema(text string, format string, fsys fs.FS, confine confineRef) (authoring, runtime jsonfacts.Config, db *memory.Database, err error) {
+	authoring, err = parseConfigFormat([]byte(text), format)
 	if err != nil {
-		return jsonfacts.Config{}, nil, err
+		return jsonfacts.Config{}, jsonfacts.Config{}, nil, err
+	}
+	runtime, err = parseConfigFormat([]byte(text), format)
+	if err != nil {
+		return jsonfacts.Config{}, jsonfacts.Config{}, nil, err
 	}
 
+	// Confinement checks read the AUTHORING form: the *_from fields being
+	// validated here are exactly the ones resolution would clear.
 	if confine != nil {
-		for i, src := range cfg.Sources {
+		for i, src := range authoring.Sources {
 			if _, err := confine(src.File); err != nil {
-				return jsonfacts.Config{}, nil, fmt.Errorf("source %d: file %q: %w", i, src.File, err)
+				return jsonfacts.Config{}, jsonfacts.Config{}, nil, fmt.Errorf("source %d: file %q: %w", i, src.File, err)
 			}
 		}
-		for i := range cfg.Matchers {
-			m := &cfg.Matchers[i]
+		for i := range authoring.Matchers {
+			m := &authoring.Matchers[i]
 			for _, ref := range []string{
 				m.ContainsFrom, m.StartsWithFrom, m.EndsWithFrom,
 				m.RegexMatchFrom, m.Base64From, m.Base64UTF16From, m.CIDRFrom,
@@ -347,24 +402,25 @@ func prepareSchema(text string, format string, fsys fs.FS, confine confineRef) (
 					continue
 				}
 				if _, err := confine(ref); err != nil {
-					return jsonfacts.Config{}, nil, fmt.Errorf("matcher %d: file %q: %w", i, ref, err)
+					return jsonfacts.Config{}, jsonfacts.Config{}, nil, fmt.Errorf("matcher %d: file %q: %w", i, ref, err)
 				}
 			}
 		}
 	}
 
-	// Resolve *_from pattern files ourselves: LoadFS (unlike LoadSchemaFS)
-	// does not do this, and an MCP-submitted config is not a schema-dir
-	// file, so nothing else will resolve them before matching runs.
-	if err := cfg.ResolveFromFS(fsys); err != nil {
-		return jsonfacts.Config{}, nil, err
+	// Resolve *_from pattern files on the RUNTIME copy only: LoadFS (unlike
+	// LoadSchemaFS) does not do this, and an MCP-submitted config is not a
+	// schema-dir file, so nothing else will resolve them before matching
+	// runs.
+	if err := runtime.ResolveFromFS(fsys); err != nil {
+		return jsonfacts.Config{}, jsonfacts.Config{}, nil, err
 	}
 
-	db, err := cfg.LoadFS(fsys)
+	db, err = runtime.LoadFS(fsys)
 	if err != nil {
-		return jsonfacts.Config{}, nil, fmt.Errorf("loading data: %w", err)
+		return jsonfacts.Config{}, jsonfacts.Config{}, nil, fmt.Errorf("loading data: %w", err)
 	}
-	return cfg, db, nil
+	return authoring, runtime, db, nil
 }
 
 // setSchema replaces the session's jsonfacts configuration atomically: it
@@ -378,11 +434,12 @@ func prepareSchema(text string, format string, fsys fs.FS, confine confineRef) (
 // commit the four fields below together under their own lock — see that
 // method's doc comment for the TOCTOU reasoning.
 func (s *session) setSchema(text string, format string, fsys fs.FS, confine confineRef) error {
-	cfg, db, err := prepareSchema(text, format, fsys, confine)
+	authoring, runtime, db, err := prepareSchema(text, format, fsys, confine)
 	if err != nil {
 		return err
 	}
-	s.cfg = cfg
+	s.cfg = runtime
+	s.authoringCfg = authoring
 	s.schemaText = text
 	s.dataDB = db
 	s.derivedDB = nil

@@ -128,6 +128,29 @@ type mcpHandlers struct {
 	// needs it to keep the loaded groups available for that follow-up and
 	// to know, at load time, which file a parse error belongs to.
 	rules *ruleStore
+
+	// configPath is the -c flag's value (schema_crud.go's write path's ONE
+	// disk target): empty means this session was started with no schema
+	// file at all, in which case every schema CRUD write tool refuses with
+	// errSchemaPathRequired, the same way h.rules == nil refuses every
+	// rule-group CRUD call. Unlike rules (a directory of many files), the
+	// schema is always ONE file — every put_source/put_matcher/
+	// put_declaration write rewrites this same path in full, per design
+	// decision 4's "deterministic serialization... rewrites the whole
+	// file."
+	configPath string
+
+	// schemaRev is the in-memory, per-process revision bookkeeping for every
+	// keyed schema item (schema_crud.go's schemaRevisions) — the schema
+	// CRUD surface's counterpart to h.rules' per-group Revision field.
+	// Populated at construction from whatever h.sess.authoringCfg loaded with
+	// (newSchemaRevisions), and replaced wholesale after every successful
+	// write (schema_crud.go's commitSchemaWrite). nil-safe is NOT relied
+	// upon: newMCPHandlers always sets this to a non-nil value (even for a
+	// configPath == "" session, since get_config's read path — and a
+	// caller checking h.configPath first — never needs to consult it, but
+	// leaving it nil would panic the moment anything did).
+	schemaRev *schemaRevisions
 }
 
 // lockedSnapshot is the one sanctioned way to read session state for a
@@ -337,7 +360,17 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir str
 		sess.rulesText = rulesText.String()
 	}
 
-	return &mcpHandlers{sess: sess, fsys: fsys, confine: confine, timeout: timeout, rules: store}, closeFn, nil
+	// schemaRev is built from whatever sess.authoringCfg ended up holding above
+	// (empty if configPath == "", exactly like a freshly loaded config with
+	// no items). A configPath == "" session still gets a non-nil schemaRev
+	// even though every write tool refuses it outright (errSchemaPathRequired)
+	// — get_config's read path (schema_reads.go) has no such restriction and
+	// must never nil-panic on a schema-less session.
+	return &mcpHandlers{
+		sess: sess, fsys: fsys, confine: confine, timeout: timeout, rules: store,
+		configPath: configPath,
+		schemaRev:  newSchemaRevisions(sess.authoringCfg),
+	}, closeFn, nil
 }
 
 // toolMode scopes which tools registerToolsForMode wires into a server
@@ -353,13 +386,14 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir str
 // registerToolsForMode) rather than a rewrite of the registration wiring.
 type toolMode string
 
-// toolModeRules is Query Mode's surface plus rule-group CRUD (design
-// decision 5's "Rules Mode" bullet) — every tool this package currently
-// exposes. set_schema is included here too: schema CRUD per design decision
-// 4 is a later phase, so until that lands, keeping set_schema registered in
-// every mode (rather than gating it behind a not-yet-built Facts Mode) is
-// the only choice that doesn't regress today's whole-document schema
-// editing capability.
+// toolModeRules is Query Mode's surface plus rule-group CRUD AND schema CRUD
+// (design decision 5's "Rules Mode" bullet, plus the schema-write set that
+// properly belongs to the not-yet-built Facts Mode) — every tool this
+// package currently exposes. Schema CRUD (schema_crud.go, design decision 4)
+// is registered here too because modes are not yet user-visible (design
+// decision 10: "toolModeRules currently registers everything"); once Facts
+// Mode is built, registerSchemaWriteSet moves under its own case instead of
+// riding along with rulesWriteSet here.
 const toolModeRules toolMode = "rules"
 
 // registerTools wires this handler's full tool surface (today, toolModeRules
@@ -390,21 +424,6 @@ func (h *mcpHandlers) registerTools(srv *server.MCPServer) {
 // neither set here) a small diff instead of a rewrite.
 func (h *mcpHandlers) registerToolsForMode(srv *server.MCPServer, mode toolMode) {
 	registerQuerySet := func() {
-		srv.AddTool(
-			mcp.NewTool("set_schema",
-				mcp.WithDescription(mcpSetSchemaDescription),
-				mcp.WithInputSchema[setSchemaInput](),
-			),
-			// No h.mu here: like query, setSchema manages its own locking,
-			// holding it only around the cheap field swap — the expensive
-			// parse/confine/load work (prepareSchema) runs lock-free first. See
-			// setSchema's doc comment. set_schema rides in this group per
-			// registerToolsForMode's doc comment (schema CRUD proper is a
-			// later phase; until then it stays available everywhere).
-			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in setSchemaInput) (setSchemaOutput, error) {
-				return h.setSchema(in)
-			}),
-		)
 		srv.AddTool(
 			mcp.NewTool("query",
 				mcp.WithDescription(mcpQueryDescription(h.timeout)),
@@ -497,6 +516,36 @@ func (h *mcpHandlers) registerToolsForMode(srv *server.MCPServer, mode toolMode)
 				return h.getRuleGroup(in)
 			}),
 		)
+		srv.AddTool(
+			mcp.NewTool("get_config",
+				mcp.WithDescription(mcpGetConfigDescription),
+				mcp.WithInputSchema[getConfigInput](),
+			),
+			// h.getConfig takes h.mu itself (read-only, cheap — no Transform).
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in getConfigInput) (getConfigOutput, error) {
+				return h.getConfig(in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("predicate_deps",
+				mcp.WithDescription(mcpPredicateDepsDescription),
+				mcp.WithInputSchema[predicateDepsInput](),
+			),
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in predicateDepsInput) (predicateDepsOutput, error) {
+				return h.predicateDeps(in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("explain_fact",
+				mcp.WithDescription(mcpExplainFactDescription),
+				mcp.WithInputSchema[explainFactInput](),
+			),
+			// No h.mu here: explainFact manages its own locking, mirroring
+			// explain's lock-free-Transform-then-writeback split.
+			mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in explainFactInput) (explainFactOutput, error) {
+				return h.explainFact(ctx, in)
+			}),
+		)
 	}
 
 	registerRulesWriteSet := func() {
@@ -530,10 +579,82 @@ func (h *mcpHandlers) registerToolsForMode(srv *server.MCPServer, mode toolMode)
 		)
 	}
 
+	// registerSchemaWriteSet is the schema CRUD surface (design decision 4's
+	// schema half; schema_crud.go): put_source/delete_source,
+	// put_matcher/delete_matcher, put_declaration/delete_declaration. This is
+	// today registered alongside rulesWriteSet under toolModeRules (design
+	// decision 10: "toolModeRules currently registers everything"); it is
+	// Facts Mode's future surface (design decision 5's "Facts Mode" bullet),
+	// which will register this set WITHOUT registerRulesWriteSet once modes
+	// are user-visible.
+	//
+	// Each write method manages its own locking (unlike put_rule_group's
+	// whole-call h.mu): a schema write's prepareSchema half can be slow
+	// (a full data reload), so — exactly like set_schema before it — the
+	// lock is only taken for the cheap staleness-check-and-swap, never
+	// across the reload itself. See schema_crud.go's commitSchemaWrite.
+	registerSchemaWriteSet := func() {
+		srv.AddTool(
+			mcp.NewTool("put_source",
+				mcp.WithDescription(mcpPutSourceDescription),
+				mcp.WithInputSchema[putSourceInput](),
+			),
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putSourceInput) (putSourceOutput, error) {
+				return h.putSource(in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("delete_source",
+				mcp.WithDescription(mcpDeleteSourceDescription),
+				mcp.WithInputSchema[deleteSourceInput](),
+			),
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteSourceInput) (deleteSourceOutput, error) {
+				return h.deleteSource(in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("put_matcher",
+				mcp.WithDescription(mcpPutMatcherDescription),
+				mcp.WithInputSchema[putMatcherInput](),
+			),
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putMatcherInput) (putMatcherOutput, error) {
+				return h.putMatcher(in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("delete_matcher",
+				mcp.WithDescription(mcpDeleteMatcherDescription),
+				mcp.WithInputSchema[deleteMatcherInput](),
+			),
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteMatcherInput) (deleteMatcherOutput, error) {
+				return h.deleteMatcher(in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("put_declaration",
+				mcp.WithDescription(mcpPutDeclarationDescription),
+				mcp.WithInputSchema[putDeclarationInput](),
+			),
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putDeclarationInput) (putDeclarationOutput, error) {
+				return h.putDeclaration(in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("delete_declaration",
+				mcp.WithDescription(mcpDeleteDeclarationDescription),
+				mcp.WithInputSchema[deleteDeclarationInput](),
+			),
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteDeclarationInput) (deleteDeclarationOutput, error) {
+				return h.deleteDeclaration(in)
+			}),
+		)
+	}
+
 	switch mode {
 	case toolModeRules:
 		registerQuerySet()
 		registerRulesWriteSet()
+		registerSchemaWriteSet()
 	default:
 		// No other mode exists yet (see toolMode's doc comment) — an unknown
 		// mode value is a programming error in this package, not a runtime
@@ -542,12 +663,16 @@ func (h *mcpHandlers) registerToolsForMode(srv *server.MCPServer, mode toolMode)
 	}
 }
 
-// -- set_schema ---------------------------------------------------------
-
-type setSchemaInput struct {
-	Schema string `json:"schema" jsonschema:"the jsonfacts config document (sources, matchers, declarations), whole-document replacement"`
-	Format string `json:"format,omitempty" jsonschema:"\"yaml\" (default) or \"json\", matching how schema is written"`
-}
+// -- schema output shapes -------------------------------------------------
+//
+// setSchemaOutput's name predates phase 1c (it originally backed the
+// whole-document set_schema MCP tool, removed in favor of the schema CRUD
+// tools in schema_crud.go — design decision 4). It survives, unrenamed, as
+// applySchemaLocked's return shape: every schema CRUD write still ends by
+// swapping into the session through applySchemaLocked and wants the exact
+// same per-predicate fact-count feedback, so this type (and
+// predicateCount/countPredicates below) are shared, not duplicated, by
+// schema_crud.go's commitSchemaWrite.
 
 type predicateCount struct {
 	Name  string `json:"name"`
@@ -560,35 +685,16 @@ type setSchemaOutput struct {
 	Warnings   []string         `json:"warnings,omitempty"`
 }
 
-// setSchema runs the expensive parse/confine/*_from-resolve/load work
-// (session.prepareSchema) BEFORE taking h.mu, then holds the lock only for
-// the field swap, buildDB, and onChange — a query, another tool call, or a
-// workbench pane render no longer blocks for the duration of a full data
-// reload (the mechanism this fixes: set_schema previously held h.mu across
-// the whole call). Two set_schema calls racing each other each run their
-// own prepareSchema independently and then swap in whichever finishes last;
-// every field that swap touches (cfg, schemaText, dataDB, derivedDB) comes
-// from the SAME prepareSchema result and is assigned in one lock
-// acquisition, so last-swap-wins still leaves the session internally
-// coherent — never a schemaText from one submission paired with a dataDB
-// from another.
-func (h *mcpHandlers) setSchema(in setSchemaInput) (setSchemaOutput, error) {
-	cfg, db, err := prepareSchema(in.Schema, in.Format, h.fsys, h.confine)
-	if err != nil {
-		return setSchemaOutput{}, err
-	}
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.applySchemaLocked(in.Schema, cfg, db)
-}
-
 // applySchemaLocked swaps a prepareSchema result into the session and fires
 // onChange. Callers must hold h.mu; the schema editor's Apply path takes the
 // lock itself so it can check its context for a Stop between acquiring the
-// lock and committing the swap.
-func (h *mcpHandlers) applySchemaLocked(schemaText string, cfg jsonfacts.Config, db *memory.Database) (setSchemaOutput, error) {
-	h.sess.cfg = cfg
+// lock and committing the swap. authoring and runtime are prepareSchema's
+// two config forms (see session.authoringCfg's doc comment) and must come
+// from the SAME prepareSchema call as db, so the session's schema-derived
+// fields never mix generations.
+func (h *mcpHandlers) applySchemaLocked(schemaText string, authoring, runtime jsonfacts.Config, db *memory.Database) (setSchemaOutput, error) {
+	h.sess.cfg = runtime
+	h.sess.authoringCfg = authoring
 	h.sess.schemaText = schemaText
 	h.sess.dataDB = db
 	h.sess.derivedDB = nil

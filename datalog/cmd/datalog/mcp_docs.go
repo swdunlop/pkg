@@ -14,23 +14,27 @@ import "time"
 const mcpServerInstructions = `This server exposes one Datalog evaluation session backed by an
 operator-chosen data directory. Session state (schema, loaded facts) lives
 only for this connection; rule groups written via put_rule_group/
-delete_rule_group land on disk immediately in the operator's rules/
-directory (see below) — that part IS persisted.
+delete_rule_group, and schema items written via put_source/put_matcher/
+put_declaration (and their delete_ counterparts), land on disk immediately
+(rule groups in the operator's rules/ directory, schema items in the
+operator's schema file — see below) — that part IS persisted.
 
 Before anything else, call list_predicates. A session often arrives
 already populated with the operator's schema and rules - answer
-questions against it with query and sample_facts. set_schema REPLACES the
-operator's whole data-loading document; put_rule_group/delete_rule_group
-edit ONE rule group at a time. Enter the authoring loop below only when
-the session is empty or the operator has asked you to change the mappings
-or rules - never just to answer a question.
+questions against it with query and sample_facts. put_source/put_matcher/
+put_declaration and put_rule_group/delete_rule_group each edit ONE item at
+a time - there is no whole-document replacement tool. Enter the authoring
+loop below only when the session is empty or the operator has asked you to
+change the mappings or rules - never just to answer a question.
 
 Workflow loop (repeat as needed):
   1. sample_input      - look at raw JSONL records to learn field names.
-  2. set_schema        - submit a jsonfacts config mapping JSON fields to
-                          predicates; check the returned per-predicate fact
-                          counts. Zero facts for a predicate means the
-                          mapping is wrong - iterate.
+  2. put_source         - create or edit ONE source (a JSONL file plus its
+                          mappings to predicates); check the returned
+                          per-predicate fact counts. Zero facts for a
+                          predicate means the mapping is wrong - iterate.
+                          put_matcher/put_declaration add string-matching
+                          and documentation on top of a loaded predicate.
   3. put_rule_group     - create or edit ONE rule group (all statements
                           sharing one head predicate/arity) deriving
                           higher-level predicates from the loaded facts.
@@ -39,23 +43,30 @@ Workflow loop (repeat as needed):
                           text so you can retry against it.
   4. query             - run one query and inspect vars/rows/stats. Iterate
                           on the rules or schema based on what comes back.
-  5. explain           - given one fact from a query result, get its full
-                          derivation tree (rule + body facts, recursively) -
-                          use this to justify a finding instead of inventing
-                          a justification for it.
+  5. explain / explain_fact - given one fact from a query result, get its
+                          full derivation tree (explain) or just the next
+                          step up plus an editable address (explain_fact) -
+                          use this to justify a finding instead of
+                          inventing a justification for it.
 
 list_predicates is the cheap index; before writing a rule or query against
 an unfamiliar predicate, call describe instead of guessing at its terms or
 meaning - it returns the predicate's declared/assembled documentation,
 term names, current fact count, and every rule that derives or consumes
-it, per arity. list_rule_groups/get_rule_group are the rule-group-shaped
-counterpart: use them to see what groups exist and their current text/
-revision before editing one with put_rule_group.
+it, per arity. predicate_deps gives the same dependency information as
+addressable rule-group/matcher/declaration keys instead of rendered rule
+text - use it when you need to know WHERE to edit, not just what a
+predicate means. list_rule_groups/get_rule_group and get_config are the
+index-then-fetch counterpart for rules and schema respectively: use them to
+see what already exists and its current revision before editing anything
+with put_rule_group/put_source/put_matcher/put_declaration.
 
-set_schema replaces the whole data-loading document; there is no
-incremental add_source/add_matcher API. put_rule_group/delete_rule_group are
-already incremental — each call touches exactly one rule group's file,
-identified by (head, arity), never the whole ruleset.
+Every put_/delete_ tool is keyed and incremental — each call touches
+exactly one item (one source file, one matcher, one declaration, one rule
+group), identified by that item's key, never the whole document. A stale
+write (the item changed since you last read it) comes back as a normal
+result with "is_stale": true and the item's current content, not a tool
+error - re-fetch or retry with the current revision.
 
 ` + mcpDialectPrimer
 
@@ -101,30 +112,20 @@ This dialect, beyond textbook Datalog:
   - Statements end with "." (facts, rules) or "?" (queries); comments
     start with "%".`
 
-// mcpSetSchemaDescription documents the jsonfacts config format for
-// set_schema: sources, matchers, and declarations, condensed from
-// jsonfacts/doc.go and README.md.
-const mcpSetSchemaDescription = `Replace the session's data-loading schema (a jsonfacts config) and reload
-data from the confined data directory. Part of the workflow loop: call
-sample_input first to see raw record shapes, then iterate set_schema
-against the returned per-predicate fact counts until every predicate you
-need has a plausible (non-zero) count.
-
-The schema has three sections, each optional:
-
-sources - one entry per JSONL file plus one or more mappings from JSON
-fields to predicate facts. Two mapping styles, mutually exclusive within
-one mapping entry:
+// mcpSchemaMappingSyntax is the mapping-expression reference shared by
+// mcpPutSourceDescription (simple/imperative mapping modes, condensed from
+// jsonfacts/doc.go and README.md — the same content the removed
+// whole-document set_schema tool's description used to carry for its
+// "sources" section).
+const mcpSchemaMappingSyntax = `Two mapping styles, mutually exclusive within one mapping entry:
 
   Simple mode: each element of "args" is an expr-lang expression
   evaluated against "value" (the parsed JSON object for the current
   line); one fact is emitted per line unless "filter" evaluates false.
 
-    {"sources": [{"file": "processes.jsonl", "mappings": [
-      {"predicate": "process",
-       "args": ["value.pid", "value.name", "value.cmdline"],
-       "filter": "value.pid != 0"}
-    ]}]}
+    {"predicate": "process",
+     "args": ["value.pid", "value.name", "value.cmdline"],
+     "filter": "value.pid != 0"}
 
     Given {"pid": 1234, "name": "cmd.exe", "cmdline": "cmd /c whoami"}
     this emits process(1234, "cmd.exe", "cmd /c whoami").
@@ -151,15 +152,72 @@ one mapping entry:
   error - useful for asserting a whole raw record for later evidence
   while also flattening the hot fields you need to join on:
 
-    {"expr": "let id = fresh_id(); assert(\"event\", [id, value]); assert(\"process\", [id, value.pid, value.name])"}
+    {"expr": "let id = fresh_id(); assert(\"event\", [id, value]); assert(\"process\", [id, value.pid, value.name])"}`
 
-matchers - scan an already-loaded predicate's string term for patterns
-and emit derived match facts, without writing Datalog rules for simple
-string matching:
+// mcpSchemaCrudStaleness is the revision-staleness paragraph shared by every
+// schema CRUD write description (schema_crud.go's put/delete methods all
+// implement this exact protocol; see rules_crud.go's mirrored
+// mcpPutRuleGroupDescription paragraph, which this is deliberately worded
+// to match).
+const mcpSchemaCrudStaleness = `"revision" is the staleness guard (see also get_config, which reports every
+item's current revision):
+  - 0 (or omitted): create a NEW item. If one already exists at this key,
+    the call is rejected as stale ("is_stale": true) with no current
+    content to hand back — call get_config to see what's there.
+  - the item's CURRENT revision: edit it. Any other value (including 0, if
+    the item already exists) is rejected as stale, with the current item
+    and revision returned so you can re-base your edit and resubmit.
+A stale rejection is NOT a tool error: it comes back as a normal successful
+result with "is_stale": true, precisely so the current item and revision
+ride along as structured data you can act on immediately.`
 
-    {"matchers": [{"predicate": "process", "term": 2,
-                    "case_insensitive": true, "windash": true,
-                    "contains": ["certutil", "bitsadmin"]}]}
+// mcpPutSourceDescription documents put_source: one JSONL source (file +
+// mappings) at a time, keyed by "file" (design decision 1's source key).
+const mcpPutSourceDescription = `Create or replace ONE source: a JSONL file plus one or more mappings from
+its JSON fields to predicate facts. Keyed by "file" — submitting the same
+"file" again replaces that source's mappings wholesale (not merged); a
+different "file" creates a new source alongside existing ones. Part of the
+workflow loop: call sample_input first to see raw record shapes, then
+iterate put_source against the returned per-predicate fact counts until
+every predicate you need has a plausible (non-zero) count.
+
+` + mcpSchemaMappingSyntax + `
+
+` + mcpSchemaCrudStaleness + `
+
+Validation, all-or-nothing: the prospective whole schema (every other
+source/matcher/declaration unchanged, plus this one) is parsed, its file
+references confined and resolved, and the data reloaded before anything is
+written — a bad file reference, expr error, or type mismatch anywhere is
+refused and nothing on disk changes. On success, returns the new
+"revision" and per-predicate fact counts (like the old set_schema's).`
+
+// mcpDeleteSourceDescription documents delete_source.
+const mcpDeleteSourceDescription = `Delete one source (identified by "file") entirely, removing its mappings
+from the schema. "revision" must equal the source's CURRENT revision (see
+get_config) — any other value, or naming a source that does not exist, is
+rejected as stale ("is_stale": true, with "current_source"/
+"current_revision" attached when the source does exist).
+
+On success, returns the "file" removed and per-predicate fact counts,
+reflecting the schema with this source's facts gone.`
+
+// mcpPutMatcherDescription documents put_matcher: scans an already-loaded
+// predicate's string term for patterns and emits derived match facts,
+// without writing Datalog rules for simple string matching. Condensed from
+// the removed set_schema description's "matchers" section.
+const mcpPutMatcherDescription = `Create or replace ONE matcher: scans an already-loaded predicate's string
+term for patterns and emits derived match facts, without writing Datalog
+rules for simple string matching. Keyed by the tuple ("predicate", "term",
+"case_insensitive", "windash") — submitting that same key again replaces
+its pattern lists; changing any of those four fields targets a DIFFERENT
+matcher (create a new one; delete the old one if it should no longer
+exist).
+
+    {"predicate": "process", "term": 2,
+     "case_insensitive": true, "windash": true,
+     "contains": ["certutil", "bitsadmin"],
+     "revision": 0}
 
   This scans term index 2 (0-based) of every process/N fact and emits
   ci_wd_contains(value, pattern) for each match. The emitted predicate
@@ -178,17 +236,118 @@ string matching:
   pattern per line, "#"-prefixed lines are comments. File references,
   like source files, are confined to the operator's data directory.
 
-declarations - name a predicate's terms, purely for documentation and
-for structured tool output (list_predicates' "use" field):
+` + mcpSchemaCrudStaleness + `
 
-    {"declarations": [{"name": "process", "use": "A running process.",
-                        "terms": [{"name": "pid"}, {"name": "name"}, {"name": "cmdline"}]}]}
+Validation, all-or-nothing, same as put_source: the prospective whole
+schema is parsed and reloaded before anything is written. On success,
+returns the new "revision" and per-predicate fact counts.`
 
-Submit "format" as "yaml" (default) or "json" to match how you wrote the
-"schema" text. The whole config is replaced on each call - there is no
-incremental add_source/add_matcher API. On success you get per-predicate
-fact counts; on failure (bad file reference, bad expr, invalid regex/CIDR,
-etc.) you get the underlying error, and the previous schema stays active.`
+// mcpDeleteMatcherDescription documents delete_matcher.
+const mcpDeleteMatcherDescription = `Delete one matcher (identified by its full key: "predicate", "term",
+"case_insensitive", "windash") entirely. "revision" must equal the
+matcher's CURRENT revision (see get_config) — any other value, or naming a
+matcher that does not exist, is rejected as stale ("is_stale": true, with
+"current_matcher"/"current_revision" attached when it does exist).
+
+On success, returns per-predicate fact counts reflecting the schema with
+this matcher's derived facts gone.`
+
+// mcpPutDeclarationDescription documents put_declaration: names a
+// predicate's terms, purely for documentation and structured tool output.
+const mcpPutDeclarationDescription = `Create or replace ONE declaration: names a predicate's terms, purely for
+documentation and structured tool output (list_predicates'/describe's "use"
+fields). Keyed by ("name", "arity" i.e. len(terms)) — a predicate may be
+declared at more than one arity as distinct declarations; changing "terms"'
+length targets a DIFFERENT declaration (create the new arity; delete the
+old one if it should no longer exist).
+
+    {"name": "process", "use": "A running process.",
+     "terms": [{"name": "pid"}, {"name": "name"}, {"name": "cmdline"}],
+     "revision": 0}
+
+` + mcpSchemaCrudStaleness + `
+
+Validation, all-or-nothing, same as put_source. On success, returns the
+new "revision" and per-predicate fact counts (declarations don't change
+fact counts themselves, but the feedback shape matches every other schema
+write for consistency).`
+
+// mcpDeleteDeclarationDescription documents delete_declaration.
+const mcpDeleteDeclarationDescription = `Delete one declaration (identified by "name"/"arity") entirely. "revision"
+must equal the declaration's CURRENT revision (see get_config) — any other
+value, or naming a declaration that does not exist, is rejected as stale
+("is_stale": true, with "current_declaration"/"current_revision" attached
+when it does exist).`
+
+// mcpGetConfigDescription documents get_config: the schema CRUD surface's
+// index-then-fetch counterpart to list_rule_groups/get_rule_group.
+const mcpGetConfigDescription = `Return the whole schema as structured data: every source, matcher, and
+declaration currently loaded, each with its full content and current
+"revision" — the revision put_source/put_matcher/put_declaration (or their
+delete_ counterparts) need to edit or delete that exact item. Items are
+returned in the schema file's canonical order (sources by file, matchers by
+their key tuple, declarations by name/arity), matching what a fresh read of
+the on-disk file would show after any write. Call this before editing
+anything, or to answer "what does the schema currently do" without reading
+YAML.`
+
+// mcpPredicateDepsDescription documents predicate_deps: static dependency
+// analysis in both directions, addressable rather than rendered (contrast
+// with describe, whose derivedBy/consumedBy render rule TEXT).
+const mcpPredicateDepsDescription = `Report one predicate/arity's dependencies in both directions, as EDITABLE
+ADDRESSES rather than rendered rule text (contrast with describe, whose
+derivedBy/consumedBy fields render full rule source) — use this when you
+need to know WHERE to make a change, not just what a predicate means.
+
+"depends_on_groups" - rule groups (head/arity/file) whose HEAD is this
+predicate: what DERIVES it via rules. "depends_on_matchers" /
+"declaration" - for a base predicate, the schema matchers and/or
+declaration that produce or document it (their exact keys, ready for
+put_matcher/put_declaration/delete_matcher/delete_declaration). A predicate
+that is both loaded from data AND rule-derived reports both.
+
+"depended_on_by" - every rule group whose BODY references this predicate
+in any position (including a negated atom or an aggregate rule's body):
+what would break, or need re-checking, if you changed this predicate's
+shape. Matchers never depend on predicates the way rules do (a matcher
+only ever reads its own configured predicate/term), so this list is always
+rule-group addresses.
+
+An unknown predicate/arity (no facts, no declaration, no matcher, no rule
+head or body reference at all) is an error — check the name/arity with
+list_predicates or describe first. A legacy session (no --rules directory)
+still works; rule-group addresses just come back with an empty "file"
+field instead of erroring.`
+
+// mcpExplainFactDescription documents explain_fact: post-hoc ONE-step
+// derivation with an always-present editable address (design decision 9),
+// contrasted with the existing full-recursion explain tool.
+const mcpExplainFactDescription = `Explain ONE STEP of a fact's derivation, plus the editable address where
+that step is defined — narrower than the explain tool (which recurses the
+whole tree) but always names WHERE to go make a change. Recurse yourself by
+calling explain_fact again on one of the returned premise facts.
+
+"fact" is one ground fact, exactly as explain's "fact" argument works:
+predicate name plus constant terms, e.g. concern("ws01", 87).
+
+"exists" is false when the CURRENT schema+rules+data evaluation never
+produced this fact at all — check the predicate/arity/terms with
+list_predicates/sample_facts. When true, "kind" is:
+
+  "derived" - "rule" (the deriving rule's text) and "doc" (its %% doc, if
+  any), "rule_address" (the rule group's {head, arity, file} — empty file
+  on a legacy, non---rules session), and "premises": the ground body facts
+  ONE level down (each with "base": true/false, but NOT themselves
+  recursively explained — call explain_fact again on one to go deeper).
+
+  "base" - this fact was loaded from data or asserted directly, not derived
+  by a rule. "declaration" names the schema declaration for this predicate,
+  if any. "candidate_matchers" lists every matcher whose "predicate" field
+  names this fact's predicate (a STATIC match on the schema's configured
+  matchers, not a trace to the exact source record/mapping that produced
+  THIS specific fact — a base fact may have come from a plain source
+  mapping with no matcher involved at all, in which case this list is
+  simply empty).`
 
 // mcpDatalogSyntaxSummary is the condensed Datalog syntax reference shared
 // by put_rule_group and query descriptions, condensed from README.md.
