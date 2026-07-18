@@ -55,10 +55,7 @@ func runServe(args []string) {
 
 	// Flags are parsed before positionals (stdlib flag.FlagSet stops at the
 	// first non-flag argument), so flags.Args() here is exactly the rules
-	// files given on the command line, in order. The first one (if any) is
-	// the Save target for the Datalog Editor's rules document, per the
-	// design's "Session state and persistence" section — see handleSave's
-	// doc comment for the full path-resolution policy. --rules and
+	// files given on the command line, in order. --rules and
 	// positional rule files are mutually exclusive (doc/features/
 	// workbench-v2.md work item 1): the directory store and the legacy
 	// monolithic-file(s) path both set session.rulesText, and there is no
@@ -84,6 +81,19 @@ func runServe(args []string) {
 		os.Exit(1)
 	}
 	defer closeFn()
+
+	// Disk is canonical: watch the schema file and rules/ directory so a
+	// vim save (or an agent write's echo) reloads, re-evaluates, and
+	// repaints (watch.go; doc/features/workbench-v2.md design decision 3).
+	// Fatal on error: an operator who started serve with -c/--rules is
+	// relying on saves being seen — a silently dead watcher would bring
+	// back exactly the stale-workbench bug this feature exists to fix.
+	stopWatcher, err := wb.startWatcher()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "datalog serve: %v\n", err)
+		os.Exit(1)
+	}
+	defer stopWatcher()
 
 	fmt.Fprintf(os.Stderr, "datalog serve: /mcp bearer token: %s\n", wb.mcpToken)
 
@@ -163,8 +173,6 @@ func newWorkbench(dataDir, configPath string, ruleFiles []string, rulesDir strin
 		console:     &consoleLog{},
 		mcpSrv:      srv,
 		agentCfg:    agentCfg,
-		schemaPath:  configPath,
-		rulesPath:   firstOrEmpty(ruleFiles),
 		mcpToken:    token,
 		pendingPerm: map[string]pendingPermission{},
 	}
@@ -215,16 +223,6 @@ func newWorkbench(dataDir, configPath string, ruleFiles []string, rulesDir strin
 	}
 
 	return wb, closeFn, nil
-}
-
-// firstOrEmpty returns files[0], or "" if files is empty — the rules Save
-// target resolution needs "no rules file given at startup" to be
-// distinguishable from "given but empty".
-func firstOrEmpty(files []string) string {
-	if len(files) == 0 {
-		return ""
-	}
-	return files[0]
 }
 
 // mcpURL derives the /mcp URL an acpDriver hands its agent from the
@@ -370,14 +368,16 @@ type workbench struct {
 	permMu      sync.Mutex
 	pendingPerm map[string]pendingPermission
 
-	// schemaPath and rulesPath are the operator-given startup paths for the
-	// schema (-c) and rules (first positional .dl file) documents,
-	// respectively — the Save targets (doc/features/web-ui.md "Session state
-	// and persistence"). Empty means "not given at startup"; see
-	// handleSave's doc comment for the resulting no-path policy. These are
-	// operator-trusted (flag/argv values), never model or browser input.
-	schemaPath string
-	rulesPath  string
+	// lastReload is the persistent reload-status surface (doc/features/
+	// workbench-v2.md design decision 3: "Parse/compile errors land in a
+	// persistent status surface and are visible to the next agent turn"):
+	// the fsnotify watcher's most recent reload outcome — what changed, or
+	// why the reload was refused and the last good state kept. Phase 2's
+	// agent-turn preamble and status rendering consume this; for phase 1d it
+	// is recorded here (under reloadMu, NOT h.mu — status reads must not
+	// contend with the session mutex) and logged to stderr.
+	reloadMu   sync.Mutex
+	lastReload reloadStatus
 
 	// mcpToken is the bearer token required on /mcp (doc/features/web-ui.md
 	// Deployment section). Generated at startup if --mcp-token was not
@@ -453,7 +453,6 @@ func (wb *workbench) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /cancel", wb.handleCancel)
 
 	// Save/git (save.go).
-	mux.HandleFunc("POST /save/{doc}", wb.handleSave)
 }
 
 // handleRoot redirects GET / to the Facts view, the authoring loop's usual

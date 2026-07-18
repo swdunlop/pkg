@@ -5,6 +5,7 @@ go 1.26.4
 require (
 	github.com/coder/acp-go-sdk v0.13.5
 	github.com/expr-lang/expr v1.17.8
+	github.com/fsnotify/fsnotify v1.10.1
 	github.com/lmorg/readline/v4 v4.2.2
 	github.com/mark3labs/kit v0.83.1
 	github.com/mark3labs/mcp-go v0.56.0
@@ -55,7 +56,6 @@ require (
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
-	github.com/fsnotify/fsnotify v1.10.1 // indirect
 	github.com/go-json-experiment/json v0.0.0-20260623181947-01eb4420fa68 // indirect
 	github.com/go-logfmt/logfmt v0.6.1 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect

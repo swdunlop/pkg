@@ -40,16 +40,9 @@ func JSONFactsEditor(schemaText string, output html.Content) html.Content {
 
 	applyButton := BusyActionButton("jsonfacts-apply", "apply", "Apply", "/jsonfacts/apply")
 
-	// Save writes the SESSION's canonical schemaText to disk — whatever was
-	// last Applied, not any unApplied draft still sitting in the textarea
-	// above. The title attribute calls this out explicitly per the task's
-	// instruction, since it's an easy trap: type, forget to click Apply,
-	// click Save, and get the old document on disk.
-	saveButton := ActionButton.
-		Set("id", "jsonfacts-save").
-		Set("title", "writes the applied schema document to disk (not any unapplied draft)").
-		Set("data-on:click", "@post('/save/schema')").
-		Add(html.Text("Save"))
+	// No Save button: disk is canonical and the fsnotify watcher reloads it
+	// (doc/features/workbench-v2.md design decision 3). Apply still applies
+	// the document to session memory only.
 
 	return PaneSection.Set("id", "pane-jsonfacts-editor").Add(
 		PaneHeadingWithNav("jsonfacts Editor", "facts"),
@@ -61,7 +54,7 @@ func JSONFactsEditor(schemaText string, output html.Content) html.Content {
 		// growing error list pushes the buttons down instead of the
 		// content above it out from under the cursor.
 		ErrorList.Set("id", "jsonfacts-error"),
-		tag.New("div.actions", applyButton, saveButton),
+		tag.New("div.actions", applyButton),
 	)
 }
 

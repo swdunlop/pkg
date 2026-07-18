@@ -37,16 +37,10 @@ func RulesEditor(rulesText string) html.Content {
 
 	runButton := BusyActionButton("rules-run", "run", "Run", "/rules/run")
 
-	// Save writes the SESSION's canonical rulesText to disk — whatever was
-	// last Run, not any un-Run draft still sitting in the textarea above.
-	// The title attribute calls this out explicitly, since it's an easy
-	// trap: type, forget to click Run, click Save, and get the old document
-	// on disk.
-	saveButton := ActionButton.
-		Set("id", "rules-save").
-		Set("title", "writes the applied rules document to disk (not any unapplied draft)").
-		Set("data-on:click", "@post('/save/rules')").
-		Add(html.Text("Save"))
+	// No Save button: disk is canonical and the fsnotify watcher reloads it
+	// (doc/features/workbench-v2.md design decision 3 — "The Save button and
+	// save-time git commits are gone; git is the human's job in the
+	// terminal"). Run still applies the document to session memory only.
 
 	// Cursor-position indicator: the design mentions one to aid navigating
 	// line:col errors. A live line:col readout needs the textarea's
@@ -65,7 +59,7 @@ func RulesEditor(rulesText string) html.Content {
 		// growing error list pushes the buttons down instead of the
 		// textarea above it out from under the cursor.
 		ErrorList.Set("id", "rules-error"),
-		tag.New("div.actions", runButton, saveButton),
+		tag.New("div.actions", runButton),
 		StatusDiv.Set("id", "status"),
 		tag.New("div#rules-results"),
 	)
