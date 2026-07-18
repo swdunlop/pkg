@@ -25,10 +25,10 @@ func TestExplain_ResolvesAgainstCachedRecorder(t *testing.T) {
 	defer done()
 	h.sess.provenanceEnabled = true
 
-	if _, err := h.setRules(setRulesInput{Source: `
+	if _, err := h.sess.setRules(`
 event("h1").
 derived(X) :- event(X).
-`}); err != nil {
+`); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 
@@ -82,10 +82,10 @@ func TestExplain_GenerationBumpInvalidatesCache(t *testing.T) {
 	defer done()
 	h.sess.provenanceEnabled = true
 
-	if _, err := h.setRules(setRulesInput{Source: `
+	if _, err := h.sess.setRules(`
 event("h1").
 derived(X) :- event(X).
-`}); err != nil {
+`); err != nil {
 		t.Fatalf("set_rules (first): %v", err)
 	}
 	if _, err := h.query(context.Background(), queryInput{Query: `derived(X)?`}); err != nil {
@@ -98,10 +98,10 @@ derived(X) :- event(X).
 	// A new ruleset that no longer derives "derived" from event at all —
 	// set_rules must clear both derivedDB and derivedProv (session.go's five
 	// gen-bumping mutators).
-	if _, err := h.setRules(setRulesInput{Source: `
+	if _, err := h.sess.setRules(`
 event("h1").
 other(X) :- event(X).
-`}); err != nil {
+`); err != nil {
 		t.Fatalf("set_rules (second): %v", err)
 	}
 	if h.sess.derivedDB != nil {
@@ -142,10 +142,10 @@ func TestExplain_QueryScopedSynthStageDoesNotPolluteBaseRecorder(t *testing.T) {
 	defer done()
 	h.sess.provenanceEnabled = true
 
-	if _, err := h.setRules(setRulesInput{Source: `
+	if _, err := h.sess.setRules(`
 event("h1").
 derived(X) :- event(X).
-`}); err != nil {
+`); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 
@@ -188,10 +188,10 @@ func TestExplain_UnknownFactReportsNoSuchDerivedFact(t *testing.T) {
 	defer done()
 	h.sess.provenanceEnabled = true
 
-	if _, err := h.setRules(setRulesInput{Source: `
+	if _, err := h.sess.setRules(`
 event("h1").
 derived(X) :- event(X).
-`}); err != nil {
+`); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 
@@ -213,10 +213,10 @@ func TestExplain_DisabledWhenProvenanceOff(t *testing.T) {
 	defer done()
 	// h.sess.provenanceEnabled left false (the zero value) deliberately.
 
-	if _, err := h.setRules(setRulesInput{Source: `
+	if _, err := h.sess.setRules(`
 event("h1").
 derived(X) :- event(X).
-`}); err != nil {
+`); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 
@@ -236,12 +236,12 @@ func TestExplain_DepthOption(t *testing.T) {
 	defer done()
 	h.sess.provenanceEnabled = true
 
-	if _, err := h.setRules(setRulesInput{Source: `
+	if _, err := h.sess.setRules(`
 event("h1").
 d1(X) :- event(X).
 d2(X) :- d1(X).
 d3(X) :- d2(X).
-`}); err != nil {
+`); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 	if _, err := h.query(context.Background(), queryInput{Query: `d3(X)?`}); err != nil {
@@ -505,11 +505,11 @@ func TestExplain_ResolvesFactWithBoolAndNullTerms(t *testing.T) {
 	defer done()
 	h.sess.provenanceEnabled = true
 
-	if _, err := h.setRules(setRulesInput{Source: `
+	if _, err := h.sess.setRules(`
 event("h1").
 flagged(X, true) :- event(X).
 unset(X, null) :- event(X).
-`}); err != nil {
+`); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 

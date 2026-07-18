@@ -111,8 +111,8 @@ func (wb *workbench) handleFacts(w http.ResponseWriter, r *http.Request) {
 // every other console entry: the drawer's own SSE fan-out (wb.consoleAppend
 // -> wb.bus.Publish) is what satisfies "the drawer must repaint or close on
 // generation change like every other pane" (doc/features/provenance.md's
-// Risks section) — a set_rules landing after this entry renders does not
-// retroactively invalidate it (same as a completed query result block), but
+// Risks section) — a rule-group edit landing after this entry renders does
+// not retroactively invalidate it (same as a completed query result block), but
 // a NEW query or Run after that point resolves against the new generation,
 // and old entries read as historical scrollback like any other console
 // entry, not as a live view.
@@ -322,8 +322,9 @@ func compositeDetail(c *datalog.Composite) html.Content {
 }
 
 // publishSessionChanged is the one call every mutating handler (Apply, Run,
-// and — once mounted — agent set_schema/set_rules over /mcp) makes after a
-// Transform completes: it re-renders both Fact Browser fragments
+// and — once mounted — agent set_schema/put_rule_group/delete_rule_group
+// over /mcp) makes after a Transform completes: it re-renders both Fact
+// Browser fragments
 // (#predicates-base and #predicates-derived) from current session state and
 // fans them out as one Batch over the bus, so every open tab's subscription
 // connection repaints whichever of the two panes it has on screen (design

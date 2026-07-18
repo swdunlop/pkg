@@ -12,41 +12,50 @@ import "time"
 // (server.WithInstructions), which most MCP clients surface to the model
 // as system-level guidance before any tool is even called.
 const mcpServerInstructions = `This server exposes one Datalog evaluation session backed by an
-operator-chosen data directory. Nothing is written back to disk; the
-session lives only for this connection.
+operator-chosen data directory. Session state (schema, loaded facts) lives
+only for this connection; rule groups written via put_rule_group/
+delete_rule_group land on disk immediately in the operator's rules/
+directory (see below) — that part IS persisted.
 
 Before anything else, call list_predicates. A session often arrives
 already populated with the operator's schema and rules - answer
-questions against it with query and sample_facts. set_schema and
-set_rules REPLACE the operator's working documents; enter the authoring
-loop below only when the session is empty or the operator has asked you
-to change the mappings or rules - never just to answer a question.
+questions against it with query and sample_facts. set_schema REPLACES the
+operator's whole data-loading document; put_rule_group/delete_rule_group
+edit ONE rule group at a time. Enter the authoring loop below only when
+the session is empty or the operator has asked you to change the mappings
+or rules - never just to answer a question.
 
 Workflow loop (repeat as needed):
-  1. sample_input   - look at raw JSONL records to learn field names.
-  2. set_schema     - submit a jsonfacts config mapping JSON fields to
-                       predicates; check the returned per-predicate fact
-                       counts. Zero facts for a predicate means the
-                       mapping is wrong - iterate.
-  3. set_rules      - submit a Datalog program (rules only, no embedded
-                       queries) deriving higher-level predicates from the
-                       loaded facts. Fix parse/compile errors and resubmit.
-  4. query          - run one query and inspect vars/rows/stats. Iterate
-                       on the rules or schema based on what comes back.
-  5. explain        - given one fact from a query result, get its full
-                       derivation tree (rule + body facts, recursively) -
-                       use this to justify a finding instead of inventing
-                       a justification for it.
+  1. sample_input      - look at raw JSONL records to learn field names.
+  2. set_schema        - submit a jsonfacts config mapping JSON fields to
+                          predicates; check the returned per-predicate fact
+                          counts. Zero facts for a predicate means the
+                          mapping is wrong - iterate.
+  3. put_rule_group     - create or edit ONE rule group (all statements
+                          sharing one head predicate/arity) deriving
+                          higher-level predicates from the loaded facts.
+                          Fix parse/compile errors and resubmit; a stale
+                          revision comes back with the group's current
+                          text so you can retry against it.
+  4. query             - run one query and inspect vars/rows/stats. Iterate
+                          on the rules or schema based on what comes back.
+  5. explain           - given one fact from a query result, get its full
+                          derivation tree (rule + body facts, recursively) -
+                          use this to justify a finding instead of inventing
+                          a justification for it.
 
 list_predicates is the cheap index; before writing a rule or query against
 an unfamiliar predicate, call describe instead of guessing at its terms or
 meaning - it returns the predicate's declared/assembled documentation,
 term names, current fact count, and every rule that derives or consumes
-it, per arity.
+it, per arity. list_rule_groups/get_rule_group are the rule-group-shaped
+counterpart: use them to see what groups exist and their current text/
+revision before editing one with put_rule_group.
 
-Each of set_schema and set_rules replaces the whole document; there is no
-incremental edit API. Submit the complete schema or ruleset text every
-time, the same way a human would save a file.
+set_schema replaces the whole data-loading document; there is no
+incremental add_source/add_matcher API. put_rule_group/delete_rule_group are
+already incremental — each call touches exactly one rule group's file,
+identified by (head, arity), never the whole ruleset.
 
 ` + mcpDialectPrimer
 
@@ -182,7 +191,7 @@ fact counts; on failure (bad file reference, bad expr, invalid regex/CIDR,
 etc.) you get the underlying error, and the previous schema stays active.`
 
 // mcpDatalogSyntaxSummary is the condensed Datalog syntax reference shared
-// by set_rules and query descriptions, condensed from README.md.
+// by put_rule_group and query descriptions, condensed from README.md.
 const mcpDatalogSyntaxSummary = `Datalog syntax summary:
   Fact:        parent("tom", "bob").
   Rule:        ancestor(X, Y) :- parent(X, Z), ancestor(Z, Y).
@@ -199,7 +208,7 @@ const mcpDatalogSyntaxSummary = `Datalog syntax summary:
   Aggregate:   alert_count(Sev, N) :- N = count : alert(?, Sev, ?).
                total_bytes(Host, T) :- T = sum(Bytes) : traffic(Host, Bytes).
                (also: min, max; aggregates are RULES - to answer "how
-                many", set_rules an aggregate, then query its head)
+                many", put_rule_group an aggregate, then query its head)
   Builtins:    @contains(Str, "needle")   - constraint form (in the body, must hold)
                @time_diff(T2, T1, D)      - binding form (D is the output)
                The @ sigil is required: contains(X, P) WITHOUT it names a
@@ -208,8 +217,8 @@ const mcpDatalogSyntaxSummary = `Datalog syntax summary:
   Comments start with "%". A "%%" block on the lines immediately above a
   statement (no blank line between) is a doc comment attached to it -
   describe surfaces it, and it explains the predicate. A "%%" block
-  separated by a blank line attaches to nothing and is dropped (set_rules
-  reports these in "warnings"). "?" alone and a bare "_" are anonymous
+  separated by a blank line attaches to nothing and is dropped
+  (put_rule_group reports these in "warnings"). "?" alone and a bare "_" are anonymous
   variables (each occurrence is distinct, matches anything, binds
   nothing) - legal anywhere in rule bodies; in the query tool's arguments
   they are allowed only inside negated atoms (where they are the required
@@ -217,28 +226,87 @@ const mcpDatalogSyntaxSummary = `Datalog syntax summary:
   or an underscore-prefixed one (_Ignored). A statement ends with "."
   (fact or rule) or "?" (query).`
 
-// mcpSetRulesDescription documents set_rules: whole-document replacement,
-// the syntax summary, and the embedded-query rejection.
-const mcpSetRulesDescription = `Replace the session's Datalog ruleset (facts and rules; not queries - see
-below) with the given source text. Part of the workflow loop: after
-set_schema produces the predicates you need, write rules deriving
-higher-level observations from them, then use the query tool to inspect
-results and iterate here on parse/compile errors.
+// mcpPutRuleGroupDescription documents put_rule_group: one rule group at a
+// time (not the whole ruleset), the syntax summary, the head/arity
+// constraint, the revision-based staleness protocol, and the
+// all-or-nothing full-ruleset validation order (doc/features/workbench-v2.md
+// design decision 4).
+const mcpPutRuleGroupDescription = `Create or replace ONE rule group: every statement sharing one head
+predicate/arity, e.g. every rule (and fact) whose head is alert/2. Part of
+the workflow loop: after set_schema produces the predicates you need,
+write one or more rule groups deriving higher-level observations from
+them, then use the query tool to inspect results and iterate here on
+parse/compile errors.
 
 ` + mcpDatalogSyntaxSummary + `
 
-The whole document replaces the previous one - there is no incremental
-add_rule/delete_rule API; resubmit the complete ruleset text each time,
-as you would save a file.
+"head"/"arity" name the group; "text" must contain ONLY statements with
+that exact head and arity (a mix of heads, or a head that doesn't match
+the arguments, is rejected before anything else). Embedded queries
+(statements ending in "?") are rejected here too: put queries in the query
+tool's "query" argument instead.
 
-Embedded queries (statements ending in "?") are rejected here with an
-error: put queries in the query tool's "query" argument instead, so each
-query's results are returned directly rather than silently discarded.
+"revision" is the staleness guard (see also list_rule_groups/get_rule_group,
+which report a group's current revision):
+  - 0 (or omitted): create a NEW group. If a group already exists at this
+    head/arity, the call is rejected as stale ("is_stale": true) with no
+    current content to hand back — call get_rule_group to see what's there.
+  - the group's CURRENT revision: edit it. Any other value (including 0,
+    if the group already exists) is rejected as stale, with the current
+    "current_text"/"current_revision" returned so you can re-base your
+    edit and resubmit with the right revision.
+A stale rejection is NOT a tool error: it comes back as a normal
+successful result with "is_stale": true, precisely so the current text and
+revision ride along as structured data you can act on immediately.
 
-On success, returns the list of predicates the ruleset defines (rule and
-aggregate-rule heads). On failure, returns the parser or compiler error
-verbatim, including line:column and the offending source line - use it to
-locate and fix the problem, then resubmit the whole document.`
+Validation, all-or-nothing: text is parsed, checked against head/arity,
+then a TRIAL compile of the FULL prospective ruleset (every other existing
+group unchanged, plus this one) runs before anything is written — a group
+that parses fine alone but breaks stratification or safety somewhere else
+in the ruleset is refused, and nothing on disk changes. Only after all of
+that succeeds does the group's file get written (atomically) and the
+session reload.
+
+On success, returns the new "revision", the "file" written, and
+per-predicate fact counts (like set_schema's). On failure (parse error,
+wrong head/arity, or a stratification/safety break), returns the
+underlying error verbatim, including line:column when available, and
+nothing was written.`
+
+// mcpDeleteRuleGroupDescription documents delete_rule_group: same
+// revision-based staleness protocol as put_rule_group, but for removal.
+const mcpDeleteRuleGroupDescription = `Delete one rule group (identified by "head"/"arity") entirely, removing its
+file from the rules directory. "revision" must equal the group's CURRENT
+revision (see list_rule_groups/get_rule_group) — any other value, or
+naming a group that does not exist, is rejected as stale ("is_stale":
+true, with "current_text"/"current_revision" attached when the group does
+exist) rather than as a tool error, exactly like put_rule_group's
+staleness protocol.
+
+Removing a group cannot itself break stratification (only ADDING a rule
+can introduce a cycle), so there is no trial-compile step here: a
+dependent rule that referenced the deleted head simply reads that
+predicate as always empty afterward (per this dialect's "unknown predicate
+is 0 rows, not an error" rule), not a compile failure.
+
+On success, returns the "file" removed and per-predicate fact counts (like
+set_schema's), reflecting the ruleset with this group gone.`
+
+// mcpListRuleGroupsDescription documents list_rule_groups.
+const mcpListRuleGroupsDescription = `List every rule group currently in the session's rules directory, in
+filename order: each group's "head", "arity", "file", current "revision",
+and "statements" count (how many rules/facts it holds). Call this before
+put_rule_group/delete_rule_group to find a group's current revision (the
+staleness guard both writes require), or to see what already exists before
+adding a new one.`
+
+// mcpGetRuleGroupDescription documents get_rule_group.
+const mcpGetRuleGroupDescription = `Return one rule group's exact on-disk text plus its current "revision" —
+the "head"/"arity" pair identifies the group (see list_rule_groups for the
+index). Use this immediately before editing a group with put_rule_group:
+its "revision" is exactly the value put_rule_group needs to accept the
+edit, and its "text" is the safe starting point for your changes (verbatim
+what's on disk right now, including comments and formatting).`
 
 // mcpQueryDescription documents the query tool. It takes the server's
 // actual per-query timeout rather than hardcoding a number: `datalog mcp`
@@ -251,8 +319,8 @@ func mcpQueryDescription(timeout time.Duration) string {
 	return `Evaluate one Datalog query against the current schema + rules + loaded
 data, and return matching rows plus per-stratum evaluation stats. This is
 the last step of the workflow loop: sample_input -> set_schema (check fact
-counts) -> set_rules (check parse/compile errors) -> query (check results
-and stats, then go back and adjust schema/rules as needed).
+counts) -> put_rule_group (check parse/compile errors) -> query (check
+results and stats, then go back and adjust schema/rules as needed).
 
 ` + mcpDatalogSyntaxSummary + `
 
@@ -278,7 +346,7 @@ don't-care form ("SMB sources nobody logged into"):
   smb_conn(H, _S, _D), not remote_logon(H, ?, ?, ?)?
 
 To answer "how many ..." questions, do not count rows by eye: define an
-aggregate rule via set_rules (N = count : ...) and query its head.
+aggregate rule via put_rule_group (N = count : ...) and query its head.
 
 A query over a predicate that no loaded data or rule defines is not an
 error - it just returns 0 rows. If a count is unexpectedly zero, check
@@ -329,10 +397,11 @@ reported at the top level.`
 // mcpListPredicatesDescription documents list_predicates.
 const mcpListPredicatesDescription = `List every predicate currently known to the session: predicates loaded
 from data (via set_schema) and predicates defined by rules (via
-set_rules), together with their arity, current fact count, and - when the
-schema declared it - a human-readable "use" description. Call this to
-get an overview before writing rules or queries, or after set_schema/
-set_rules to confirm what changed.`
+put_rule_group or the rules the operator loaded at startup), together with
+their arity, current fact count, and - when the schema declared it - a
+human-readable "use" description. Call this to get an overview before
+writing rules or queries, or after set_schema/put_rule_group to confirm
+what changed.`
 
 // mcpDescribeDescription documents describe.
 const mcpDescribeDescription = `Describe one predicate by name: everything known about it, across every

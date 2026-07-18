@@ -29,7 +29,7 @@ func TestProvenanceSweep_EndToEnd(t *testing.T) {
 	defer done()
 	h.sess.provenanceEnabled = true
 
-	if _, err := h.setRules(setRulesInput{Source: multiStratumRules}); err != nil {
+	if _, err := h.sess.setRules(multiStratumRules); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 
@@ -82,10 +82,10 @@ func TestProvenanceSweep_EndToEnd(t *testing.T) {
 
 	// set_rules then explain: the old fact must vanish (not-found), never a
 	// stale tree.
-	if _, err := h.setRules(setRulesInput{Source: `
+	if _, err := h.sess.setRules(`
 event("ws01", "port_scan").
 other(H) :- event(H, _).
-`}); err != nil {
+`); err != nil {
 		t.Fatalf("set_rules (second): %v", err)
 	}
 	if _, err := h.explain(context.Background(), explainInput{Fact: `alert("ws01", "port_scan")`}); err == nil {
@@ -109,7 +109,7 @@ func TestProvenanceSweep_QueryThenExplainMatchesColdExplain(t *testing.T) {
 	ha, doneA := newTestHandlers(t, t.TempDir())
 	defer doneA()
 	ha.sess.provenanceEnabled = true
-	if _, err := ha.setRules(setRulesInput{Source: multiStratumRules}); err != nil {
+	if _, err := ha.sess.setRules(multiStratumRules); err != nil {
 		t.Fatalf("A set_rules: %v", err)
 	}
 	if _, err := ha.query(context.Background(), queryInput{Query: `alert(H, K)?`}); err != nil {
@@ -124,7 +124,7 @@ func TestProvenanceSweep_QueryThenExplainMatchesColdExplain(t *testing.T) {
 	hb, doneB := newTestHandlers(t, t.TempDir())
 	defer doneB()
 	hb.sess.provenanceEnabled = true
-	if _, err := hb.setRules(setRulesInput{Source: multiStratumRules}); err != nil {
+	if _, err := hb.sess.setRules(multiStratumRules); err != nil {
 		t.Fatalf("B set_rules: %v", err)
 	}
 	viaCold, err := hb.explain(context.Background(), explainInput{Fact: `alert("ws01", "port_scan")`})

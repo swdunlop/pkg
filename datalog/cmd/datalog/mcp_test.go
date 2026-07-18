@@ -7,6 +7,7 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,32 @@ import (
 )
 
 // -- test helpers ---------------------------------------------------------
+
+// rulesHeadPredicates lists the sorted, deduplicated set of rule/aggregate-
+// rule head predicate names in sess — the same computation the old
+// mcpHandlers.setRules wrapper used to perform on its output before set_rules
+// was removed as an MCP tool (see doc/features/workbench-v2.md design
+// decision 4). Tests that used to assert on setRulesOutput.Predicates after
+// calling the MCP wrapper now call session.setRules directly (test setup,
+// out of MCP scope) and use this helper to get the same list.
+func rulesHeadPredicates(sess *session) []string {
+	seen := map[string]bool{}
+	var preds []string
+	for _, r := range sess.rules {
+		if !seen[r.Head.Pred] {
+			seen[r.Head.Pred] = true
+			preds = append(preds, r.Head.Pred)
+		}
+	}
+	for _, ar := range sess.aggRules {
+		if !seen[ar.Head.Pred] {
+			seen[ar.Head.Pred] = true
+			preds = append(preds, ar.Head.Pred)
+		}
+	}
+	sort.Strings(preds)
+	return preds
+}
 
 // newTestHandlers builds mcpHandlers rooted at dir (a real directory, so
 // os.Root-based confinement applies exactly as it does for `datalog mcp`),
@@ -112,26 +139,30 @@ func TestMordorGoldenLoop(t *testing.T) {
 		}
 	}
 
-	// set_rules with rules.dl: assert the 9 head predicates.
+	// setRules with rules.dl: assert the 9 head predicates. This uses
+	// session.setRules directly (test setup, not the MCP tool surface —
+	// set_rules was removed as an MCP tool in favor of the rule-group CRUD
+	// tools; see rules_crud_test.go) and derives the predicate list the same
+	// way the old mcpHandlers.setRules wrapper used to.
 	rulesData, err := os.ReadFile(filepath.Join("..", "..", "examples", "mordor", "rules.dl"))
 	if err != nil {
 		t.Fatalf("reading rules.dl: %v", err)
 	}
-	rulesOut, err := h.setRules(setRulesInput{Source: string(rulesData)})
-	if err != nil {
-		t.Fatalf("set_rules: %v", err)
+	if _, err := h.sess.setRules(string(rulesData)); err != nil {
+		t.Fatalf("setRules: %v", err)
 	}
 	wantPreds := []string{
 		"admin_share", "confirmed_drop", "elevated_lateral_movement",
 		"elevated_logon", "exe_drop", "exe_on_disk", "lateral_movement",
 		"remote_logon", "smb_conn",
 	}
-	if len(rulesOut.Predicates) != len(wantPreds) {
-		t.Fatalf("set_rules: got %d predicates, want %d: %v", len(rulesOut.Predicates), len(wantPreds), rulesOut.Predicates)
+	gotPreds := rulesHeadPredicates(h.sess)
+	if len(gotPreds) != len(wantPreds) {
+		t.Fatalf("setRules: got %d predicates, want %d: %v", len(gotPreds), len(wantPreds), gotPreds)
 	}
 	for i, want := range wantPreds {
-		if rulesOut.Predicates[i] != want {
-			t.Errorf("set_rules: predicate[%d] = %q, want %q (full list %v)", i, rulesOut.Predicates[i], want, rulesOut.Predicates)
+		if gotPreds[i] != want {
+			t.Errorf("setRules: predicate[%d] = %q, want %q (full list %v)", i, gotPreds[i], want, gotPreds)
 		}
 	}
 
@@ -328,100 +359,16 @@ func TestSetSchema_Valid(t *testing.T) {
 	}
 }
 
-// -- set_rules ----------------------------------------------------------
-
-func TestSetRules_RejectsEmbeddedQuery(t *testing.T) {
-	h, done := newTestHandlers(t, t.TempDir())
-	defer done()
-
-	_, err := h.setRules(setRulesInput{Source: `foo(X) :- event(_, X, _).` + "\n" + `foo(X)?` + "\n"})
-	if err == nil {
-		t.Fatal("set_rules: expected error for embedded query, got none")
-	}
-}
-
-func TestSetRules_TrialCompileError(t *testing.T) {
-	h, done := newTestHandlers(t, t.TempDir())
-	defer done()
-
-	// Unstratifiable negation cycle: a depends negatively on itself.
-	_, err := h.setRules(setRulesInput{Source: `a(X) :- event(_, X, _), not a(X).` + "\n"})
-	if err == nil {
-		t.Fatal("set_rules: expected trial-compile error for unstratifiable negation, got none")
-	}
-	if !strings.Contains(err.Error(), "unstratifiable") {
-		t.Errorf("set_rules: error %q does not mention unstratifiable", err.Error())
-	}
-}
-
-// TestSetRules_SurfacesDetachedDocWarning pins the MCP set_rules data-loss
-// tell: a program with a detached '%%' doc block (block, blank line, rule)
-// parses and compiles cleanly, but the detached doc is silently dropped from
-// the stored document. Unlike the workbench, a model driving set_rules over
-// MCP has no Check pane, so set_rules must report ruleset.Warnings in its
-// output or the dropped doc vanishes with no signal at all. Mirrors
-// TestHTTP_RulesCheckSurfacesDetachedDocWarning (rules_editor_test.go) for the
-// MCP surface, and setSchemaOutput.Warnings for the sibling tool.
-func TestSetRules_SurfacesDetachedDocWarning(t *testing.T) {
-	h, done := newTestHandlers(t, t.TempDir())
-	defer done()
-
-	src := "%% this doc is detached\n\nfoo(X) :- event(_, X, _).\n"
-	out, err := h.setRules(setRulesInput{Source: src})
-	if err != nil {
-		t.Fatalf("setRules: %v", err)
-	}
-	joined := strings.Join(out.Warnings, "\n")
-	if !strings.Contains(joined, "detached") {
-		t.Fatalf("set_rules dropped detached-doc warning; Warnings=%v", out.Warnings)
-	}
-
-	// A clean program with attached docs must NOT warn.
-	clean, err := h.setRules(setRulesInput{Source: "%% attached doc\nbar(X) :- event(_, X, _).\n"})
-	if err != nil {
-		t.Fatalf("setRules (clean): %v", err)
-	}
-	if len(clean.Warnings) != 0 {
-		t.Fatalf("clean set_rules should not warn; Warnings=%v", clean.Warnings)
-	}
-}
-
-func TestSetRules_WholeDocumentReplacement(t *testing.T) {
-	dir := t.TempDir()
-	writeSyntheticData(t, dir, 3)
-	h, done := newTestHandlers(t, dir)
-	defer done()
-
-	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
-		t.Fatalf("set_schema: %v", err)
-	}
-
-	if _, err := h.setRules(setRulesInput{Source: `foo(X) :- event(_, X, _).` + "\n"}); err != nil {
-		t.Fatalf("set_rules (first): %v", err)
-	}
-	out, err := h.listPredicates(listPredicatesInput{})
-	if err != nil {
-		t.Fatalf("list_predicates: %v", err)
-	}
-	if !containsPredicate(out.Predicates, "foo") {
-		t.Fatalf("list_predicates: expected %q after first set_rules, got %+v", "foo", out.Predicates)
-	}
-
-	// Second call replaces, not appends: "foo" should disappear, "bar" appear.
-	if _, err := h.setRules(setRulesInput{Source: `bar(X) :- event(_, X, _).` + "\n"}); err != nil {
-		t.Fatalf("set_rules (second): %v", err)
-	}
-	out, err = h.listPredicates(listPredicatesInput{})
-	if err != nil {
-		t.Fatalf("list_predicates: %v", err)
-	}
-	if containsPredicate(out.Predicates, "foo") {
-		t.Errorf("list_predicates: %q still present after replacing set_rules, want gone", "foo")
-	}
-	if !containsPredicate(out.Predicates, "bar") {
-		t.Fatalf("list_predicates: expected %q after second set_rules, got %+v", "bar", out.Predicates)
-	}
-}
+// -- set_rules (removed as an MCP tool; see rules_crud_test.go) -----------
+//
+// The whole-document set_rules MCP tool was removed in favor of the
+// rule-group CRUD tools (doc/features/workbench-v2.md design decision 4).
+// Its embedded-query-rejection, trial-compile-error, detached-doc-warning,
+// and whole-document-replacement coverage now lives in rules_crud_test.go
+// as put_rule_group coverage (TestPutRuleGroup_RejectsEmbeddedQuery,
+// TestPutRuleGroup_BreaksFullRulesetRejected,
+// TestPutRuleGroup_SurfacesDetachedDocWarning,
+// TestPutRuleGroup_EditReplacesGroupContent).
 
 func containsPredicate(preds []predicateInfo, name string) bool {
 	for _, p := range preds {
@@ -609,7 +556,7 @@ func TestQuery_DoesNotHoldLockDuringTransform(t *testing.T) {
 			}
 		}),
 	}
-	if _, err := h.setRules(setRulesInput{Source: `r(X) :- slow(X).`}); err != nil {
+	if _, err := h.sess.setRules(`r(X) :- slow(X).`); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 
@@ -704,7 +651,7 @@ func TestQuery_RulesBaseStageExceedsFactCap(t *testing.T) {
 	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
-	if _, err := h.setRules(setRulesInput{Source: "pair(A,B) :- event(A,_,_), event(B,_,_).\n"}); err != nil {
+	if _, err := h.sess.setRules("pair(A,B) :- event(A,_,_), event(B,_,_).\n"); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 
@@ -772,7 +719,7 @@ func TestQuery_PopulatesAndReusesDerivedCache(t *testing.T) {
 	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
-	if _, err := h.setRules(setRulesInput{Source: `derived(X) :- event(X, _, _).` + "\n"}); err != nil {
+	if _, err := h.sess.setRules(`derived(X) :- event(X, _, _).` + "\n"); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 
@@ -815,7 +762,7 @@ func TestQuery_CachedDerivedExcludesSyntheticQueryPredicate(t *testing.T) {
 	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
-	if _, err := h.setRules(setRulesInput{Source: `derived(X) :- event(X, _, _).` + "\n"}); err != nil {
+	if _, err := h.sess.setRules(`derived(X) :- event(X, _, _).` + "\n"); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 
@@ -859,7 +806,7 @@ func TestQuery_StaleWriteBackDropped(t *testing.T) {
 			}
 		}),
 	}
-	if _, err := h.setRules(setRulesInput{Source: `r(X) :- slow(X).` + "\n"}); err != nil {
+	if _, err := h.sess.setRules(`r(X) :- slow(X).` + "\n"); err != nil {
 		t.Fatalf("set_rules (initial): %v", err)
 	}
 
@@ -873,7 +820,7 @@ func TestQuery_StaleWriteBackDropped(t *testing.T) {
 
 	// Race a mutation in: bumps gen and clears derivedDB before the paused
 	// query's base Transform ever returns.
-	if _, err := h.setRules(setRulesInput{Source: `s(X) :- slow(X).` + "\n"}); err != nil {
+	if _, err := h.sess.setRules(`s(X) :- slow(X).` + "\n"); err != nil {
 		t.Fatalf("set_rules (racing): %v", err)
 	}
 
@@ -982,7 +929,7 @@ func TestSampleFacts_DerivedPredicate(t *testing.T) {
 	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
-	if _, err := h.setRules(setRulesInput{Source: `active(Host) :- event(Host, Pid, Cmd).`}); err != nil {
+	if _, err := h.sess.setRules(`active(Host) :- event(Host, Pid, Cmd).`); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 
@@ -1044,7 +991,7 @@ tag("a", "b").
 tag("c", "d").
 tag("e", "f").
 `
-	if _, err := h.setRules(setRulesInput{Source: src}); err != nil {
+	if _, err := h.sess.setRules(src); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 	evaluated, _, err := h.sess.evaluate(context.Background())
@@ -1106,7 +1053,7 @@ event(Host, Kind) :- raw(Host, Kind, ?).
 %% Hosts with no observed events.
 quiet(Host) :- known_host(Host), not event(Host, ?).
 `
-	if _, err := h.setRules(setRulesInput{Source: src}); err != nil {
+	if _, err := h.sess.setRules(src); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 
@@ -1146,7 +1093,7 @@ func TestDescribeTool_UnknownPredicateErrors(t *testing.T) {
 	h, done := newTestHandlers(t, dir)
 	defer done()
 
-	if _, err := h.setRules(setRulesInput{Source: `event("h1").`}); err != nil {
+	if _, err := h.sess.setRules(`event("h1").`); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 	if _, err := h.describe(describeInput{Predicate: "nope"}); err == nil {
@@ -1281,7 +1228,7 @@ func TestConcurrentHandlerCalls(t *testing.T) {
 	if _, err := h.setSchema(setSchemaInput{Schema: syntheticSchemaYAML, Format: "yaml"}); err != nil {
 		t.Fatalf("set_schema: %v", err)
 	}
-	if _, err := h.setRules(setRulesInput{Source: `foo(X) :- event(_, X, _).` + "\n"}); err != nil {
+	if _, err := h.sess.setRules(`foo(X) :- event(_, X, _).` + "\n"); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 

@@ -22,7 +22,7 @@ func TestProvenanceRace_ConcurrentExplainQuerySetRules(t *testing.T) {
 	defer done()
 	h.sess.provenanceEnabled = true
 
-	if _, err := h.setRules(setRulesInput{Source: multiStratumRules}); err != nil {
+	if _, err := h.sess.setRules(multiStratumRules); err != nil {
 		t.Fatalf("set_rules: %v", err)
 	}
 
@@ -77,7 +77,7 @@ score(H, N) :- N = count : indicator(H, K).
 					src = rulesetB
 				}
 				h.mu.Lock()
-				_, err := h.setRules(setRulesInput{Source: src})
+				_, err := h.sess.setRules(src)
 				h.mu.Unlock()
 				if err != nil {
 					t.Errorf("set_rules: %v", err)
@@ -93,7 +93,7 @@ score(H, N) :- N = count : indicator(H, K).
 	// be internally consistent — an explain of a fact the current ruleset
 	// derives must succeed, resolving the cached DB against the cached
 	// recorder without panicking.
-	if _, err := h.setRules(setRulesInput{Source: multiStratumRules}); err != nil {
+	if _, err := h.sess.setRules(multiStratumRules); err != nil {
 		t.Fatalf("final set_rules: %v", err)
 	}
 	if _, err := h.query(ctx, queryInput{Query: `alert(H, K)?`}); err != nil {

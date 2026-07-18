@@ -252,6 +252,24 @@ type ruleStoreGroup struct {
 	Text     string
 	Rules    []syntax.Rule
 	AggRules []syntax.AggregateRule
+
+	// Revision is this group's in-memory, per-process edit counter (phase 1b,
+	// doc/features/workbench-v2.md design decision 4's "per-part revision
+	// counters reject stale writes with current content"). It starts at 1
+	// when the group is first loaded or created — EVERY group starts at 1
+	// independently (loadRuleStore assigns 1 to every group it loads,
+	// regardless of how many other groups are in the same directory) — never
+	// 0, so 0 is left free as putRuleGroup's "this must be a create"
+	// sentinel (see that method) — and is bumped by every successful
+	// put/delete that touches this key. Deliberately NOT persisted: a
+	// process restart reloads the store fresh (loadRuleStore) and every
+	// group's Revision resets to 1, which is fine because staleness is a
+	// same-process, same-session concept — the fsnotify reload path (phase
+	// 1d) that would otherwise let a vim save silently outrun an agent's
+	// stale in-memory revision is exactly the mechanism this counter exists
+	// to protect against, and a restart is a stronger reset than any vim
+	// save could cause anyway.
+	Revision int
 }
 
 // ruleStore is a loaded rules/ directory: every group file, parsed and
@@ -266,6 +284,28 @@ type ruleStore struct {
 	Dir    string
 	Order  []groupKey // filename order, matching directory listing order
 	Groups map[groupKey]*ruleStoreGroup
+
+	// deletedHighWater tracks, per groupKey that has ever been DELETED from
+	// this store during its process lifetime, the highest Revision that key
+	// ever reached before deletion. putRuleGroup consults this when a key is
+	// being CREATED (either for the first time, or re-created after a prior
+	// delete): a brand-new key starts at 1 (matching loadRuleStore's own
+	// per-group start-at-1 — see ruleStoreGroup.Revision's doc comment), but
+	// a key that previously existed and was deleted resumes numbering from
+	// one past its own highest-ever revision, rather than resetting to 1.
+	// This is a deliberate choice beyond the brief's "your choice, document
+	// it": resetting a re-created key's Revision to 1 could collide, within
+	// one long-running process, with a revision number a caller already saw
+	// and discarded for that SAME key before the delete (e.g. a stale-write
+	// rejection that handed back "current_revision: 1" for the
+	// now-deleted group, followed by a re-create that also starts at 1,
+	// would make an old cached "1" look valid again for a completely
+	// different generation of the group). Per-key monotonic-across-the-
+	// key's-own-history costs nothing extra (one small map) and removes that
+	// ambiguity entirely; it is NOT store-wide monotonic (two DIFFERENT keys
+	// may both be at revision 1 simultaneously, exactly as loadRuleStore
+	// already produces for a fresh directory).
+	deletedHighWater map[groupKey]int
 }
 
 // export concatenates every group's Text in filename order, exactly as
@@ -360,8 +400,9 @@ func loadRuleStore(dir string) (*ruleStore, error) {
 
 		g := groups[key]
 		rs.Groups[key] = &ruleStoreGroup{
-			Key:  key,
-			File: name,
+			Key:      key,
+			File:     name,
+			Revision: 1, // every group starts at 1 independently; see ruleStoreGroup.Revision's doc comment
 			// Text is the RAW on-disk content, not renderGroupText's
 			// re-rendered canonical form: "within a group's file the
 			// agent's text lands verbatim" (doc/features/workbench-v2.md

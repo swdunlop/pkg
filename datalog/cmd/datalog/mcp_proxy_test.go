@@ -92,8 +92,10 @@ func TestMCPProxy_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tools/list through proxy: %v", err)
 	}
-	if len(tools.Tools) != 8 {
-		t.Fatalf("tools/list through proxy: got %d tools, want 8 (set_schema, set_rules, query, explain, list_predicates, describe, sample_facts, sample_input)", len(tools.Tools))
+	if len(tools.Tools) != 11 {
+		t.Fatalf("tools/list through proxy: got %d tools, want 11 (set_schema, query, explain, list_predicates, "+
+			"describe, sample_facts, sample_input, list_rule_groups, get_rule_group, put_rule_group, delete_rule_group)",
+			len(tools.Tools))
 	}
 
 	callReq := mcp.CallToolRequest{}

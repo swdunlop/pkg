@@ -397,9 +397,17 @@ func (s *session) setSchema(text string, format string, fsys fs.FS, confine conf
 // stratification/arity errors attach to this submission rather than to a
 // later, innocent query, and only then replaces s.rules/s.aggRules/
 // s.rulesText wholesale. Unlike loadProgram (which appends, for the REPL's
-// .load), setRules always replaces the whole document — the editing model
-// mcp-server.md specifies for the MCP tool surface. On any error, session
-// state is unchanged.
+// .load), setRules always replaces the whole document.
+//
+// This method is NOT part of the MCP tool surface (phase 1b removed the
+// whole-document set_rules MCP tool — doc/features/workbench-v2.md design
+// decision 4 — in favor of the rule-group CRUD tools in rules_crud.go). It
+// survives as a plain session-level helper because many pre-existing unit
+// tests (session_test.go, describe_test.go, commands_test.go) use it
+// directly as test setup, unrelated to MCP; those tests are out of scope
+// for the CRUD migration and this method's behavior for them must not
+// change. Do not wire this back onto an MCP tool.
+//
 // The returned warnings are ruleset.Warnings (detached '%%' doc-comment
 // blocks that will be silently dropped from the round-tripped document).
 // They are surfaced -- not swallowed -- so a caller writing documented rules
@@ -434,12 +442,16 @@ func (s *session) setRules(source string) ([]string, error) {
 // rulesText captures the full original source — including any embedded
 // queries — since the workbench editor's content is the canonical document),
 // but returns the embedded `?` queries to the caller instead of rejecting
-// them. The MCP set_rules tool keeps the stricter no-embedded-queries rule
-// (setRules above): a model is expected to use the query tool instead of
-// embedding one in a set_rules document. The workbench's Datalog Editor Run
-// action accepts embedded queries because the editor follows the REPL's
-// `.`/`?` convention, so a pasted `.dl` file with trailing queries should
-// just work. On any error, session state is unchanged.
+// them. setRules above keeps the stricter no-embedded-queries rule (matching
+// what the now-removed whole-document set_rules MCP tool used to enforce).
+// The workbench's Datalog Editor Run action (rules_editor.go) is this
+// method's one remaining caller: it accepts embedded queries because the
+// editor follows the REPL's `.`/`?` convention, so a pasted `.dl` file with
+// trailing queries should just work. Under a --rules session, this path
+// still only mutates SESSION memory and can diverge from the rules/
+// directory store on disk until a later phase retires it — see
+// runApplyRulesDocument's doc comment in rules_editor.go. On any error,
+// session state is unchanged.
 func (s *session) setRulesWithQueries(source string) ([]syntax.Query, error) {
 	ruleset, err := parseUserProgram(source)
 	if err != nil {
@@ -457,6 +469,57 @@ func (s *session) setRulesWithQueries(source string) ([]syntax.Query, error) {
 	s.derivedProv = nil
 	s.gen++
 	return ruleset.Queries, nil
+}
+
+// loadRuleStore is the ONE chokepoint that rebuilds a session's rules from a
+// *ruleStore (doc/features/workbench-v2.md work item 1's design decision 3,
+// "One rebuild chokepoint on the session"): it resets s.rules/s.aggRules/
+// s.facts, reloads EVERY group in store through s.loadProgram (the same
+// fact-routing path newMCPHandlers used to run inline — see that function's
+// git history), sets s.rulesText to store.export(), invalidates
+// derivedDB/derivedProv, and bumps gen. Every caller that (re)builds a
+// session's rules from a rules/ directory — newMCPHandlers at startup, and
+// every put_rule_group/delete_rule_group CRUD write after this task —
+// funnels through here, so the fsnotify watcher (phase 1d) can reuse this
+// exact method for a disk-triggered reload with no separate code path to
+// keep in sync.
+//
+// s.facts is reset here (unlike loadProgram's own append-only contract)
+// because this method represents a FULL rebuild from the store's current
+// on-disk content, not an incremental addition — a group that used to assert
+// a fact and no longer does must not leave that fact behind. Any facts
+// asserted through some OTHER path before this call (there are none in the
+// current cmd/datalog surface, since there is no assert-fact tool per
+// doc/features/workbench-v2.md's "no assert-fact tool" line) would also be
+// dropped by this reset; that is intentional, not a gap, since the rules/
+// directory store's groups are meant to be the session's only source of
+// rule-derived facts (body-less rules) in this mode.
+//
+// On any per-group loadProgram error, the error is returned immediately and
+// s is left PARTIALLY rebuilt (some groups loaded, some not) — callers that
+// need "all-or-nothing including on-session-state" must validate the WHOLE
+// prospective ruleset via a trial Compile (see rules_crud.go's put_rule_group,
+// which does exactly this) BEFORE ever calling loadRuleStore. Note that this
+// method itself never compiles: newMCPHandlers's startup path calls it with
+// no trial Compile, so a directory whose groups individually parse but
+// collectively fail stratification loads "successfully" here and errors
+// LOUDLY at the first evaluation instead — the same query-time failure a
+// malformed monolithic rules file always produced, never a silent drop.
+func (s *session) loadRuleStore(store *ruleStore) error {
+	s.facts = nil
+	s.rules = nil
+	s.aggRules = nil
+	for _, k := range store.Order {
+		g := store.Groups[k]
+		if _, err := s.loadProgram(g.Text); err != nil {
+			return fmt.Errorf("%s: %w", g.File, err)
+		}
+	}
+	s.rulesText = store.export()
+	s.derivedDB = nil
+	s.derivedProv = nil
+	s.gen++
+	return nil
 }
 
 // loadProgram parses a Datalog source string containing multiple statements,

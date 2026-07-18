@@ -833,12 +833,23 @@ func TestMCP_UnauthorizedWithoutOrWrongToken(t *testing.T) {
 	}
 }
 
-func TestMCP_InitializeAndSetRulesPatchesBack(t *testing.T) {
+// TestMCP_InitializeAndPutRuleGroupPatchesBack is
+// TestMCP_InitializeAndSetRulesPatchesBack's successor: the whole-document
+// set_rules MCP tool was removed (doc/features/workbench-v2.md design
+// decision 4) in favor of the rule-group CRUD tools, so this now drives
+// put_rule_group over /mcp against a workbench started with --rules (a
+// rules/ directory store — required, since put_rule_group errors on a
+// legacy session with no store at all).
+func TestMCP_InitializeAndPutRuleGroupPatchesBack(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 3)
-	wb := newTestWorkbench(t, dir, "", nil, "the-real-token")
+	rulesDir := filepath.Join(dir, "rules")
+	if err := os.MkdirAll(rulesDir, 0o755); err != nil {
+		t.Fatalf("mkdir rules dir: %v", err)
+	}
+	wb := newTestWorkbenchRulesDir(t, dir, "", rulesDir, "the-real-token")
 
-	// Preload the schema so set_rules has a predicate to build against.
+	// Preload the schema so put_rule_group has a predicate to build against.
 	wb.h.mu.Lock()
 	if err := wb.h.sess.setSchema(syntheticSchemaYAML, "yaml", wb.h.fsys, wb.h.confine); err != nil {
 		wb.h.mu.Unlock()
@@ -899,24 +910,26 @@ func TestMCP_InitializeAndSetRulesPatchesBack(t *testing.T) {
 	// initialize handshake.
 	mustMCPCall(t, srv, wb.mcpToken, mcpInitializeBody())
 
-	// call set_rules.
-	setRulesBody := mcpToolCallBody("set_rules", map[string]any{
-		"source": "derived(X) :- event(_, X, _).\n",
+	// call put_rule_group.
+	putRuleGroupBody := mcpToolCallBody("put_rule_group", map[string]any{
+		"head": "derived", "arity": 1,
+		"text":     "derived(X) :- event(_, X, _).\n",
+		"revision": 0,
 	})
-	respBody := mustMCPCall(t, srv, wb.mcpToken, setRulesBody)
+	respBody := mustMCPCall(t, srv, wb.mcpToken, putRuleGroupBody)
 	if strings.Contains(strings.ToLower(string(respBody)), `"iserror":true`) {
-		t.Fatalf("set_rules tool call reported an error: %s", respBody)
+		t.Fatalf("put_rule_group tool call reported an error: %s", respBody)
 	}
 
 	// The /events subscriber should receive a #predicates patch-back
-	// reflecting the agent's set_rules call.
+	// reflecting the agent's put_rule_group call.
 	select {
 	case f := <-frames:
 		if !strings.Contains(f, "predicates") {
-			t.Fatalf("expected a #predicates patch-back after set_rules, got: %s", f)
+			t.Fatalf("expected a #predicates patch-back after put_rule_group, got: %s", f)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for patch-back /events frame after set_rules over /mcp")
+		t.Fatal("timed out waiting for patch-back /events frame after put_rule_group over /mcp")
 	}
 }
 

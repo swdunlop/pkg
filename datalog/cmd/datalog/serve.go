@@ -279,11 +279,11 @@ func generateToken() (string, error) {
 	return string(out), nil
 }
 
-// mountMCP mounts the same six-tool MCP surface the stdio `datalog mcp`
+// mountMCP mounts the same MCP tool surface the stdio `datalog mcp`
 // subcommand exposes at /mcp, using mcp-go's streamable HTTP server
 // (doc/features/web-ui.md Deployment section). It shares the exact same
 // *mcpHandlers (and thus mutex + session) the panes use, via
-// h.registerTools — an agent calling set_rules over /mcp and a human
+// h.registerTools — an agent calling put_rule_group over /mcp and a human
 // clicking Run in the browser are the same operation on the same session.
 //
 // mcp-go's server.NewStreamableHTTPServer implements http.Handler directly
@@ -324,7 +324,7 @@ func (wb *workbench) requireBearerToken(next http.Handler) http.Handler {
 
 // workbench holds the shared state behind every HTTP handler: the same
 // mcpHandlers the MCP tool surface calls (so a human's Apply/Run and an
-// agent's set_schema/set_rules/query are the same operation), the SSE bus
+// agent's set_schema/put_rule_group/query are the same operation), the SSE bus
 // for Transform-completed fan-out, and the job set backing Global Cancel.
 // Mutating handlers go through h's typed methods under h.mu (the same mutex
 // the MCP tools use); reads may use session state under the same mutex for

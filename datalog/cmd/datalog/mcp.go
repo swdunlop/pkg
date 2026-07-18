@@ -26,8 +26,9 @@ import (
 )
 
 // runMCP implements the `datalog mcp` subcommand: an MCP server on stdio
-// exposing the session as six structured-JSON tools. args excludes the
-// "mcp" argument itself (main.go strips it before dispatching here).
+// exposing the session as a set of structured-JSON tools (registerToolsForMode
+// lists them by name). args excludes the "mcp" argument itself (main.go
+// strips it before dispatching here).
 //
 // runMCP uses its own flag.FlagSet rather than the package-level pflag
 // flags main.go's bare mode registers on flag.CommandLine — registering
@@ -290,25 +291,23 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir str
 			return nil, nil, fmt.Errorf("loading rules directory %s: %w", rulesDir, err)
 		}
 		store = s
-		// Each group loads through session.loadProgram — the same chokepoint
-		// the positional-file path below uses — never by writing sess.rules/
-		// aggRules/facts directly from here. loadProgram routes ground facts
-		// (body-less rules) into s.facts, where buildDB folds them into the
-		// BASE database; appending them into s.rules instead would evaluate
-		// them as derived rules, silently changing base/derived
-		// classification (listPredicates) and base-DB contents versus
-		// loading the identical statements from a monolith. Queries cannot
-		// occur here (loadRuleStore already rejected them per file), so the
-		// returned queries slice is always empty; errors are wrapped with
-		// the group's filename so attribution survives the shared path.
-		for _, k := range s.Order {
-			g := s.Groups[k]
-			if _, err := sess.loadProgram(g.Text); err != nil {
-				closeFn()
-				return nil, nil, fmt.Errorf("loading rules directory %s: %s: %w", rulesDir, g.File, err)
-			}
+		// session.loadRuleStore is the one rebuild chokepoint (session.go,
+		// doc/features/workbench-v2.md work item 1 design decision 3): it
+		// loads every group through session.loadProgram — the same
+		// fact-routing path the positional-file path below uses — rather
+		// than writing sess.rules/aggRules/facts directly here. loadProgram
+		// routes ground facts (body-less rules) into s.facts, where buildDB
+		// folds them into the BASE database; appending them into s.rules
+		// instead would evaluate them as derived rules, silently changing
+		// base/derived classification (listPredicates) and base-DB contents
+		// versus loading the identical statements from a monolith. Queries
+		// cannot occur here (loadRuleStore already rejected them per file),
+		// so the returned queries slice is always empty; errors are wrapped
+		// with the group's filename so attribution survives the shared path.
+		if err := sess.loadRuleStore(s); err != nil {
+			closeFn()
+			return nil, nil, fmt.Errorf("loading rules directory %s: %w", rulesDir, err)
 		}
-		sess.rulesText = s.export()
 	} else {
 		var rulesText strings.Builder
 		for _, rf := range ruleFiles {
@@ -341,107 +340,206 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir str
 	return &mcpHandlers{sess: sess, fsys: fsys, confine: confine, timeout: timeout, rules: store}, closeFn, nil
 }
 
-// registerTools wires the six typed handler methods into srv using
-// mcp-go's generic structured-tool-handler helper: mcp.WithInputSchema[T]
-// derives the JSON input schema from each input struct's fields and
-// "jsonschema" tags, and mcp.NewStructuredToolHandler binds incoming
-// arguments to that struct and serializes the returned struct as the
-// tool's structured result.
+// toolMode scopes which tools registerToolsForMode wires into a server
+// (doc/features/workbench-v2.md design decision 5: "Three conversation
+// modes, chosen at start... the agent's tool surface is scoped server-side,
+// not by instruction"). Modes are NOT user-visible yet (phase 1b only builds
+// the seam — see this task's brief): there is exactly one constant in use
+// today, toolModeRules, wired from both of this package's registration call
+// sites (mcp.go's runMCP, serve.go's newWorkbench) exactly as registerTools
+// was before this type existed. A later phase adds toolModeQuery/
+// toolModeFacts and a real per-conversation mode choice; until then this
+// type exists so that later change is additive (a new case in
+// registerToolsForMode) rather than a rewrite of the registration wiring.
+type toolMode string
+
+// toolModeRules is Query Mode's surface plus rule-group CRUD (design
+// decision 5's "Rules Mode" bullet) — every tool this package currently
+// exposes. set_schema is included here too: schema CRUD per design decision
+// 4 is a later phase, so until that lands, keeping set_schema registered in
+// every mode (rather than gating it behind a not-yet-built Facts Mode) is
+// the only choice that doesn't regress today's whole-document schema
+// editing capability.
+const toolModeRules toolMode = "rules"
+
+// registerTools wires this handler's full tool surface (today, toolModeRules
+// — the only mode phase 1b builds) into srv. Kept as a thin alias over
+// registerToolsForMode so the two existing call sites (mcp.go's runMCP,
+// serve.go's newWorkbench) don't need to change when a later phase adds a
+// real mode argument at those sites.
 func (h *mcpHandlers) registerTools(srv *server.MCPServer) {
-	srv.AddTool(
-		mcp.NewTool("set_schema",
-			mcp.WithDescription(mcpSetSchemaDescription),
-			mcp.WithInputSchema[setSchemaInput](),
-		),
-		// No h.mu here: like query, setSchema manages its own locking,
-		// holding it only around the cheap field swap — the expensive
-		// parse/confine/load work (prepareSchema) runs lock-free first. See
-		// setSchema's doc comment.
-		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in setSchemaInput) (setSchemaOutput, error) {
-			return h.setSchema(in)
-		}),
-	)
-	srv.AddTool(
-		mcp.NewTool("set_rules",
-			mcp.WithDescription(mcpSetRulesDescription),
-			mcp.WithInputSchema[setRulesInput](),
-		),
-		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in setRulesInput) (setRulesOutput, error) {
-			h.mu.Lock()
-			defer h.mu.Unlock()
-			return h.setRules(in)
-		}),
-	)
-	srv.AddTool(
-		mcp.NewTool("query",
-			mcp.WithDescription(mcpQueryDescription(h.timeout)),
-			mcp.WithInputSchema[queryInput](),
-		),
-		// No h.mu here: query manages the lock itself, holding it only for
-		// the state snapshot so a long-running Transform does not freeze
-		// the other tools or the workbench panes that share this mutex.
-		mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in queryInput) (queryOutput, error) {
-			return h.query(ctx, in)
-		}),
-	)
-	srv.AddTool(
-		mcp.NewTool("list_predicates",
-			mcp.WithDescription(mcpListPredicatesDescription),
-			mcp.WithInputSchema[listPredicatesInput](),
-		),
-		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in listPredicatesInput) (listPredicatesOutput, error) {
-			h.mu.Lock()
-			defer h.mu.Unlock()
-			return h.listPredicates(in)
-		}),
-	)
-	srv.AddTool(
-		mcp.NewTool("sample_facts",
-			mcp.WithDescription(mcpSampleFactsDescription),
-			mcp.WithInputSchema[sampleFactsInput](),
-		),
-		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in sampleFactsInput) (sampleFactsOutput, error) {
-			h.mu.Lock()
-			defer h.mu.Unlock()
-			return h.sampleFacts(in)
-		}),
-	)
-	srv.AddTool(
-		mcp.NewTool("explain",
-			mcp.WithDescription(mcpExplainDescription),
-			mcp.WithInputSchema[explainInput](),
-		),
-		// No h.mu here: explain manages its own locking via
-		// lockedSnapshot-style capture inside h.explain, for the same reason
-		// query does — resolving/computing a fixpoint can take a while and
-		// must not freeze every other tool call or workbench pane.
-		mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in explainInput) (explainOutput, error) {
-			return h.explain(ctx, in)
-		}),
-	)
-	srv.AddTool(
-		mcp.NewTool("describe",
-			mcp.WithDescription(mcpDescribeDescription),
-			mcp.WithInputSchema[describeInput](),
-		),
-		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in describeInput) (describeOutput, error) {
-			h.mu.Lock()
-			defer h.mu.Unlock()
-			return h.describe(in)
-		}),
-	)
-	srv.AddTool(
-		mcp.NewTool("sample_input",
-			mcp.WithDescription(mcpSampleInputDescription),
-			mcp.WithInputSchema[sampleInputInput](),
-		),
-		// No h.mu here: sample_input only ever reads h.fsys/h.confine, both
-		// immutable after construction (never reassigned), and touches no
-		// session state at all — see sampleInput's doc comment.
-		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in sampleInputInput) (sampleInputOutput, error) {
-			return h.sampleInput(in)
-		}),
-	)
+	h.registerToolsForMode(srv, toolModeRules)
+}
+
+// registerToolsForMode wires the mode-appropriate subset of typed handler
+// methods into srv using mcp-go's generic structured-tool-handler helper:
+// mcp.WithInputSchema[T] derives the JSON input schema from each input
+// struct's fields and "jsonschema" tags, and mcp.NewStructuredToolHandler
+// binds incoming arguments to that struct and serializes the returned
+// struct as the tool's structured result.
+//
+// The registration list is split into two named groups per design decision
+// 5, even though today only one mode (toolModeRules, "everything") exists to
+// select between them: querySet is the read/query surface every mode gets
+// (query, list_predicates, sample_facts, explain, describe, sample_input,
+// plus the new rule-group reads list_rule_groups/get_rule_group), and
+// rulesWriteSet is the rule-group CRUD surface (put_rule_group,
+// delete_rule_group) that only Rules Mode gets. Splitting the func body this
+// way now — rather than one flat call list — is what makes a later mode
+// addition (Query Mode registering only querySet, Facts Mode registering
+// neither set here) a small diff instead of a rewrite.
+func (h *mcpHandlers) registerToolsForMode(srv *server.MCPServer, mode toolMode) {
+	registerQuerySet := func() {
+		srv.AddTool(
+			mcp.NewTool("set_schema",
+				mcp.WithDescription(mcpSetSchemaDescription),
+				mcp.WithInputSchema[setSchemaInput](),
+			),
+			// No h.mu here: like query, setSchema manages its own locking,
+			// holding it only around the cheap field swap — the expensive
+			// parse/confine/load work (prepareSchema) runs lock-free first. See
+			// setSchema's doc comment. set_schema rides in this group per
+			// registerToolsForMode's doc comment (schema CRUD proper is a
+			// later phase; until then it stays available everywhere).
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in setSchemaInput) (setSchemaOutput, error) {
+				return h.setSchema(in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("query",
+				mcp.WithDescription(mcpQueryDescription(h.timeout)),
+				mcp.WithInputSchema[queryInput](),
+			),
+			// No h.mu here: query manages the lock itself, holding it only for
+			// the state snapshot so a long-running Transform does not freeze
+			// the other tools or the workbench panes that share this mutex.
+			mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in queryInput) (queryOutput, error) {
+				return h.query(ctx, in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("list_predicates",
+				mcp.WithDescription(mcpListPredicatesDescription),
+				mcp.WithInputSchema[listPredicatesInput](),
+			),
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in listPredicatesInput) (listPredicatesOutput, error) {
+				h.mu.Lock()
+				defer h.mu.Unlock()
+				return h.listPredicates(in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("sample_facts",
+				mcp.WithDescription(mcpSampleFactsDescription),
+				mcp.WithInputSchema[sampleFactsInput](),
+			),
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in sampleFactsInput) (sampleFactsOutput, error) {
+				h.mu.Lock()
+				defer h.mu.Unlock()
+				return h.sampleFacts(in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("explain",
+				mcp.WithDescription(mcpExplainDescription),
+				mcp.WithInputSchema[explainInput](),
+			),
+			// No h.mu here: explain manages its own locking via
+			// lockedSnapshot-style capture inside h.explain, for the same reason
+			// query does — resolving/computing a fixpoint can take a while and
+			// must not freeze every other tool call or workbench pane.
+			mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in explainInput) (explainOutput, error) {
+				return h.explain(ctx, in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("describe",
+				mcp.WithDescription(mcpDescribeDescription),
+				mcp.WithInputSchema[describeInput](),
+			),
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in describeInput) (describeOutput, error) {
+				h.mu.Lock()
+				defer h.mu.Unlock()
+				return h.describe(in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("sample_input",
+				mcp.WithDescription(mcpSampleInputDescription),
+				mcp.WithInputSchema[sampleInputInput](),
+			),
+			// No h.mu here: sample_input only ever reads h.fsys/h.confine, both
+			// immutable after construction (never reassigned), and touches no
+			// session state at all — see sampleInput's doc comment.
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in sampleInputInput) (sampleInputOutput, error) {
+				return h.sampleInput(in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("list_rule_groups",
+				mcp.WithDescription(mcpListRuleGroupsDescription),
+				mcp.WithInputSchema[listRuleGroupsInput](),
+			),
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in listRuleGroupsInput) (listRuleGroupsOutput, error) {
+				h.mu.Lock()
+				defer h.mu.Unlock()
+				return h.listRuleGroups(in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("get_rule_group",
+				mcp.WithDescription(mcpGetRuleGroupDescription),
+				mcp.WithInputSchema[getRuleGroupInput](),
+			),
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in getRuleGroupInput) (getRuleGroupOutput, error) {
+				h.mu.Lock()
+				defer h.mu.Unlock()
+				return h.getRuleGroup(in)
+			}),
+		)
+	}
+
+	registerRulesWriteSet := func() {
+		srv.AddTool(
+			mcp.NewTool("put_rule_group",
+				mcp.WithDescription(mcpPutRuleGroupDescription),
+				mcp.WithInputSchema[putRuleGroupInput](),
+			),
+			// h.mu held for the whole call (design decision 4: "Writes happen
+			// under h.mu like the old set_rules did — rule compiles are fast").
+			// Unlike set_schema's data reload (which can be slow enough to be
+			// worth a lock-free prepare phase), a rule group's parse + trial
+			// Compile + file write is fast, so there is no lock-free half worth
+			// splitting out here.
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putRuleGroupInput) (putRuleGroupOutput, error) {
+				h.mu.Lock()
+				defer h.mu.Unlock()
+				return h.putRuleGroup(in)
+			}),
+		)
+		srv.AddTool(
+			mcp.NewTool("delete_rule_group",
+				mcp.WithDescription(mcpDeleteRuleGroupDescription),
+				mcp.WithInputSchema[deleteRuleGroupInput](),
+			),
+			mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteRuleGroupInput) (deleteRuleGroupOutput, error) {
+				h.mu.Lock()
+				defer h.mu.Unlock()
+				return h.deleteRuleGroup(in)
+			}),
+		)
+	}
+
+	switch mode {
+	case toolModeRules:
+		registerQuerySet()
+		registerRulesWriteSet()
+	default:
+		// No other mode exists yet (see toolMode's doc comment) — an unknown
+		// mode value is a programming error in this package, not a runtime
+		// condition a caller can trigger, so it registers nothing rather than
+		// guessing at a fallback surface.
+	}
 }
 
 // -- set_schema ---------------------------------------------------------
@@ -530,54 +628,6 @@ func countPredicates(db datalog.Database) []predicateCount {
 		return out[i].Arity < out[j].Arity
 	})
 	return out
-}
-
-// -- set_rules ------------------------------------------------------------
-
-type setRulesInput struct {
-	Source string `json:"source" jsonschema:"the whole Datalog program (facts and rules); embedded '?' queries are rejected, use the query tool instead"`
-}
-
-type setRulesOutput struct {
-	Predicates []string `json:"predicates"`
-
-	// Warnings carries session.setRules's non-fatal parse diagnostics --
-	// currently detached '%%' doc-comment blocks that were dropped from the
-	// stored document (see syntax.Ruleset.Warnings). A model writing
-	// documented rules over MCP has no workbench Check pane to surface these,
-	// so set_rules must report them here or a doc block that failed to attach
-	// vanishes silently -- the same Warnings channel set_schema already
-	// exposes (setSchemaOutput.Warnings).
-	Warnings []string `json:"warnings,omitempty"`
-}
-
-// setRules requires the caller to hold h.mu — unlike h.query, which manages
-// its own locking via lockedSnapshot/cacheDerivedQuery, its safety lives
-// entirely in the tool-handler wrapper that locks around it.
-func (h *mcpHandlers) setRules(in setRulesInput) (setRulesOutput, error) {
-	warnings, err := h.sess.setRules(in.Source)
-	if err != nil {
-		return setRulesOutput{}, err
-	}
-	seen := map[string]bool{}
-	var preds []string
-	for _, r := range h.sess.rules {
-		if !seen[r.Head.Pred] {
-			seen[r.Head.Pred] = true
-			preds = append(preds, r.Head.Pred)
-		}
-	}
-	for _, ar := range h.sess.aggRules {
-		if !seen[ar.Head.Pred] {
-			seen[ar.Head.Pred] = true
-			preds = append(preds, ar.Head.Pred)
-		}
-	}
-	sort.Strings(preds)
-	if h.onChange != nil {
-		h.onChange()
-	}
-	return setRulesOutput{Predicates: preds, Warnings: warnings}, nil
 }
 
 // -- query ------------------------------------------------------------

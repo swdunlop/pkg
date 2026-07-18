@@ -11,9 +11,10 @@ import (
 // describeRuleRef is one rule's contribution to a describeArity's derivedBy
 // or consumedBy list: the rule rendered as source text (syntax.Rule.String/
 // syntax.AggregateRule.String — the SAME rendering the .rules command and
-// set_rules round-trip use, so a model reading this back sees exactly what
-// it would find in the rules document) plus that rule's own %% doc comment,
-// if any (syntax.Rule.Doc/syntax.AggregateRule.Doc — see
+// the rule-group CRUD tools' (put_rule_group/get_rule_group) round-trip use,
+// so a model reading this back sees exactly what it would find in the rule
+// group's file) plus that rule's own %% doc comment, if any
+// (syntax.Rule.Doc/syntax.AggregateRule.Doc — see
 // doc/features/predicate-docs.md).
 type describeRuleRef struct {
 	RuleText string `json:"ruleText"`

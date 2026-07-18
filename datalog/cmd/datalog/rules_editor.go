@@ -319,6 +319,24 @@ type applyRulesResult struct {
 // cheap relative to evalTimeout, so — unlike setSchema's data reload —
 // holding wb.h.mu across the whole call is fine; there is no lock-free
 // "prepare" half worth splitting out here.
+//
+// KNOWN DIVERGENCE under a --rules (rules/ directory store) session: this
+// path calls session.setRulesWithQueries, which only ever mutates SESSION
+// MEMORY (s.rules/s.aggRules/s.rulesText) — it has no idea a *ruleStore
+// exists at all and never touches h.rules or any file on disk. The v1
+// workbench's Datalog Editor Run action therefore still edits the
+// monolithic in-memory document even when the session was started with
+// --rules: pasting a whole ruleset into the editor and clicking Run applies
+// it to the session but does NOT update the rules/ directory's group files,
+// so a subsequent put_rule_group/delete_rule_group call (which reloads
+// FROM the store via session.loadRuleStore) would silently discard whatever
+// Run just applied, and the rules/ directory and the session's in-memory
+// ruleset can disagree indefinitely. This is accepted, not fixed, for phase
+// 1b (doc/features/workbench-v2.md work item 2, "Old UI keeps working until
+// phase 2 replaces it," is what retires this whole editor/Run affordance in
+// favor of the new browser's read-only Rules tab plus the CRUD tools) — see
+// this task's brief, which calls this out explicitly as a known, deferred
+// divergence rather than a bug to fix now.
 func runApplyRulesDocument(ctx context.Context, wb *workbench, rulesText string) <-chan applyRulesResult {
 	out := make(chan applyRulesResult, 1)
 	var queries []syntax.Query

@@ -135,9 +135,10 @@ const agentSystemPrompt = `You are the assistant embedded in a Datalog workbench
 The human is authoring a jsonfacts schema (mapping JSONL records to base facts)
 and Datalog rules over those facts, and their working session is usually
 already loaded. Orient with list_predicates, then answer questions with query
-and sample_facts against what is there. set_schema and set_rules REPLACE the
-human's working documents - call them only when the human explicitly asks you
-to change the schema or rules, never to answer a question; sample_input is for
+and sample_facts against what is there. set_schema REPLACES the human's whole
+data-loading document; put_rule_group/delete_rule_group edit ONE rule group at
+a time - call any of these only when the human explicitly asks you to change
+the schema or rules, never to answer a question; sample_input is for
 authoring too, not for lookups. Datalog is the reasoner: express joins and
 filters in a single conjunctive query and let the engine unify, rather than
 fetching predicates one at a time and correlating results yourself. Prefer
@@ -226,14 +227,21 @@ func (d *kitDriver) Answer(requestID, optionID string) error {
 func (d *kitDriver) Close() error { return d.k.Close() }
 
 // readOnlyTools is the workbench's own read-only MCP tool set (mcp.go): the
-// three tools that only ever read the session's schema/rules/facts back to
-// the caller, never mutate them. set_schema, set_rules, and sample_input are
-// deliberately excluded — they REPLACE the human's working documents (see
-// mcp_docs.go's tool descriptions) and must keep prompting.
+// tools that only ever read the session's schema/rules/facts back to the
+// caller, never mutate them. set_schema and sample_input are deliberately
+// excluded — they REPLACE the human's working documents (see mcp_docs.go's
+// tool descriptions) and must keep prompting; put_rule_group/
+// delete_rule_group are excluded for the same reason (design decision 5:
+// editing or deleting an existing group is consent-gated). list_rule_groups
+// and get_rule_group are pure reads (phase 1b, doc/features/workbench-v2.md
+// work item 1) and join this set alongside query/sample_facts/
+// list_predicates.
 var readOnlyTools = map[string]bool{
-	"query":           true,
-	"sample_facts":    true,
-	"list_predicates": true,
+	"query":            true,
+	"sample_facts":     true,
+	"list_predicates":  true,
+	"list_rule_groups": true,
+	"get_rule_group":   true,
 }
 
 // readOnlyToolName recognizes a permission request's tool-call title as one
