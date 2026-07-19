@@ -416,8 +416,12 @@ const (
 func (h *mcpHandlers) registerTools(srv *server.MCPServer) {
 	h.registerFactsReadSet(srv)
 	h.registerQueryOnlySet(srv)
-	h.registerRulesWriteSet(srv)
-	h.registerSchemaWriteSet(srv)
+	// nil consent: these surfaces predate per-conversation consent (stdio's
+	// caller IS the operator's tool; /mcp holds the operator-issued bearer
+	// token) — the diff-card gate is the KIT conversation's (design decision
+	// 5; consent.go's header).
+	h.registerRulesWriteSet(srv, nil)
+	h.registerSchemaWriteSet(srv, nil)
 }
 
 // registerToolsForMode wires the mode-appropriate subset of typed handler
@@ -432,7 +436,11 @@ func (h *mcpHandlers) registerTools(srv *server.MCPServer) {
 // decision 5), so a future tool lands in exactly one mode's method body —
 // there is no shared "everything" closure left to silently carry a new tool
 // into a mode it does not belong in.
-func (h *mcpHandlers) registerToolsForMode(srv *server.MCPServer, mode toolMode) {
+// consent, when non-nil, gates edits/deletes of existing items behind a
+// transcript diff card (consent.go) — the write sets thread it into their
+// handlers, so no mode or tool can register a gated write without deciding
+// its consent story at this one seam.
+func (h *mcpHandlers) registerToolsForMode(srv *server.MCPServer, mode toolMode, consent *consentGate) {
 	switch mode {
 	case toolModeQuery:
 		h.registerFactsReadSet(srv)
@@ -440,10 +448,10 @@ func (h *mcpHandlers) registerToolsForMode(srv *server.MCPServer, mode toolMode)
 	case toolModeRules:
 		h.registerFactsReadSet(srv)
 		h.registerQueryOnlySet(srv)
-		h.registerRulesWriteSet(srv)
+		h.registerRulesWriteSet(srv, consent)
 	case toolModeFacts:
 		h.registerFactsReadSet(srv)
-		h.registerSchemaWriteSet(srv)
+		h.registerSchemaWriteSet(srv, consent)
 	default:
 		// An unknown mode value is a programming error in this package, not
 		// a runtime condition a caller can trigger, so it registers nothing
@@ -592,22 +600,21 @@ func (h *mcpHandlers) registerQueryOnlySet(srv *server.MCPServer) {
 
 // registerRulesWriteSet is the rule-group CRUD surface (put_rule_group,
 // delete_rule_group) that only Rules Mode gets (design decision 5).
-func (h *mcpHandlers) registerRulesWriteSet(srv *server.MCPServer) {
+// consent, when non-nil, gates edits/deletes of EXISTING groups behind a
+// transcript diff card (consent.go's consented* methods, where the gating
+// logic and its tests live); creating a new group applies immediately.
+func (h *mcpHandlers) registerRulesWriteSet(srv *server.MCPServer, consent *consentGate) {
 	srv.AddTool(
 		mcp.NewTool("put_rule_group",
 			mcp.WithDescription(mcpPutRuleGroupDescription),
 			mcp.WithInputSchema[putRuleGroupInput](),
 		),
-		// h.mu held for the whole call (design decision 4: "Writes happen
-		// under h.mu like the old set_rules did — rule compiles are fast").
-		// Unlike set_schema's data reload (which can be slow enough to be
-		// worth a lock-free prepare phase), a rule group's parse + trial
-		// Compile + file write is fast, so there is no lock-free half worth
-		// splitting out here.
-		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putRuleGroupInput) (putRuleGroupOutput, error) {
-			h.mu.Lock()
-			defer h.mu.Unlock()
-			return h.putRuleGroup(in)
+		// h.mu held for the whole write (design decision 4: "Writes happen
+		// under h.mu like the old set_rules did — rule compiles are fast");
+		// the consent gate runs before, outside the lock (consent.go's
+		// consentedPutRuleGroup).
+		mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in putRuleGroupInput) (putRuleGroupOutput, error) {
+			return h.consentedPutRuleGroup(ctx, consent, in)
 		}),
 	)
 	srv.AddTool(
@@ -615,10 +622,8 @@ func (h *mcpHandlers) registerRulesWriteSet(srv *server.MCPServer) {
 			mcp.WithDescription(mcpDeleteRuleGroupDescription),
 			mcp.WithInputSchema[deleteRuleGroupInput](),
 		),
-		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteRuleGroupInput) (deleteRuleGroupOutput, error) {
-			h.mu.Lock()
-			defer h.mu.Unlock()
-			return h.deleteRuleGroup(in)
+		mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in deleteRuleGroupInput) (deleteRuleGroupOutput, error) {
+			return h.consentedDeleteRuleGroup(ctx, consent, in)
 		}),
 	)
 }
@@ -627,21 +632,17 @@ func (h *mcpHandlers) registerRulesWriteSet(srv *server.MCPServer) {
 // schema half; schema_crud.go): put_source/delete_source,
 // put_matcher/delete_matcher, put_declaration/delete_declaration. This is
 // Facts Mode's surface (design decision 5's "Facts Mode" bullet) — Query
-// and Rules Mode never register it.
-//
-// Each write method manages its own locking (unlike put_rule_group's
-// whole-call h.mu): a schema write's prepareSchema half can be slow
-// (a full data reload), so — exactly like set_schema before it — the
-// lock is only taken for the cheap staleness-check-and-swap, never
-// across the reload itself. See schema_crud.go's commitSchemaWrite.
-func (h *mcpHandlers) registerSchemaWriteSet(srv *server.MCPServer) {
+// and Rules Mode never register it. consent, when non-nil, gates
+// edits/deletes of EXISTING items behind a transcript diff card
+// (consent.go's consented* methods); adds apply immediately.
+func (h *mcpHandlers) registerSchemaWriteSet(srv *server.MCPServer, consent *consentGate) {
 	srv.AddTool(
 		mcp.NewTool("put_source",
 			mcp.WithDescription(mcpPutSourceDescription),
 			mcp.WithInputSchema[putSourceInput](),
 		),
-		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putSourceInput) (putSourceOutput, error) {
-			return h.putSource(in)
+		mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in putSourceInput) (putSourceOutput, error) {
+			return h.consentedPutSource(ctx, consent, in)
 		}),
 	)
 	srv.AddTool(
@@ -649,8 +650,8 @@ func (h *mcpHandlers) registerSchemaWriteSet(srv *server.MCPServer) {
 			mcp.WithDescription(mcpDeleteSourceDescription),
 			mcp.WithInputSchema[deleteSourceInput](),
 		),
-		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteSourceInput) (deleteSourceOutput, error) {
-			return h.deleteSource(in)
+		mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in deleteSourceInput) (deleteSourceOutput, error) {
+			return h.consentedDeleteSource(ctx, consent, in)
 		}),
 	)
 	srv.AddTool(
@@ -658,8 +659,8 @@ func (h *mcpHandlers) registerSchemaWriteSet(srv *server.MCPServer) {
 			mcp.WithDescription(mcpPutMatcherDescription),
 			mcp.WithInputSchema[putMatcherInput](),
 		),
-		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putMatcherInput) (putMatcherOutput, error) {
-			return h.putMatcher(in)
+		mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in putMatcherInput) (putMatcherOutput, error) {
+			return h.consentedPutMatcher(ctx, consent, in)
 		}),
 	)
 	srv.AddTool(
@@ -667,8 +668,8 @@ func (h *mcpHandlers) registerSchemaWriteSet(srv *server.MCPServer) {
 			mcp.WithDescription(mcpDeleteMatcherDescription),
 			mcp.WithInputSchema[deleteMatcherInput](),
 		),
-		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteMatcherInput) (deleteMatcherOutput, error) {
-			return h.deleteMatcher(in)
+		mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in deleteMatcherInput) (deleteMatcherOutput, error) {
+			return h.consentedDeleteMatcher(ctx, consent, in)
 		}),
 	)
 	srv.AddTool(
@@ -676,8 +677,8 @@ func (h *mcpHandlers) registerSchemaWriteSet(srv *server.MCPServer) {
 			mcp.WithDescription(mcpPutDeclarationDescription),
 			mcp.WithInputSchema[putDeclarationInput](),
 		),
-		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in putDeclarationInput) (putDeclarationOutput, error) {
-			return h.putDeclaration(in)
+		mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in putDeclarationInput) (putDeclarationOutput, error) {
+			return h.consentedPutDeclaration(ctx, consent, in)
 		}),
 	)
 	srv.AddTool(
@@ -685,8 +686,8 @@ func (h *mcpHandlers) registerSchemaWriteSet(srv *server.MCPServer) {
 			mcp.WithDescription(mcpDeleteDeclarationDescription),
 			mcp.WithInputSchema[deleteDeclarationInput](),
 		),
-		mcp.NewStructuredToolHandler(func(_ context.Context, _ mcp.CallToolRequest, in deleteDeclarationInput) (deleteDeclarationOutput, error) {
-			return h.deleteDeclaration(in)
+		mcp.NewStructuredToolHandler(func(ctx context.Context, _ mcp.CallToolRequest, in deleteDeclarationInput) (deleteDeclarationOutput, error) {
+			return h.consentedDeleteDeclaration(ctx, consent, in)
 		}),
 	)
 }

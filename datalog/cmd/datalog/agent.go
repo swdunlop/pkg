@@ -125,6 +125,12 @@ type agentConfig struct {
 // so no subprocess, socket, or token is involved.
 type kitDriver struct {
 	k *kit.Kit
+
+	// consent is the conversation's diff-card gate (consent.go), nil for
+	// the v1 embedded driver. Answer dispatches to it: kit itself has no
+	// permission flow, so every requestID a kit conversation can see is
+	// the gate's own.
+	consent *consentGate
 }
 
 // agentSystemPrompt frames the workbench for the agent. The MCP server's
@@ -276,12 +282,15 @@ func (d *kitDriver) Prompt(ctx context.Context, text string, sink func(agentEven
 	return res.StopReason, nil
 }
 
-// Answer always fails: kit has no permission/approval flow to surface (see
-// the agentDriver interface doc and acp-integration.md's kit risk note), so
-// it never emits a "permission" agentEvent for a pane Answer click to
-// target.
+// Answer resolves a consent diff card's Approve/Deny click (consent.go) —
+// the one kind of permission a kit conversation can be waiting on, since
+// kit itself has no permission/approval flow (see the agentDriver
+// interface doc and acp-integration.md's kit risk note).
 func (d *kitDriver) Answer(requestID, optionID string) error {
-	return fmt.Errorf("the embedded agent does not issue permission requests")
+	if d.consent != nil && d.consent.Resolve(requestID, optionID) {
+		return nil
+	}
+	return fmt.Errorf("the embedded agent does not recognize this permission request")
 }
 
 func (d *kitDriver) Close() error { return d.k.Close() }

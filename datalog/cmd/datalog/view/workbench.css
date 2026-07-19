@@ -600,3 +600,28 @@ button.action.why {
 }
 /* While a turn runs the button shows a plain ■ (stop) — no spinner ring;
  * the agent-activity line beside it is the pane's one running indicator. */
+
+/* Consent diff cards (workbench-v2 design decision 5): the blocked
+ * write's line diff, between the permission line and the Approve/Deny
+ * row. Green/red backgrounds derive from the theme's primary/danger at
+ * low alpha so both schemes keep their contrast. */
+pre.consent-diff {
+  margin: var(--space-2) 0;
+  max-height: 16rem;
+  overflow: auto;
+  font-size: var(--text-7);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-medium);
+  padding: var(--space-2);
+}
+.diff-line {
+  white-space: pre-wrap;
+}
+.diff-line.add {
+  background: rgb(from var(--primary) r g b / 0.15);
+}
+.diff-line.del {
+  background: rgb(from var(--danger) r g b / 0.15);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}

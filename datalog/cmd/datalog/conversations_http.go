@@ -288,11 +288,12 @@ func (wb *workbench) conversationDriver(id string, mode conversationMode) (agent
 		_ = wb.agent.Close()
 		wb.agent = nil
 	}
-	k, err := newConversationKit(context.Background(), wb.agentCfg, wb.h, wb.conversations.sessionPath(id), mode)
+	consent := newConsentGate(wb, id)
+	k, err := newConversationKit(context.Background(), wb.agentCfg, wb.h, wb.conversations.sessionPath(id), mode, consent)
 	if err != nil {
 		return nil, err
 	}
-	d := &kitDriver{k: k}
+	d := &kitDriver{k: k, consent: consent}
 	wb.agent, wb.agentConvID = d, id
 	return d, nil
 }

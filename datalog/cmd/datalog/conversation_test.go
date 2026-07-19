@@ -360,7 +360,7 @@ func TestConversationAutoTitle(t *testing.T) {
 func registeredToolNames(t *testing.T, h *mcpHandlers, mode toolMode) []string {
 	t.Helper()
 	srv := server.NewMCPServer("test", "0.0.0")
-	h.registerToolsForMode(srv, mode)
+	h.registerToolsForMode(srv, mode, nil)
 	tools := srv.ListTools()
 	names := make([]string, 0, len(tools))
 	for name := range tools {

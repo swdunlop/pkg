@@ -317,12 +317,12 @@ func (cm *conversationManager) ModeOf(id string) (conversationMode, error) {
 // with the SAME mode-appropriate system prompt and tool registration").
 // kit itself rebuilds the message history from the session tree — Resume
 // does not touch messages at all, only mode.
-func (cm *conversationManager) Resume(ctx context.Context, cfg agentConfig, h *mcpHandlers, id string) (*kit.Kit, conversationMode, error) {
+func (cm *conversationManager) Resume(ctx context.Context, cfg agentConfig, h *mcpHandlers, id string, consent *consentGate) (*kit.Kit, conversationMode, error) {
 	mode, err := cm.ModeOf(id)
 	if err != nil {
 		return nil, "", fmt.Errorf("resuming conversation %s: %w", id, err)
 	}
-	k, err := newConversationKit(ctx, cfg, h, cm.sessionPath(id), mode)
+	k, err := newConversationKit(ctx, cfg, h, cm.sessionPath(id), mode, consent)
 	if err != nil {
 		return nil, "", err
 	}
@@ -484,7 +484,10 @@ func conversationSystemPrompt(mode conversationMode) string {
 // surfaces (runMCP, the /mcp mount) share, exactly like newKitDriver's
 // mcpSrv parameter (agent.go) — one session, N frontends, extended to N
 // conversations.
-func newConversationKit(ctx context.Context, cfg agentConfig, h *mcpHandlers, path string, mode conversationMode) (*kit.Kit, error) {
+// consent, when non-nil, is the conversation's diff-card gate (consent.go),
+// threaded into the write sets' registration so edits/deletes of existing
+// items block on the human's Approve/Deny.
+func newConversationKit(ctx context.Context, cfg agentConfig, h *mcpHandlers, path string, mode conversationMode, consent *consentGate) (*kit.Kit, error) {
 	if !validConversationMode(mode) {
 		return nil, fmt.Errorf("invalid conversation mode %q", mode)
 	}
@@ -492,7 +495,7 @@ func newConversationKit(ctx context.Context, cfg agentConfig, h *mcpHandlers, pa
 		server.WithInstructions(mcpServerInstructions),
 		server.WithRecovery(),
 	)
-	h.registerToolsForMode(srv, mode.toolMode())
+	h.registerToolsForMode(srv, mode.toolMode(), consent)
 
 	k, err := kit.New(ctx, &kit.Options{
 		Model:            cfg.Model,
