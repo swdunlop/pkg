@@ -133,20 +133,17 @@ func ruleDepSection(label string, links []RuleDepLink, matchers []string) html.C
 			sec = sec.Add(html.Text(", "))
 		}
 		first = false
-		sec = sec.Add(tag.New("a.pred-link").
-			Set("data-on:click", "$_browserTab = 'schema'").
-			Add(html.Text(m)))
+		sec = sec.Add(SchemaLink(m))
 	}
 	return sec
 }
 
 func ruleDepLink(l RuleDepLink) html.Content {
 	label := fmt.Sprintf("%s/%d", l.Head, l.Arity)
-	a := tag.New("a.pred-link").Add(html.Text(label))
 	if l.IsGroup {
-		return a.Set("data-on:click", fmt.Sprintf("@get('/rules/%s/%d')", l.Head, l.Arity))
+		return RulesLink(l.Head, l.Arity, label)
 	}
-	return a.Set("data-on:click", "$_browserTab = 'facts'")
+	return FactsLink(l.Head, l.Arity, label)
 }
 
 // HighlightDatalog renders one rule statement's source text with light

@@ -208,9 +208,12 @@ func WhyButton(name string, arity int, factLiteral string) html.Content {
 	// The result lands in the Facts tab's own #why-output surface
 	// (browser.go's WhyOutput), which sits directly above the predicate
 	// lists this button renders under — no tab flip needed; the why?
-	// button only exists inside the Facts tab.
+	// button only exists inside the Facts tab. The scroll runs before the
+	// tree arrives over the bus, which is fine: the (possibly empty)
+	// #why-output div already sits where the result will land, so the
+	// viewport is right when the patch morphs it.
 	return tag.New("button.action.why").
-		Set("data-on:click", "@post('"+href+"')").
+		Set("data-on:click", "@post('"+href+"'); document.getElementById('why-output')?.scrollIntoView()").
 		Add(html.Text("why?"))
 }
 

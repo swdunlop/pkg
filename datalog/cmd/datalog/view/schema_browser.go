@@ -39,10 +39,14 @@ type SchemaPatternsInfo struct {
 }
 
 // SchemaMatcherInfo is one matcher: the (predicate, term) it reads, its
-// flags, and its pattern kinds.
+// flags, and its pattern kinds. Arity is the read predicate's arity when
+// package main could resolve it from the config's own mappings/declarations
+// (the matcher itself doesn't carry one), or 0 when unknown/ambiguous — the
+// read link then falls back to a plain Facts-tab flip.
 type SchemaMatcherInfo struct {
 	Predicate string
 	Term      int
+	Arity     int
 	Flags     []string // e.g. "case-insensitive", "windash"
 	Patterns  []SchemaPatternsInfo
 }
@@ -97,7 +101,7 @@ func schemaMapping(m SchemaMappingInfo) html.Content {
 	}
 	li := tag.New("li.schema-mapping").Add(
 		tag.New("span.schema-arrow", html.Text("→ ")),
-		PredicateLink(m.Predicate),
+		FactsLink(m.Predicate, len(m.Args), m.Predicate),
 		tag.New("code", html.Text("("+strings.Join(m.Args, ", ")+")")),
 	)
 	if m.Filter != "" {
@@ -122,9 +126,13 @@ func schemaMatchersSection(matchers []SchemaMatcherInfo) html.Content {
 const schemaPatternInlineMax = 8
 
 func schemaMatcher(m SchemaMatcherInfo) html.Content {
+	readLink := PredicateLink(m.Predicate)
+	if m.Arity > 0 {
+		readLink = FactsLink(m.Predicate, m.Arity, m.Predicate)
+	}
 	head := tag.New("div.schema-item-head").Add(
 		html.Text("reads "),
-		PredicateLink(m.Predicate),
+		readLink,
 		tag.New("code", html.Text(fmt.Sprintf(" term %d", m.Term))),
 	)
 	for _, f := range m.Flags {
@@ -134,7 +142,7 @@ func schemaMatcher(m SchemaMatcherInfo) html.Content {
 	for _, p := range m.Patterns {
 		line := tag.New("div.schema-patterns").Add(
 			tag.New("span.schema-arrow", html.Text("→ ")),
-			PredicateLink(p.Produces),
+			FactsLink(p.Produces, 2, p.Produces),
 			html.Text(fmt.Sprintf("/2 · %s (%d): ", p.Kind, len(p.Patterns))),
 		)
 		if len(p.Patterns) <= schemaPatternInlineMax {
@@ -180,7 +188,7 @@ func schemaDeclsSection(decls []SchemaDeclInfo) html.Content {
 			terms = append(terms, html.Text(")"))
 			item := tag.New("div.schema-item").Add(
 				tag.New("div.schema-item-head").Add(
-					PredicateLink(d.Name),
+					FactsLink(d.Name, len(d.Terms), d.Name),
 					tag.New("code").Add(terms...),
 				),
 			)
@@ -192,10 +200,11 @@ func schemaDeclsSection(decls []SchemaDeclInfo) html.Content {
 	)
 }
 
-// PredicateLink renders a predicate name as a link into the Facts tab: the
-// click flips the client-local $_browserTab. Deep-linking to the expanded
-// predicate is phase-4 polish (workbench-v2 "Cross-links + provenance
-// polish"); the tab flip alone already lands the reader one click away.
+// PredicateLink renders a predicate name as a plain Facts-tab flip — the
+// arity-unknown fallback for surfaces that cannot resolve one (a matcher
+// reading a predicate no mapping or declaration names). Everything that
+// knows the arity uses FactsLink (cross_links.go) instead, which also loads
+// and scrolls to the predicate's facts.
 func PredicateLink(name string) html.Content {
 	return tag.New("a.pred-link").
 		Set("data-on:click", "$_browserTab = 'facts'").

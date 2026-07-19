@@ -39,9 +39,34 @@ func renderSchemaPanel(cfg jsonfacts.Config) html.Content {
 		sources[i] = view.SchemaSourceInfo{File: s.File, Mappings: mappings}
 	}
 
+	// A matcher names the predicate it reads but not its arity; resolve one
+	// from the config's own mappings and declarations so the "reads" link
+	// can deep-link into the Facts tab (phase 4). Two different arities for
+	// one name leaves it unresolved (0) — the link then falls back to a
+	// plain tab flip rather than guessing.
+	arities := map[string]int{}
+	noteArity := func(name string, arity int) {
+		if prev, ok := arities[name]; ok && prev != arity {
+			arities[name] = 0
+			return
+		}
+		arities[name] = arity
+	}
+	for _, s := range sorted.Sources {
+		for _, m := range s.Mappings {
+			if m.Predicate != "" {
+				noteArity(m.Predicate, len(m.Args))
+			}
+		}
+	}
+	for _, d := range sorted.Declarations {
+		noteArity(d.Name, len(d.Terms))
+	}
+
 	matchers := make([]view.SchemaMatcherInfo, len(sorted.Matchers))
 	for i, m := range sorted.Matchers {
 		matchers[i] = schemaMatcherInfo(m)
+		matchers[i].Arity = arities[m.Predicate]
 	}
 
 	decls := make([]view.SchemaDeclInfo, len(sorted.Declarations))

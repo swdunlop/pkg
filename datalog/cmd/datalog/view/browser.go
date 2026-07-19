@@ -61,21 +61,11 @@ func factsPanel() html.Content {
 }
 
 // WhyOutput renders the #why-output fragment the Facts tab's why? buttons
-// patch (fact_browser.go's handleWhy): the fact it explains as a heading
-// and the rendered derivation tree — already box-drawing text from
-// seminaive.Derivation.String() — in a <pre> block so its indentation and
-// unicode connectors render verbatim. An error replaces the same div, so
-// only one why? result shows at a time.
+// patch (fact_browser.go's handleWhy): a WhyTree (why_tree.go's structural
+// derivation rendering) on success. An error replaces the same div, so only
+// one why? result shows at a time.
 func WhyOutput(content html.Content) html.Content {
 	return tag.New("div#why-output").Add(content)
-}
-
-// WhyResult is the successful why? rendering WhyOutput wraps.
-func WhyResult(fact, tree string) html.Content {
-	return html.Group{
-		tag.New("p.query-text", html.Text("why: "+fact)),
-		tag.New("pre.explain-tree", html.Text(tree)),
-	}
 }
 
 // WhyError is the failed why? rendering.

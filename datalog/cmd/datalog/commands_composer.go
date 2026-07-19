@@ -9,6 +9,7 @@ import (
 	"github.com/mark3labs/kit/pkg/kit"
 	html "github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/tag"
+	"swdunlop.dev/pkg/datalog/cmd/datalog/view"
 	"swdunlop.dev/pkg/datalog/jsonfacts"
 )
 
@@ -137,7 +138,8 @@ func (wb *workbench) runComposerQuery(input string) (html.Content, string) {
 				parts = append(parts, commandError(outcome.Block.Err))
 				fmt.Fprintf(&summary, "%s\nerror: %s\n", q.String(), outcome.Block.Err)
 			} else {
-				parts = append(parts, resultBlock(outcome.Block))
+				parts = append(parts, resultBlock(outcome.Block),
+					linkRow("predicates", atomPredicateLinks(q.Body)))
 				summarizeQueryBlock(&summary, outcome.Block)
 			}
 		}
@@ -209,12 +211,20 @@ func (wb *workbench) runComposerExpr(mode conversationMode, input string) (html.
 		tag.New("p.expr-result", html.Text("⇒ "+exprValueText(result)))}
 	if len(asserted) > 0 {
 		lines := make(html.Group, 0, len(asserted))
+		seen := map[string]bool{}
+		var links []html.Content
 		for _, f := range asserted {
 			text := assertedFactText(f)
 			lines = append(lines, tag.New("li", html.Text(text)))
 			fmt.Fprintf(&summary, "asserted %s\n", text)
+			key := fmt.Sprintf("%s/%d", f.Predicate, len(f.Args))
+			if !seen[key] && isPredicateIdent(f.Predicate) {
+				seen[key] = true
+				links = append(links, view.FactsLink(f.Predicate, len(f.Args), f.Predicate))
+			}
 		}
-		parts = append(parts, tag.New("ul.asserted-facts", lines))
+		parts = append(parts, tag.New("ul.asserted-facts", lines),
+			linkRow("predicates", links))
 	}
 	return parts, strings.TrimRight(summary.String(), "\n")
 }

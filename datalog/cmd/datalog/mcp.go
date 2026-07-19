@@ -970,16 +970,28 @@ type explainOutput struct {
 
 // explain resolves fact's full derivation tree and renders it as the same
 // unicode box-drawing text seminaive.Derivation.String() produces for the
-// REPL's .why — one rendering, shared by every explain surface (this tool,
-// repl.go's .why, cmd/datalog/fact_browser.go's "why?" affordance's
-// underlying call). Mirrors query's own lock-free-Transform-then-writeback
-// split (h.lockedSnapshot/h.cacheDerivedQuery): the potentially-slow part
-// (computing a base fixpoint when none is cached yet) runs with no lock
-// held, and only the cheap write-back takes h.mu again.
+// REPL's .why. It wraps explainDerivation — the one resolution path every
+// explain surface shares (this tool, repl.go's .why, and the Fact
+// Browser's "why?" affordance, which renders the structured Derivation
+// itself instead of this text form).
 func (h *mcpHandlers) explain(ctx context.Context, in explainInput) (explainOutput, error) {
-	fact, err := parseFactStatement(in.Fact)
+	d, err := h.explainDerivation(ctx, in)
 	if err != nil {
 		return explainOutput{}, err
+	}
+	return explainOutput{Tree: d.String()}, nil
+}
+
+// explainDerivation resolves fact's full derivation tree as the structured
+// seminaive.Derivation. Mirrors query's own
+// lock-free-Transform-then-writeback split
+// (h.lockedSnapshot/h.cacheDerivedQuery): the potentially-slow part
+// (computing a base fixpoint when none is cached yet) runs with no lock
+// held, and only the cheap write-back takes h.mu again.
+func (h *mcpHandlers) explainDerivation(ctx context.Context, in explainInput) (seminaive.Derivation, error) {
+	fact, err := parseFactStatement(in.Fact)
+	if err != nil {
+		return seminaive.Derivation{}, err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, h.timeout)
@@ -992,10 +1004,10 @@ func (h *mcpHandlers) explain(ctx context.Context, in explainInput) (explainOutp
 	cachedDB := h.sess.derivedDB
 	h.mu.Unlock()
 	if !provEnabled {
-		return explainOutput{}, fmt.Errorf("explain: this session was not started with provenance enabled")
+		return seminaive.Derivation{}, fmt.Errorf("explain: this session was not started with provenance enabled")
 	}
 	if buildErr != nil {
-		return explainOutput{}, buildErr
+		return seminaive.Derivation{}, buildErr
 	}
 
 	prov := cachedProv
@@ -1008,7 +1020,7 @@ func (h *mcpHandlers) explain(ctx context.Context, in explainInput) (explainOutp
 		fresh := seminaive.NewProvenance()
 		out, err := evaluateSnapshot(ctx, ruleset, engineOpts, db, fresh)
 		if err != nil {
-			return explainOutput{}, err
+			return seminaive.Derivation{}, err
 		}
 		prov = fresh
 		if err := checkFactCap(out); err == nil {
@@ -1028,11 +1040,11 @@ func (h *mcpHandlers) explain(ctx context.Context, in explainInput) (explainOutp
 	}
 	d, found := prov.ExplainTree(fact, opts...)
 	if !found {
-		return explainOutput{}, fmt.Errorf("explain: %s: no such derived fact in the current evaluation "+
+		return seminaive.Derivation{}, fmt.Errorf("explain: %s: no such derived fact in the current evaluation "+
 			"(check the predicate name/arity and constant terms with list_predicates/sample_facts, or "+
 			"re-run query — an explain must name a fact the current ruleset actually produced)", in.Fact)
 	}
-	return explainOutput{Tree: d.String()}, nil
+	return d, nil
 }
 
 // -- list_predicates ------------------------------------------------------

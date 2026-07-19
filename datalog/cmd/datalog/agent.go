@@ -726,6 +726,10 @@ func permissionEntry(ev agentEvent, tab string) html.Content {
 	return html.Group{
 		tag.New("p.permission-line",
 			html.Text("agent is waiting for permission: "+summary)),
+		// The gated write's browser referent (phase 4): a rule-group edit
+		// card links the group it would touch, so the operator can inspect
+		// the current state before answering.
+		toolBrowserLink(strings.TrimPrefix(ev.ToolName, "datalog__"), ev.ToolArgs),
 		tag.New("div.permission-options", buttons),
 	}
 }
@@ -739,10 +743,17 @@ func permissionEntry(ev agentEvent, tab string) html.Content {
 // one, falling back to a generic subject.
 func permissionResolvedEntry(ev *agentEvent, note string) html.Content {
 	subject := "a pending permission request"
+	var link html.Content = html.Group{}
 	if ev != nil {
 		subject = "permission for " + permissionSummary(*ev)
+		// An approved edit's transcript record keeps its browser link
+		// (phase 4, design decision 2: "a rule group in an approved edit").
+		link = toolBrowserLink(strings.TrimPrefix(ev.ToolName, "datalog__"), ev.ToolArgs)
 	}
-	return tag.New("p.permission-line", html.Text(subject+" — "+note))
+	return html.Group{
+		tag.New("p.permission-line", html.Text(subject+" — "+note)),
+		link,
+	}
 }
 
 // urlQueryEscape escapes a value for inclusion in a query string built by
@@ -816,6 +827,11 @@ func toolEntry(ev agentEvent, done bool) html.Content {
 	if done && ev.Result != "" {
 		body = append(body, toolResultBody(name, ev))
 	}
+	// The browser cross-link (phase 4, design decision 2): a rule-group
+	// edit links its group's Rules-tab detail, an explain links its fact's
+	// predicate, and so on — the transcript entry is the index into the
+	// browser. Renders nothing for tools with no browser-side referent.
+	body = append(body, toolBrowserLink(name, ev.ToolArgs))
 	// oat's summary is a flex row (space-between, trailing chevron ::after),
 	// so source order is layout order: code takes the flexible middle and
 	// the status icon rides the right edge beside the chevron.
@@ -860,12 +876,17 @@ func toolResultBody(name string, ev agentEvent) html.Content {
 				}
 				rows[i] = cells
 			}
-			return resultTable(queryResultBlock{
-				Vars:      out.Vars,
-				Rows:      rows,
-				Total:     out.Total,
-				Truncated: out.Truncated,
-			})
+			return html.Group{
+				resultTable(queryResultBlock{
+					Vars:      out.Vars,
+					Rows:      rows,
+					Total:     out.Total,
+					Truncated: out.Truncated,
+				}),
+				// Deep-link the predicates the query read (phase 4) —
+				// parsed from the call's own arguments, best-effort.
+				queryPredicateLinks(argsSummary(name, ev.ToolArgs)),
+			}
 		}
 		// Not the tool's structured shape (a transport quirk); fall through
 		// to the raw rendering rather than show an empty table.

@@ -13,6 +13,7 @@ import (
 	"swdunlop.dev/pkg/datalog"
 	"swdunlop.dev/pkg/datalog/cmd/datalog/view"
 	"swdunlop.dev/pkg/datalog/memory"
+	"swdunlop.dev/pkg/datalog/seminaive"
 )
 
 // factsPageSize is the number of facts paged per request, per
@@ -147,18 +148,71 @@ func (wb *workbench) handleWhy(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), evalTimeout)
 	defer cancel()
 
-	// Reuse mcpHandlers.explain wholesale — same lock-free-Transform/
-	// writeback split as query (h.lockedSnapshot/h.cacheDerivedQuery), same
-	// cache-beside-generation discipline, same rendering. A browser "why?"
-	// click and an agent's explain tool call are the same operation on the
-	// same session, matching every other workbench action's "one pipeline,
-	// N frontends" rule (serve.go).
-	out, err := wb.h.explain(ctx, explainInput{Fact: factText})
+	// Reuse mcpHandlers.explainDerivation wholesale — same
+	// lock-free-Transform/writeback split as query
+	// (h.lockedSnapshot/h.cacheDerivedQuery), same cache-beside-generation
+	// discipline. A browser "why?" click and an agent's explain tool call
+	// are the same operation on the same session, matching every other
+	// workbench action's "one pipeline, N frontends" rule (serve.go); the
+	// browser renders the structured Derivation (phase 4's why? expansion)
+	// where the tool renders its text form.
+	d, err := wb.h.explainDerivation(ctx, explainInput{Fact: factText})
 	if err != nil {
 		wb.publishWhyError("why: " + err.Error())
 		return
 	}
-	wb.bus.Publish(datastar.Elements(view.WhyOutput(view.WhyResult(factText, out.Tree))))
+	wb.h.mu.Lock()
+	root := wb.whyNode(d)
+	wb.h.mu.Unlock()
+	wb.bus.Publish(datastar.Elements(view.WhyOutput(view.WhyTree(factText, root))))
+}
+
+// whyNode converts one seminaive.Derivation step into the view's WhyNode,
+// recursively — the same engine-type-to-Info-struct split every browser
+// panel uses (browser_panels.go). Callers must hold wb.h.mu: the rule-group
+// lookup (which turns a derived step into a Rules-tab link) reads
+// wb.h.rules.
+func (wb *workbench) whyNode(d seminaive.Derivation) view.WhyNode {
+	n := view.WhyNode{
+		Fact:       factDisplayLiteral(d.Fact),
+		Pred:       d.Fact.Name,
+		Arity:      len(d.Fact.Terms),
+		Base:       d.Base,
+		Repeated:   d.Repeated,
+		Truncated:  d.Truncated,
+		Aggregate:  d.Aggregate,
+		GroupCount: d.GroupCount,
+		Sampled:    d.Sampled,
+		Rule:       d.Rule,
+		Doc:        d.Doc,
+		Detail:     d.Detail,
+	}
+	if wb.h.rules != nil {
+		_, n.RuleIsGroup = wb.h.rules.Groups[groupKey{Head: d.Fact.Name, Arity: len(d.Fact.Terms)}]
+	}
+	for _, b := range d.Body {
+		n.Body = append(n.Body, wb.whyNode(b))
+	}
+	return n
+}
+
+// factDisplayLiteral renders a fact as display text — name(term, ...), each
+// term via its own Constant.String(). Unlike factLiteral it never fails:
+// this is a label for the why? tree, not text that must round-trip through
+// the parser, so composites and loader IDs render however String() shows
+// them.
+func factDisplayLiteral(f datalog.Fact) string {
+	var buf strings.Builder
+	buf.WriteString(f.Name)
+	buf.WriteByte('(')
+	for i, c := range f.Terms {
+		if i > 0 {
+			buf.WriteString(", ")
+		}
+		buf.WriteString(c.String())
+	}
+	buf.WriteByte(')')
+	return buf.String()
 }
 
 // publishWhyError renders a why? failure into the Facts tab's #why-output
