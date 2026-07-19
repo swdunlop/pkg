@@ -2,12 +2,16 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"path"
 	"strconv"
+	"strings"
 
+	html "github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/datastar"
+	"github.com/swdunlop/html-go/tag"
 	"swdunlop.dev/pkg/datalog/cmd/datalog/view"
 )
 
@@ -36,13 +40,16 @@ func (wb *workbench) handleDataList(w http.ResponseWriter, r *http.Request) {
 
 	_ = stream.Emit(datastar.Elements(view.DataFileList(files)))
 	if len(files) > 0 {
-		wb.emitDataFile(stream, files[0], 0)
+		wb.emitDataFile(stream, files[0], 0, "")
 	}
 }
 
 // handleDataFile is the Data Browser's paginated-row handler
-// (GET /data/{file}?offset=N). offset=0 (or absent) replaces the row list;
-// offset>0 appends the next chunk via datastar.Mode("append").
+// (GET /data/{file}?offset=N&filter=S). offset=0 (or absent) replaces the
+// row list; offset>0 appends the next chunk via datastar.Mode("append").
+// filter is a case-insensitive substring filter over raw lines (design
+// decision 9); offset counts MATCHING rows, so a Load More under a filter
+// pages through the filtered view, not the whole file.
 func (wb *workbench) handleDataFile(w http.ResponseWriter, r *http.Request) {
 	stream, err := datastar.RequestStream(w, r)
 	if err != nil {
@@ -50,6 +57,7 @@ func (wb *workbench) handleDataFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	file := r.PathValue("file")
+	filter := r.URL.Query().Get("filter")
 	offset := 0
 	if raw := r.URL.Query().Get("offset"); raw != "" {
 		n, convErr := strconv.Atoi(raw)
@@ -62,7 +70,7 @@ func (wb *workbench) handleDataFile(w http.ResponseWriter, r *http.Request) {
 		offset = n
 	}
 
-	wb.emitDataFile(stream, file, offset)
+	wb.emitDataFile(stream, file, offset, filter)
 }
 
 // emitDataFile reads file's row chunk at offset (dataPageSize rows) and
@@ -72,14 +80,14 @@ func (wb *workbench) handleDataFile(w http.ResponseWriter, r *http.Request) {
 // through wb.h.confine before ever reaching wb.h.fsys, since it must never
 // escape the data root. Shared by handleDataFile (explicit file switches)
 // and handleDataList (auto-loading the first file).
-func (wb *workbench) emitDataFile(stream datastar.Stream, file string, offset int) {
+func (wb *workbench) emitDataFile(stream datastar.Stream, file string, offset int, filter string) {
 	ref, err := wb.h.confine(file)
 	if err != nil {
 		_ = stream.Emit(datastar.Elements(view.DataErrors([]string{err.Error()})))
 		return
 	}
 
-	rows, hasMore, err := readDataChunk(wb, ref, offset, dataPageSize)
+	rows, hasMore, err := readDataChunk(wb, ref, offset, dataPageSize, filter)
 	if err != nil {
 		_ = stream.Emit(datastar.Elements(view.DataErrors([]string{err.Error()})))
 		return
@@ -94,7 +102,7 @@ func (wb *workbench) emitDataFile(stream datastar.Stream, file string, offset in
 		// later appends can never bury it mid-list.
 		_ = stream.Emit(
 			datastar.Elements(view.DataTableBody(file, rows, selFile, selRow, selValid), datastar.Selector("#data-table-body")),
-			datastar.Elements(view.DataLoadMore(file, nextOffset, hasMore)),
+			datastar.Elements(view.DataLoadMore(file, nextOffset, hasMore, filter)),
 		)
 		return
 	}
@@ -107,15 +115,20 @@ func (wb *workbench) emitDataFile(stream datastar.Stream, file string, offset in
 	// new one (mirrors fact_browser.go's handleFacts).
 	_ = stream.Emit(
 		datastar.Elements(view.DataRows(file, rows, selFile, selRow, selValid), datastar.Selector("#data-table-body"), datastar.Mode("append")),
-		datastar.Elements(view.DataLoadMore(file, nextOffset, hasMore)),
+		datastar.Elements(view.DataLoadMore(file, nextOffset, hasMore, filter)),
 	)
 }
 
 // readDataChunk opens ref (already confined) through wb.h.fsys and returns
-// up to limit records starting at the 0-based line offset, plus whether
-// more rows remain beyond the returned chunk. Blank lines are skipped and
-// do not count as rows, matching jsonfacts' own loader behavior.
-func readDataChunk(wb *workbench, ref string, offset, limit int) ([]view.DataRowInfo, bool, error) {
+// up to limit records starting at the 0-based offset, plus whether more
+// rows remain beyond the returned chunk. Blank lines are skipped and do not
+// count as rows, matching jsonfacts' own loader behavior. filter, when
+// non-empty, keeps only lines containing it (case-insensitive substring
+// over the raw line); offset then counts MATCHING rows so pagination pages
+// through the filtered view, while each row's Index stays its original
+// position in the file — the index is the selection key /data/select
+// resolves, so it must never renumber under a filter.
+func readDataChunk(wb *workbench, ref string, offset, limit int, filter string) ([]view.DataRowInfo, bool, error) {
 	f, err := wb.h.fsys.Open(path.Clean(ref))
 	if err != nil {
 		return nil, false, fmt.Errorf("opening %s: %w", ref, err)
@@ -125,7 +138,9 @@ func readDataChunk(wb *workbench, ref string, offset, limit int) ([]view.DataRow
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
 
+	needle := strings.ToLower(filter)
 	lineNum := 0
+	matched := 0
 	var rows []view.DataRowInfo
 	hasMore := false
 	for scanner.Scan() {
@@ -133,15 +148,20 @@ func readDataChunk(wb *workbench, ref string, offset, limit int) ([]view.DataRow
 		if len(line) == 0 {
 			continue
 		}
-		if lineNum >= offset {
+		idx := lineNum
+		lineNum++
+		if needle != "" && !strings.Contains(strings.ToLower(string(line)), needle) {
+			continue
+		}
+		if matched >= offset {
 			if len(rows) < limit {
-				rows = append(rows, view.DataRowInfo{Index: lineNum, Raw: string(line)})
+				rows = append(rows, view.DataRowInfo{Index: idx, Raw: string(line)})
 			} else {
 				hasMore = true
 				break
 			}
 		}
-		lineNum++
+		matched++
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, false, fmt.Errorf("reading %s: %w", ref, err)
@@ -153,8 +173,11 @@ func readDataChunk(wb *workbench, ref string, offset, limit int) ([]view.DataRow
 // the Data tab's current selection — the `!` composer command's evaluation
 // target (doc/features/workbench-v2.md design decision 8; the v1 Test
 // button this selection used to drive died with the jsonfacts editor) —
-// and patches the newly and previously selected #data-row-N elements to
-// move the highlight.
+// patches the newly and previously selected #data-row-N elements to move
+// the highlight, and loads the detail pane with the record pretty-printed
+// (design decision 9's master-detail: collapsible nesting via
+// view.JSONTree; a line that fails to parse as JSON falls back to raw
+// text, since the browser must show what is actually in the file).
 func (wb *workbench) handleDataSelect(w http.ResponseWriter, r *http.Request) {
 	stream, err := datastar.RequestStream(w, r)
 	if err != nil {
@@ -200,6 +223,21 @@ func (wb *workbench) handleDataSelect(w http.ResponseWriter, r *http.Request) {
 	if prevValid && prevFile == file && prevRow != row {
 		_ = stream.Emit(datastar.Elements(view.DataRow(prevFile, prevRow, prevRecord, false)))
 	}
+	_ = stream.Emit(datastar.Elements(view.DataDetail(file, row, renderRecordDetail(raw))))
+}
+
+// renderRecordDetail builds the detail pane's body for one raw JSONL line:
+// the parsed record as a collapsible tree, or the raw text when the line
+// isn't valid JSON. Decoding with UseNumber keeps large integers'
+// exact source digits instead of float64-rounding them on display.
+func renderRecordDetail(raw string) html.Content {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return tag.New("pre.doc", html.Text(raw))
+	}
+	return view.JSONTree(v)
 }
 
 // readDataLine opens ref (already confined) and returns the row-th

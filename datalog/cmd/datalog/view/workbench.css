@@ -312,12 +312,87 @@ section.pane td {
   overflow-wrap: anywhere;
 }
 
+/* Data tab master-detail (workbench-v2 design decision 9): file picker and
+ * substring filter up top, record list and detail pane side by side, each
+ * scrolling on its own inside the pane. The pane itself must stop
+ * scrolling for the nested regions to work. */
+#pane-data-browser {
+  overflow-y: hidden;
+}
+.data-controls {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.data-controls #data-filter {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-7);
+}
+.data-columns {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--space-3);
+}
+.data-columns > .data-list,
+.data-columns > #data-detail {
+  min-height: 0;
+  overflow-y: auto;
+}
+#data-detail {
+  border-inline-start: 1px solid var(--border);
+  padding-inline-start: var(--space-3);
+  font-size: var(--text-7);
+}
+#data-detail .detail-heading {
+  margin: 0 0 var(--space-2);
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+}
+
+/* The record detail's collapsible JSON tree. */
+.json-tree {
+  font-family: var(--font-mono);
+}
+.json-children {
+  margin-inline-start: var(--space-4);
+}
+details.json-node > summary {
+  cursor: pointer;
+  padding: 0;
+}
+.json-key {
+  color: var(--primary);
+}
+.json-key::after {
+  content: ':';
+  color: var(--muted-foreground);
+}
+.json-size {
+  color: var(--muted-foreground);
+}
+.json-leaf {
+  overflow-wrap: anywhere;
+}
+.json-value {
+  white-space: pre-wrap;
+}
+
 /* Data Browser rows: a plain list, not a table (single column of raw-line
- * previews). Rows are clickable (selects the row as the jsonfacts Editor's
- * test target); the Load More row keeps the default cursor since it isn't. */
+ * previews). Rows are clickable (selects the row as the `!` command's
+ * eval target and loads the detail pane). */
 #data-table-body {
   font-size: var(--text-7);
   margin-block: var(--space-3);
+}
+#data-table-body .line-no {
+  color: var(--muted-foreground);
+  margin-inline-end: var(--space-2);
+  user-select: none;
 }
 #data-table-body li {
   overflow-wrap: anywhere;
@@ -335,6 +410,140 @@ section.pane td {
 #data-table-body li.selected {
   background: var(--accent);
 }
+
+/* Schema tab (workbench-v2 design decision 9): structural sources/
+ * matchers/declarations. */
+#schema-panel {
+  font-size: var(--text-7);
+}
+.schema-section > h3 {
+  margin: var(--space-3) 0 var(--space-2);
+  font-size: var(--text-6);
+  color: var(--muted-foreground);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.schema-item {
+  border-bottom: 1px solid var(--border);
+  padding-block: var(--space-2);
+}
+.schema-item:last-child {
+  border-bottom: none;
+}
+.schema-item-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.schema-item-head .badge {
+  font-size: var(--text-8, 0.7rem);
+  color: var(--muted-foreground);
+  background: var(--faint);
+  border-radius: var(--radius-full);
+  padding: 0 var(--space-2);
+}
+ul.schema-mappings {
+  list-style: none;
+  margin: var(--space-1) 0 0;
+  padding: 0;
+}
+li.schema-mapping {
+  padding: var(--space-1) 0 var(--space-1) var(--space-3);
+  overflow-wrap: anywhere;
+}
+.schema-arrow,
+.schema-filter-label {
+  color: var(--muted-foreground);
+}
+.schema-patterns {
+  padding: var(--space-1) 0 0 var(--space-3);
+  overflow-wrap: anywhere;
+}
+code.schema-pattern {
+  background: var(--faint);
+  border-radius: var(--radius-small);
+  padding: 0 var(--space-1);
+}
+a.pred-link {
+  color: var(--primary);
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: rgb(from var(--primary) r g b / 0.4);
+}
+
+/* Rules tab: group list left, group detail right — same nested-scroll
+ * shape as the Data tab's master-detail. */
+#rules-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  font-size: var(--text-7);
+}
+.rules-columns {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+  gap: var(--space-3);
+}
+.rules-columns > #rule-groups,
+.rules-columns > #rule-group-detail {
+  min-height: 0;
+  overflow-y: auto;
+}
+#rule-group-detail {
+  border-inline-start: 1px solid var(--border);
+  padding-inline-start: var(--space-3);
+}
+.rule-group-file code {
+  color: var(--muted-foreground);
+  font-size: var(--text-8, 0.7rem);
+}
+.rule-detail-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.rule-detail-head h3 {
+  margin: 0;
+  font-size: var(--text-5);
+}
+.rule-detail-head .count,
+code.rule-detail-file {
+  color: var(--muted-foreground);
+}
+.rule-statement {
+  margin-block: var(--space-3);
+}
+p.rule-doc {
+  margin: 0 0 var(--space-1);
+  color: var(--muted-foreground);
+}
+pre.rule-text {
+  margin: 0;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-medium);
+  overflow-x: auto;
+  white-space: pre-wrap;
+}
+.rule-deps {
+  margin-block: var(--space-2);
+}
+.rule-deps-label {
+  color: var(--muted-foreground);
+}
+/* Datalog syntax highlighting (view.HighlightDatalog). */
+.dl-comment { color: var(--muted-foreground); font-style: italic; }
+.dl-str { color: light-dark(#3c7a48, #a3be8c); }   /* nord14-ish */
+.dl-num { color: light-dark(#8a5a00, #ebcb8b); }   /* nord13-ish */
+.dl-var { color: light-dark(#2e6ca3, #88c0d0); }   /* accent */
+.dl-pred { color: light-dark(#5e51a0, #b48ead); font-weight: 600; } /* nord15-ish */
+.dl-kw { color: var(--danger); }
+.dl-op { color: var(--muted-foreground); }
 
 /* Disclosure bodies inside panes. */
 section.pane details pre {

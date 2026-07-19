@@ -57,8 +57,7 @@ func (wb *workbench) handleConversationPage(w http.ResponseWriter, r *http.Reque
 // empty state (no conversation selected).
 func (wb *workbench) renderConversationPage(w http.ResponseWriter, active *conversationInfo) {
 	wb.h.mu.Lock()
-	schemaText := wb.h.sess.schemaText
-	rulesText := wb.h.sess.rulesText
+	schemaPanel, rulesPanel := wb.renderBrowserPanels()
 	wb.h.mu.Unlock()
 
 	var transcript, composer html.Content
@@ -73,7 +72,7 @@ func (wb *workbench) renderConversationPage(w http.ResponseWriter, active *conve
 	page := view.Page{
 		Title: "Datalog Workbench",
 		Left:  view.ConversationPane(wb.renderRail(active), transcript, composer),
-		Right: view.Browser(schemaText, rulesText),
+		Right: view.Browser(schemaPanel, rulesPanel),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	buf := html.Append(nil, page)

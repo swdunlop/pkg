@@ -184,3 +184,120 @@ declarations:
 		t.Fatalf("subdirectory file selection produced an error fragment:\n%s", joined)
 	}
 }
+
+// -- phase 3: master-detail + filter (workbench-v2 design decision 9) -------
+
+// TestHTTP_DataBrowserFilter pins the substring filter's contract: only
+// matching rows return, row Index stays the ORIGINAL file position (it is
+// the /data/select key), pagination offsets count matching rows, and the
+// Load More control re-submits the same filter so the next chunk pages the
+// filtered view rather than the whole file.
+func TestHTTP_DataBrowserFilter(t *testing.T) {
+	dir := t.TempDir()
+	// 120 rows; "cmd1" matches cmd1, cmd1x, cmd10x, cmd11x — i.e. rows 1 and
+	// 10..19 and 100..119: 31 matches total, so one filtered page of 50
+	// covers them all, while an unfiltered page would not reach row 100.
+	writeSyntheticData(t, dir, 120)
+	wb := newTestWorkbench(t, dir, "", nil, "test-token")
+	srv := startTestServer(wb)
+	defer srv.Close()
+	applyTestSchema(t, wb, syntheticSchemaYAML)
+
+	resp, err := http.Get(srv.URL + "/data/events.jsonl?filter=" + url.QueryEscape("CMD11"))
+	if err != nil {
+		t.Fatalf("GET /data with filter: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	joined := string(body)
+
+	// Case-insensitive: CMD11 matches cmd11, cmd110..cmd119 — 11 rows.
+	if got := strings.Count(joined, "<li"); got != 11 {
+		t.Fatalf("filter=CMD11 should match 11 rows, got %d:\n%s", got, joined)
+	}
+	// Original file positions survive filtering — row 110 keeps id 110.
+	if !strings.Contains(joined, "id='data-row-110'") {
+		t.Fatalf("filtered rows must keep their original file index as the row id:\n%s", joined)
+	}
+	if strings.Contains(joined, "id='data-row-0'") {
+		t.Fatalf("non-matching row 0 leaked through filter:\n%s", joined)
+	}
+}
+
+// TestHTTP_DataBrowserFilterPagination drives a filter with more matches
+// than one page and confirms the Load More control carries the filter and
+// the next offset addresses matching rows.
+func TestHTTP_DataBrowserFilterPagination(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 200) // "cmd1" matches 1, 10-19, 100-199: 112 rows
+	wb := newTestWorkbench(t, dir, "", nil, "test-token")
+	srv := startTestServer(wb)
+	defer srv.Close()
+	applyTestSchema(t, wb, syntheticSchemaYAML)
+
+	resp, err := http.Get(srv.URL + "/data/events.jsonl?filter=cmd1")
+	if err != nil {
+		t.Fatalf("GET /data with filter: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	joined := string(body)
+	if !strings.Contains(joined, "offset=50&amp;filter=cmd1") {
+		t.Fatalf("Load More under a filter must carry offset-over-matches AND the filter itself:\n%s", joined)
+	}
+
+	// Second page: offset counts MATCHES (50 matched rows deep), so the
+	// page must start mid-hundreds, not at file row 50.
+	resp2, err := http.Get(srv.URL + "/data/events.jsonl?offset=50&filter=cmd1")
+	if err != nil {
+		t.Fatalf("GET page 2: %v", err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	joined2 := string(body2)
+	// Matches in file order: 1, 10..19, 100..199. The 51st match (offset 50)
+	// is file row 139.
+	if !strings.Contains(joined2, "id='data-row-139'") {
+		t.Fatalf("offset=50 under filter must resume at the 51st MATCH (file row 139):\n%s", joined2)
+	}
+}
+
+// TestHTTP_DataSelectLoadsDetailPane pins the master-detail contract:
+// selecting a record patches #data-detail with the parsed record as a
+// collapsible JSON tree (keys visible, nesting via <details>).
+func TestHTTP_DataSelectLoadsDetailPane(t *testing.T) {
+	dir := t.TempDir()
+	mustWriteFile(t, filepath.Join(dir, "events.jsonl"),
+		`{"host": "h0", "pid": 12345678901234567890, "nest": {"a": [1, 2]}}`+"\n")
+	wb := newTestWorkbench(t, dir, "", nil, "test-token")
+	srv := startTestServer(wb)
+	defer srv.Close()
+	applyTestSchema(t, wb, syntheticSchemaYAML)
+
+	resp, err := http.Get(srv.URL + "/data/select/events.jsonl/0")
+	if err != nil {
+		t.Fatalf("GET /data/select: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	joined := string(body)
+
+	if !strings.Contains(joined, "id='data-detail'") {
+		t.Fatalf("select must patch the #data-detail pane:\n%s", joined)
+	}
+	if !strings.Contains(joined, "json-tree") || !strings.Contains(joined, ">host<") {
+		t.Fatalf("detail pane must render the record as a JSON tree with keys:\n%s", joined)
+	}
+	if !strings.Contains(joined, "nest") || !strings.Contains(joined, "[0]") {
+		t.Fatalf("nested objects/arrays must render structurally:\n%s", joined)
+	}
+	// UseNumber: a 20-digit integer must keep its exact source digits, not
+	// float64-round on display.
+	if !strings.Contains(joined, "12345678901234567890") {
+		t.Fatalf("large integers must render with exact source digits:\n%s", joined)
+	}
+	// Selection state moved too — the `!` command's eval target.
+	if _, _, valid := wb.currentSelection(); !valid {
+		t.Fatal("selection must be recorded for the ! command's eval target")
+	}
+}

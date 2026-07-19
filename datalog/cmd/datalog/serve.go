@@ -484,6 +484,9 @@ func (wb *workbench) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /data/{file}", wb.handleDataFile)
 	mux.HandleFunc("GET /data/select/{file}/{row}", wb.handleDataSelect)
 
+	// Browser: Rules tab group detail (browser_panels.go).
+	mux.HandleFunc("GET /rules/{head}/{arity}", wb.handleRuleGroup)
+
 	// Browser: Facts tab (fact_browser.go), including the why? affordance
 	// (doc/features/provenance.md), which renders into the tab's
 	// #why-output surface.

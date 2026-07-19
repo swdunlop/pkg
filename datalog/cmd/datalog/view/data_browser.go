@@ -1,37 +1,130 @@
 package view
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
+	"sort"
 
 	html "github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/tag"
 )
 
-// DataBrowser renders the Data Browser pane shell (doc/features/web-ui.md):
-// a file list and a paginated raw-record list. Records are just a single
-// column of raw-line previews (plus a click target), so a plain list
-// carries this better than a <table> — there's no second column to align.
+// DataBrowser renders the Data tab's master-detail shell (doc/features/
+// workbench-v2.md design decision 9): a file picker and substring filter up
+// top, then two columns — a compact record list (line number + truncated
+// preview) on the left, and the selected record pretty-printed with
+// collapsible nesting on the right. Selection doubles as the `!` composer
+// command's evaluation target.
 //
 //   - #data-files      — file list, patched by GET /data
 //   - #data-table-body — paginated row list, patched (append mode) by
-//     GET /data/{file}?offset=N
+//     GET /data/{file}?offset=N&filter=...
+//   - #data-detail     — detail pane, patched by GET /data/select/{file}/{row}
 //   - #data-error      — in-pane error surface
+//
+// $_dataFilter is chrome state (underscore-prefixed, doc/notes/datastar.md's
+// convention) — the server reads it from the URL the client builds, never
+// from a signal payload. The input writes the signal itself in its own
+// handler rather than via data-bind, so the underscore name never has to
+// round-trip datastar's attribute-name casing rules.
 func DataBrowser() html.Content {
-	return PaneSection.Set("id", "pane-data-browser").Add(
-		PaneHeading.Add(html.Text("Data Browser")),
-		ErrorList.Set("id", "data-error"),
-		// data-init fetches the configured file list as soon as the pane
-		// mounts — without it the pane renders empty until something else
-		// happens to request /data, which nothing does.
-		tag.New("div#data-files").Set("data-init", "@get('/data')"),
-		tag.New("ul.unstyled#data-table-body"),
-		// The Load More control is a SIBLING of the row list, never a child:
-		// the list is an append target, so anything rendered inside it gets
-		// buried under appended pages (the stranded-mid-list bug). Mirrors
-		// fact_browser.go's tbody/LoadMoreControl split.
-		tag.New("div").Set("id", dataLoadMoreID),
+	filterAction := "@get('/data/' + encodeURIComponent($dataFile) + '?filter=' + encodeURIComponent($_dataFilter))"
+	return PaneSection.Set("id", "pane-data-browser").
+		Set("data-signals", `{_dataFilter: ''}`).
+		Add(
+			PaneHeading.Add(html.Text("Data Browser")),
+			ErrorList.Set("id", "data-error"),
+			tag.New("div.data-controls").Add(
+				// data-init fetches the configured file list as soon as the
+				// pane mounts — without it the pane renders empty until
+				// something else happens to request /data, which nothing does.
+				tag.New("div#data-files").Set("data-init", "@get('/data')"),
+				tag.New("input#data-filter").
+					Set("type", "search").
+					Set("placeholder", "filter records…").
+					Set("data-on:input__debounce.300ms", "$_dataFilter = evt.target.value; "+filterAction),
+			),
+			tag.New("div.data-columns").Add(
+				tag.New("div.data-list").Add(
+					tag.New("ul.unstyled#data-table-body"),
+					// The Load More control is a SIBLING of the row list, never a
+					// child: the list is an append target, so anything rendered
+					// inside it gets buried under appended pages (the
+					// stranded-mid-list bug). Mirrors fact_browser.go's
+					// tbody/LoadMoreControl split.
+					tag.New("div").Set("id", dataLoadMoreID),
+				),
+				DataDetail("", 0, DataDetailEmpty()),
+			),
+		)
+}
+
+// DataDetailEmpty is the detail pane's unselected placeholder.
+func DataDetailEmpty() html.Content {
+	return tag.New("p.text-light", html.Text("select a record to inspect it"))
+}
+
+// DataDetail renders the #data-detail fragment: the selected record's
+// source position and its pretty-printed body (JSONTree on parse success, a
+// raw <pre> fallback otherwise — package main decides which). An empty file
+// renders the placeholder shell DataBrowser mounts.
+func DataDetail(file string, row int, body html.Content) html.Content {
+	div := tag.New("div#data-detail")
+	if file == "" {
+		return div.Add(body)
+	}
+	return div.Add(
+		tag.New("p.detail-heading", html.Text(fmt.Sprintf("%s · record %d", file, row))),
+		body,
 	)
+}
+
+// JSONTree renders a decoded JSON value with collapsible nesting: objects
+// and arrays become open <details> nodes (summary = key + size), scalars
+// become key/value leaf lines. Values render via json.Marshal so strings
+// stay quoted and json.Number (the caller should decode with UseNumber)
+// keeps its exact source digits.
+func JSONTree(v any) html.Content {
+	return tag.New("div.json-tree").Add(jsonNode("", v))
+}
+
+func jsonNode(key string, v any) html.Content {
+	label := html.Group{}
+	if key != "" {
+		label = html.Group{tag.New("span.json-key", html.Text(key)), html.Text(" ")}
+	}
+	switch val := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		children := make([]html.Content, len(keys))
+		for i, k := range keys {
+			children[i] = jsonNode(k, val[k])
+		}
+		return tag.New("details.json-node").Set("open", "").Add(
+			tag.New("summary").Add(label, tag.New("span.json-size", html.Text(fmt.Sprintf("{%d}", len(val))))),
+			tag.New("div.json-children").Add(children...),
+		)
+	case []any:
+		children := make([]html.Content, len(val))
+		for i, item := range val {
+			children[i] = jsonNode(fmt.Sprintf("[%d]", i), item)
+		}
+		return tag.New("details.json-node").Set("open", "").Add(
+			tag.New("summary").Add(label, tag.New("span.json-size", html.Text(fmt.Sprintf("[%d]", len(val))))),
+			tag.New("div.json-children").Add(children...),
+		)
+	default:
+		text, err := json.Marshal(v)
+		if err != nil {
+			text = []byte(fmt.Sprint(v))
+		}
+		return tag.New("div.json-leaf").Add(label, tag.New("span.json-value", html.Text(string(text))))
+	}
 }
 
 // DataFileList renders the #data-files fragment: a <select> with one
@@ -54,11 +147,14 @@ func DataBrowser() html.Content {
 // r.PathValue("file") returns the decoded "logs/events.jsonl" — a "/"
 // escapes to "%2F" the same way url.PathEscape and encodeURIComponent both
 // treat it, so this reaches the handler intact.
+// The change handler carries the current substring filter along
+// ($_dataFilter, DataBrowser's chrome signal) so switching files keeps the
+// filter applied, matching what the filter input itself would fetch.
 func DataFileList(files []string) html.Content {
 	return tag.New("div#data-files").Add(
 		tag.New("select").
 			Set("data-bind:data-file").
-			Set("data-on:change", "@get('/data/' + encodeURIComponent($dataFile))").
+			Set("data-on:change", "@get('/data/' + encodeURIComponent($dataFile) + '?filter=' + encodeURIComponent($_dataFilter))").
 			Add(
 				html.Map(files, func(f string) html.Content {
 					return tag.New("option").Set("value", f).Add(html.Text(f))
@@ -84,20 +180,28 @@ type DataRowInfo struct {
 	Raw   string
 }
 
-// DataRow renders one <li> for a raw JSONL record: a preview of the raw
-// line. Clicking the row selects it as the jsonfacts editor's evaluation
-// target — the row index is only a lookup key (into the source file, and
-// into wb.selRow), not something worth displaying. The row carries a
-// stable #data-row-N id so handleJSONFactsTest can patch it (and any
-// previously-selected row) in place; selected marks it as the jsonfacts
-// editor's current evaluation target (doc/features/web-ui.md: the Data
-// Browser highlights the tested row instead of the jsonfacts Editor
-// duplicating it).
+// dataPreviewLen is how many characters of the raw line show in the record
+// list (design decision 9: "a compact record list (line number + first ~100
+// chars)"); the full record lives in the detail pane.
+const dataPreviewLen = 100
+
+// DataRow renders one <li> for a raw JSONL record: the line number and a
+// truncated preview of the raw line. Clicking the row selects it — loading
+// the detail pane and marking it as the `!` composer command's evaluation
+// target. The row carries a stable #data-row-N id so handleDataSelect can
+// patch it (and any previously-selected row) in place.
 func DataRow(file string, row int, raw string, selected bool) html.Content {
+	preview := raw
+	if runes := []rune(preview); len(runes) > dataPreviewLen {
+		preview = string(runes[:dataPreviewLen]) + "…"
+	}
 	li := tag.New("li").
 		Set("id", fmt.Sprintf("data-row-%d", row)).
 		Set("data-on:click", fmt.Sprintf("@get('/data/select/%s/%d')", pathEscape(file), row)).
-		Add(html.Text(raw))
+		Add(
+			tag.New("span.line-no", html.Text(fmt.Sprintf("%d", row))),
+			html.Text(preview),
+		)
 	if selected {
 		li = li.Class("selected")
 	}
@@ -114,15 +218,18 @@ const dataLoadMoreID = "data-load-more"
 // empty (id-carrying) placeholder once hasMore is false — kept non-nil and
 // id-bearing so a later patch targeting dataLoadMoreID always has an element
 // to morph, even after exhaustion (mirrors fact_browser.go's
-// loadMoreControl).
-func DataLoadMore(file string, nextOffset int, hasMore bool) html.Content {
+// loadMoreControl). filter is the substring filter this page was fetched
+// under: the next chunk's offset counts MATCHING rows, so the control must
+// re-submit the same filter or the offset would address the wrong rows.
+func DataLoadMore(file string, nextOffset int, hasMore bool, filter string) html.Content {
 	div := tag.New("div").Set("id", dataLoadMoreID)
 	if !hasMore {
 		return div
 	}
 	return div.Add(
 		ActionButton.
-			Set("data-on:click", fmt.Sprintf("@get('/data/%s?offset=%d')", pathEscape(file), nextOffset)).
+			Set("data-on:click", fmt.Sprintf("@get('/data/%s?offset=%d&filter=%s')",
+				pathEscape(file), nextOffset, url.QueryEscape(filter))).
 			Add(html.Text("Load More")),
 	)
 }

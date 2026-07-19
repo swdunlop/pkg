@@ -327,22 +327,26 @@ func compositeDetail(c *datalog.Composite) html.Content {
 	return view.CompositeDetail(summary, string(full))
 }
 
-// publishSessionChanged is the one call every mutating handler (Apply, Run,
-// and — once mounted — agent set_schema/put_rule_group/delete_rule_group
-// over /mcp) makes after a Transform completes: it re-renders both Fact
-// Browser fragments
-// (#predicates-base and #predicates-derived) from current session state and
-// fans them out as one Batch over the bus, so every open tab's subscription
-// connection repaints whichever of the two panes it has on screen (design
-// constraint 3's SSE patch-back; page.go's body-level subscription div is
-// page-scoped, so a page with both panes — the Rules view — gets both
-// updates over its one connection). The fragments are rendered once here,
-// at publish time, and the same bytes go to every subscriber
-// (doc/notes/datastar.md §8's pre-rendered fan-out). Callers must hold
-// wb.h.mu, since rendering reads session state.
+// publishSessionChanged is the one call every mutating path (agent CRUD
+// over /mcp or a conversation's tool surface, and the fsnotify reload)
+// makes after session state changes: it re-renders every session-derived
+// browser fragment — the two Fact Browser predicate lists AND the Schema
+// and Rules tab panels (phase 3's structural renderings, which would
+// otherwise go stale the moment an agent edit or vim save landed) — and
+// fans them out as one Batch over the bus, so every open page's
+// subscription connection repaints whichever fragments it has on screen.
+// The fragments are rendered once here, at publish time, and the same
+// bytes go to every subscriber (doc/notes/datastar.md §8's pre-rendered
+// fan-out). Callers must hold wb.h.mu, since rendering reads session state.
 func (wb *workbench) publishSessionChanged() {
 	base, derived := renderPredicates(wb.h.sess)
-	wb.bus.Publish(datastar.Batch(datastar.Elements(base), datastar.Elements(derived)))
+	schema, rules := wb.renderBrowserPanels()
+	wb.bus.Publish(datastar.Batch(
+		datastar.Elements(base),
+		datastar.Elements(derived),
+		datastar.Elements(schema),
+		datastar.Elements(rules),
+	))
 }
 
 // renderPredicates builds the #predicates-base and #predicates-derived
