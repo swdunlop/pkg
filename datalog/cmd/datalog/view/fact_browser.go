@@ -205,13 +205,12 @@ func WhyButton(name string, arity int, factLiteral string) html.Content {
 	// pins it. name needs no escaping: why? buttons render only for
 	// derived predicates, whose names lexed as identifiers ([a-zA-Z0-9_]).
 	href := fmt.Sprintf("/why/%s/%d?fact=%s", name, arity, url.QueryEscape(factLiteral))
-	// Reveal the Query tab before posting: the result lands in the console
-	// scrollback, and this is the one console-writing affordance that lives
-	// outside the drawer — without this, a click with the drawer collapsed
-	// appears to do nothing. Same client-local signal flip as consoleBar's
-	// tab buttons; chrome state stays out of the POST payload.
+	// The result lands in the Facts tab's own #why-output surface
+	// (browser.go's WhyOutput), which sits directly above the predicate
+	// lists this button renders under — no tab flip needed; the why?
+	// button only exists inside the Facts tab.
 	return tag.New("button.action.why").
-		Set("data-on:click", "$_consoleTab = 'query'; $_consoleOpen = true; @post('"+href+"')").
+		Set("data-on:click", "@post('"+href+"')").
 		Add(html.Text("why?"))
 }
 

@@ -134,15 +134,12 @@ type conversationManager struct {
 	dir string
 }
 
-// newConversationManager returns a manager rooted at dir, creating dir (and
-// any missing parents) if it does not exist yet — a fresh project has no
-// .datalog/sessions until the first conversation, and every method below
-// (List included) must work against that empty state without a separate
-// "initialize the project" step.
+// newConversationManager returns a manager rooted at dir. The directory is
+// NOT created here — Create makes it on the first conversation instead — so
+// a workbench that never starts a conversation (tests over the checked-in
+// examples included) leaves no .datalog droppings in the project; List
+// already treats a missing directory as an empty listing.
 func newConversationManager(dir string) (*conversationManager, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("creating conversation directory %s: %w", dir, err)
-	}
 	return &conversationManager{dir: dir}, nil
 }
 
@@ -204,6 +201,11 @@ func seedSessionFile(path, id, dir string) error {
 func (cm *conversationManager) Create(mode conversationMode) (*conversationInfo, error) {
 	if !validConversationMode(mode) {
 		return nil, fmt.Errorf("invalid conversation mode %q", mode)
+	}
+	// The sessions directory appears on first use (see newConversationManager:
+	// a workbench that never converses must leave no .datalog droppings).
+	if err := os.MkdirAll(cm.dir, 0o755); err != nil {
+		return nil, fmt.Errorf("creating conversation directory %s: %w", cm.dir, err)
 	}
 	id := newSessionID()
 	path := cm.sessionPath(id)
@@ -631,4 +633,12 @@ func (g *conversationTurnGate) Running() (name string, running bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.ownerName, g.owner != ""
+}
+
+// RunningID reports the conversation ID currently holding the gate — the
+// delete handler's "is the running turn THIS conversation's" check.
+func (g *conversationTurnGate) RunningID() (id string, running bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.owner, g.owner != ""
 }

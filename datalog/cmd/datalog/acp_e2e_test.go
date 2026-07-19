@@ -25,7 +25,7 @@ package main
 //   - "exit3": exits the process with status 3 immediately after
 //     initialize, before ever answering session/new or session/prompt.
 //   - "readonly-perm": requests permission for a bare "query"-titled tool
-//     call and asserts the turn completes with NO /console/answer POST —
+//     call and asserts the turn completes with NO /answer POST —
 //     agent.go's auto-allow policy (readOnlyToolName) must answer it
 //     without the human, exercised end to end through runAgentTurn's real
 //     driver.Answer call rather than a fakeDriver stand-in.
@@ -316,7 +316,7 @@ func (a *fakeACPAgent) promptFullScript(ctx context.Context, params acp.PromptRe
 // runAgentTurn (not driver.Prompt directly, unlike promptFullScript's
 // TestACPDriver_FullTurnEndToEnd caller), this exercises agent.go's
 // auto-allow policy against a REAL RequestPermission RPC round-trip: no
-// /console/answer POST should ever be needed for the turn to complete.
+// /answer POST should ever be needed for the turn to complete.
 func (a *fakeACPAgent) promptReadOnlyPermScript(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
 	outcome, err := a.conn.RequestPermission(ctx, acp.RequestPermissionRequest{
 		SessionId: params.SessionId,
@@ -658,26 +658,44 @@ func TestACPDriver_FullTurnEndToEnd(t *testing.T) {
 	}
 }
 
+// startACPConversation points wb at a temp conversation store and creates
+// one query-mode conversation, returning its id — the phase-2 send
+// endpoint's analogue of the v1 agent tab these tests used to drive.
+func startACPConversation(t *testing.T, wb *workbench) string {
+	t.Helper()
+	cm, err := newConversationManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("newConversationManager: %v", err)
+	}
+	wb.conversations = cm
+	conv, err := cm.Create(conversationModeQuery)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	return conv.ID
+}
+
 // TestACPDriver_PermissionViaConsoleHTTP drives the same full-turn fake-agent
 // script through the WORKBENCH's own console handlers (handleConsolePrompt,
 // handleConsoleAnswer) rather than calling the driver directly — proving the
-// permission button's POST /console/answer?requestID=...&optionID=...
+// permission button's POST /answer?requestID=...&optionID=...
 // actually reaches a live ACP subprocess turn and morphs the transcript
 // entry to resolved, end to end.
 func TestACPDriver_PermissionViaConsoleHTTP(t *testing.T) {
 	wb, srv, cfg := newACPTestWorkbenchAndServer(t)
 	setFakeACPAgentScript(t, "full")
-	wb.agentCfg = cfg // handleConsolePrompt's wb.agentDriver() lazily builds from this
+	wb.agentCfg = cfg // conversationDriver lazily builds the ACP driver from this
 
-	resp := postSignals(t, srv, "/console/prompt", map[string]any{"consolePrompt": "check things"})
+	convID := startACPConversation(t, wb)
+	resp := postSignals(t, srv, "/c/"+convID+"/send", map[string]any{"prompt": "check things"})
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
 	// Wait for the permission entry (with its live buttons) to land in the
 	// agent tab's transcript.
-	waitFor(t, func() bool { return strings.Contains(renderLog(wb, "agent"), "permission-option") })
+	waitFor(t, func() bool { return strings.Contains(renderLog(wb, convID), "permission-option") })
 
-	log := renderLog(wb, "agent")
+	log := renderLog(wb, convID)
 	if !strings.Contains(log, "agent is waiting for permission") {
 		t.Fatalf("permission entry missing from transcript: %s", log)
 	}
@@ -694,7 +712,7 @@ func TestACPDriver_PermissionViaConsoleHTTP(t *testing.T) {
 		t.Fatalf("no pending permission tracked in wb.pendingPerm")
 	}
 
-	answerResp := postSignals(t, srv, "/console/answer?requestID="+reqID+"&optionID=allow_once", map[string]any{})
+	answerResp := postSignals(t, srv, "/answer?requestID="+reqID+"&optionID=allow_once", map[string]any{})
 	io.Copy(io.Discard, answerResp.Body)
 	answerResp.Body.Close()
 
@@ -705,9 +723,9 @@ func TestACPDriver_PermissionViaConsoleHTTP(t *testing.T) {
 	// the resolved permission morph, which handleConsoleAnswer renders
 	// first) ensures the turn has fully finished before the order assertion
 	// below inspects the last transcript entry.
-	waitFor(t, func() bool { return strings.Contains(renderLog(wb, "agent"), "permission answered: allow_once") })
+	waitFor(t, func() bool { return strings.Contains(renderLog(wb, convID), "permission answered: allow_once") })
 
-	log = renderLog(wb, "agent")
+	log = renderLog(wb, convID)
 	if strings.Contains(log, "permission-option") {
 		t.Fatalf("resolved permission entry still carries live buttons: %s", log)
 	}
@@ -737,10 +755,10 @@ func TestACPDriver_PermissionViaConsoleHTTP(t *testing.T) {
 	// "looking at the session"/" now" must have morphed together), the
 	// message entries are the first and last entries in the log, and a tool
 	// entry lands strictly between them.
-	// handleConsolePrompt appends a "user" entry for the prompt itself
+	// handleConversationSend appends a "user" entry for the prompt itself
 	// before the turn even starts, so the transcript's own message/tool
 	// ordering begins at kinds[1:].
-	kinds := entryKinds(t, wb, "agent")
+	kinds := entryKinds(t, wb, convID)
 	if len(kinds) < 1 || kinds[0] != "user" {
 		t.Fatalf("first transcript entry = %v, want the user's prompt (\"user\") leading the log: %v", kinds, kinds)
 	}
@@ -764,7 +782,7 @@ func TestACPDriver_PermissionViaConsoleHTTP(t *testing.T) {
 	if toolIdx <= 0 || toolIdx >= len(turnKinds)-1 {
 		t.Fatalf("tool entry not strictly between the opening and final message entries: kinds=%v", turnKinds)
 	}
-	entries := wb.console.Render("agent")
+	entries := wb.console.Render(convID)
 	opening := renderContent(entries[1]) // entries[0] is the "user" entry
 	if !strings.Contains(opening, "looking at the session now") {
 		t.Fatalf("opening message entry did not accumulate both streamed chunks into one entry: %s", opening)
@@ -784,22 +802,23 @@ func TestACPDriver_PermissionViaConsoleHTTP(t *testing.T) {
 // the permission request's title ("query") is one of the workbench's own
 // read-only tools, so agent.go's auto-allow policy must answer it via a
 // REAL driver.Answer call inside runAgentTurn's sink, with no
-// /console/answer POST ever issued and nothing left in wb.pendingPerm.
+// /answer POST ever issued and nothing left in wb.pendingPerm.
 func TestACPDriver_PermissionForReadOnlyToolAutoAllowed(t *testing.T) {
 	wb, srv, cfg := newACPTestWorkbenchAndServer(t)
 	setFakeACPAgentScript(t, "readonly-perm")
 	wb.agentCfg = cfg
 
-	resp := postSignals(t, srv, "/console/prompt", map[string]any{"consolePrompt": "check things"})
+	convID := startACPConversation(t, wb)
+	resp := postSignals(t, srv, "/c/"+convID+"/send", map[string]any{"prompt": "check things"})
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
-	// The turn completes on its own — no button click, no /console/answer
+	// The turn completes on its own — no button click, no /answer
 	// POST — because the auto-allow policy answers the request from inside
 	// the sink the instant it arrives.
-	waitFor(t, func() bool { return strings.Contains(renderLog(wb, "agent"), "permission answered: allow_once") })
+	waitFor(t, func() bool { return strings.Contains(renderLog(wb, convID), "permission answered: allow_once") })
 
-	log := renderLog(wb, "agent")
+	log := renderLog(wb, convID)
 	if !strings.Contains(log, "auto-allowed: query") {
 		t.Fatalf("expected an auto-allowed note in the transcript: %s", log)
 	}
@@ -835,13 +854,14 @@ func TestACPDriver_SparseTerminalToolCallUpdateKeepsName(t *testing.T) {
 	setFakeACPAgentScript(t, "sparse-terminal-update")
 	wb.agentCfg = cfg
 
-	resp := postSignals(t, srv, "/console/prompt", map[string]any{"consolePrompt": "check things"})
+	convID := startACPConversation(t, wb)
+	resp := postSignals(t, srv, "/c/"+convID+"/send", map[string]any{"prompt": "check things"})
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
-	waitFor(t, func() bool { return strings.Contains(renderLog(wb, "agent"), "done") })
+	waitFor(t, func() bool { return strings.Contains(renderLog(wb, convID), "done") })
 
-	log := renderLog(wb, "agent")
+	log := renderLog(wb, convID)
 	if !strings.Contains(log, "list_predicates") {
 		t.Fatalf("completed tool entry lost its name after a sparse terminal tool_call_update: %s", log)
 	}
@@ -912,7 +932,7 @@ func TestACPDriver_CancelMidTurn(t *testing.T) {
 	cancelledCtx, cancelNow := context.WithCancel(context.Background())
 	cancelNow()
 	fake := &fakeDriver{events: []agentEvent{{Kind: "message", Text: "x"}}}
-	wb.runAgentTurn(cancelledCtx, fake, "hi")
+	wb.runAgentTurn(cancelledCtx, fake, "hi", "agent")
 	if !strings.Contains(renderLog(wb, "agent"), "turn cancelled") {
 		t.Fatalf("runAgentTurn did not render a clean cancellation for ctx.Err(): %s", renderLog(wb, "agent"))
 	}

@@ -4,16 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
-	"iter"
-	"net/http"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	html "github.com/swdunlop/html-go"
-
-	"swdunlop.dev/pkg/datalog/seminaive"
 )
 
 // renderLog joins one tab's rendered scrollback into a string for
@@ -27,199 +22,6 @@ func renderLog(wb *workbench, tab string) string {
 }
 
 // -- console query tab -------------------------------------------------------
-
-// TestConsoleQueryStop exercises the query Stop path end to end: a query
-// parked mid-Transform on a blocking external is cancelled via POST /cancel
-// (what the Run button's Stop morph posts), and the scrollback reports
-// "query stopped" rather than the timeout wording.
-func TestConsoleQueryStop(t *testing.T) {
-	wb := newMordorWorkbench(t)
-	srv := startTestServer(wb)
-	defer srv.Close()
-
-	inTransform := make(chan struct{})
-	var once sync.Once
-	wb.h.mu.Lock()
-	wb.h.sess.engineOpts = append(wb.h.sess.engineOpts,
-		seminaive.WithExternal("slow", 1, func(ctx context.Context, _ seminaive.Bindings) iter.Seq[[]any] {
-			return func(yield func([]any) bool) {
-				once.Do(func() { close(inTransform) })
-				<-ctx.Done() // parked until Stop cancels the job ctx
-			}
-		}))
-	wb.h.mu.Unlock()
-
-	queryDone := make(chan struct{})
-	go func() {
-		defer close(queryDone)
-		resp := postSignals(t, srv, "/console/query", map[string]any{
-			"consoleQuery": "slow(X)",
-		})
-		defer resp.Body.Close()
-		_, _ = io.ReadAll(resp.Body) // EOF == handler returned
-	}()
-
-	select {
-	case <-inTransform:
-	case <-time.After(10 * time.Second):
-		t.Fatal("query never reached the blocking external")
-	}
-
-	resp, err := http.Post(srv.URL+"/cancel", "", nil)
-	if err != nil {
-		t.Fatalf("POST /cancel: %v", err)
-	}
-	resp.Body.Close()
-
-	select {
-	case <-queryDone:
-	case <-time.After(10 * time.Second):
-		t.Fatal("query handler did not return after /cancel")
-	}
-
-	log := renderLog(wb, "query")
-	if !strings.Contains(log, "query stopped") {
-		t.Fatalf("scrollback missing 'query stopped': %s", log)
-	}
-	if strings.Contains(log, "timed out") {
-		t.Fatalf("user cancel misreported as timeout: %s", log)
-	}
-}
-
-// TestConsoleQueryMultiQueryCompletedResultsSurviveMidBatchCancel is the
-// handler-level regression for the round-two review's finding, exercised
-// through the exact multi-query shape the review called out: a batch of two
-// queries where the FIRST query's own Transform is cancelled mid-flight
-// (mirroring one query consuming the shared budget or a Stop landing while
-// it runs) must still render that first query's halt-status entry, and must
-// NOT go on to silently run or render anything for the second query — the
-// classifyQueryOutcome ordering rule's Continue=false is what stops the loop
-// here. This complements the deterministic classifyQueryOutcome unit tests
-// in rules_editor_test.go, which pin the qErr==nil/ctx-already-dead ordering
-// directly; reproducing THAT exact instruction-level gap through the real
-// HTTP handler is not reliably reachable (semi-naive's own ctx check inside
-// Transform races any external POST /cancel and almost always wins), so this
-// test instead pins the reachable, equally real regression shape: a batch
-// input must never drop a query's own halt reporting nor silently continue
-// past it.
-func TestConsoleQueryMultiQueryCompletedResultsSurviveMidBatchCancel(t *testing.T) {
-	wb := newMordorWorkbench(t)
-	srv := startTestServer(wb)
-	defer srv.Close()
-
-	inTransform := make(chan struct{})
-	var once sync.Once
-	wb.h.mu.Lock()
-	wb.h.sess.engineOpts = append(wb.h.sess.engineOpts,
-		seminaive.WithExternal("slow3", 1, func(ctx context.Context, _ seminaive.Bindings) iter.Seq[[]any] {
-			return func(yield func([]any) bool) {
-				once.Do(func() { close(inTransform) })
-				<-ctx.Done()
-			}
-		}))
-	wb.h.mu.Unlock()
-
-	queryDone := make(chan struct{})
-	go func() {
-		defer close(queryDone)
-		resp := postSignals(t, srv, "/console/query", map[string]any{
-			// Two queries in one batch — the second must never run once the
-			// first is cancelled mid-Transform.
-			"consoleQuery": "slow3(X)?\ncopied_to(F, H)?",
-		})
-		defer resp.Body.Close()
-		_, _ = io.ReadAll(resp.Body)
-	}()
-
-	select {
-	case <-inTransform:
-	case <-time.After(10 * time.Second):
-		t.Fatal("query never reached the blocking external")
-	}
-
-	resp, err := http.Post(srv.URL+"/cancel", "", nil)
-	if err != nil {
-		t.Fatalf("POST /cancel: %v", err)
-	}
-	resp.Body.Close()
-
-	select {
-	case <-queryDone:
-	case <-time.After(10 * time.Second):
-		t.Fatal("query handler did not return after /cancel")
-	}
-
-	log := renderLog(wb, "query")
-	if !strings.Contains(log, "query stopped") {
-		t.Fatalf("scrollback missing 'query stopped' for the cancelled first query: %s", log)
-	}
-	if strings.Contains(log, "context canceled") {
-		t.Fatalf("halt-status entry duplicated with a raw ctx error: %s", log)
-	}
-	if strings.Contains(log, "copied_to") {
-		t.Fatalf("second query in the batch ran after the first was cancelled: %s", log)
-	}
-}
-
-func TestConsoleQuery(t *testing.T) {
-	wb := newMordorWorkbench(t)
-	srv := startTestServer(wb)
-	defer srv.Close()
-
-	// A bare query body — the handler supplies the `?` terminator.
-	resp := postSignals(t, srv, "/console/query", map[string]any{
-		"consoleQuery": "copied_to(F, H)",
-	})
-	defer resp.Body.Close()
-	// Drain the POST's stream to EOF: the entry lands in the scrollback via
-	// the bus, so the handler must have RETURNED before asserting, and EOF
-	// is the "handler returned" signal.
-	_, _ = io.ReadAll(resp.Body)
-
-	log := renderLog(wb, "query")
-	if !strings.Contains(log, "copied_to(F, H)?") {
-		t.Fatalf("query echo missing from scrollback: %s", log)
-	}
-	if !strings.Contains(log, "<table>") {
-		t.Fatalf("result table missing from scrollback: %s", log)
-	}
-}
-
-func TestConsoleQueryRejectsRules(t *testing.T) {
-	wb := newMordorWorkbench(t)
-	srv := startTestServer(wb)
-	defer srv.Close()
-
-	resp := postSignals(t, srv, "/console/query", map[string]any{
-		"consoleQuery": "bad(X) :- copied_to(X, _).",
-	})
-	defer resp.Body.Close()
-	_, _ = io.ReadAll(resp.Body)
-
-	log := renderLog(wb, "query")
-	if !strings.Contains(log, "queries only") {
-		t.Fatalf("expected rules rejection in scrollback: %s", log)
-	}
-}
-
-func TestConsoleQueryParseError(t *testing.T) {
-	wb := newMordorWorkbench(t)
-	srv := startTestServer(wb)
-	defer srv.Close()
-
-	resp := postSignals(t, srv, "/console/query", map[string]any{
-		"consoleQuery": "copied_to(F,",
-	})
-	defer resp.Body.Close()
-	_, _ = io.ReadAll(resp.Body)
-
-	log := renderLog(wb, "query")
-	if !strings.Contains(log, `class='console-entry error'`) {
-		t.Fatalf("expected an error entry in scrollback: %s", log)
-	}
-}
-
-// -- console log mechanics ----------------------------------------------------
 
 func TestConsoleLogCapAndUpdate(t *testing.T) {
 	c := &consoleLog{}
@@ -240,85 +42,6 @@ func TestConsoleLogCapAndUpdate(t *testing.T) {
 }
 
 // -- console clear ------------------------------------------------------------
-
-func TestConsoleClearQueryTab(t *testing.T) {
-	wb := newMordorWorkbench(t)
-	srv := startTestServer(wb)
-	defer srv.Close()
-
-	wb.console.Append("query", "note", html.Text("probe"))
-	wb.console.Append("agent", "agent", html.Text("kept"))
-
-	resp := postSignals(t, srv, "/console/clear?tab=query", map[string]any{})
-	defer resp.Body.Close()
-	_, _ = io.ReadAll(resp.Body)
-
-	if got := len(wb.console.Render("query")); got != 0 {
-		t.Fatalf("query scrollback not cleared: %d entries", got)
-	}
-	if !strings.Contains(renderLog(wb, "agent"), "kept") {
-		t.Fatalf("clearing query tab touched the agent scrollback")
-	}
-}
-
-func TestConsoleClearAgentResetsDriver(t *testing.T) {
-	wb := newMordorWorkbench(t)
-	srv := startTestServer(wb)
-	defer srv.Close()
-
-	driver := &fakeDriver{}
-	wb.agent = driver
-	wb.console.Append("agent", "agent", html.Text("old conversation"))
-
-	resp := postSignals(t, srv, "/console/clear?tab=agent", map[string]any{})
-	defer resp.Body.Close()
-	_, _ = io.ReadAll(resp.Body)
-
-	if got := len(wb.console.Render("agent")); got != 0 {
-		t.Fatalf("agent scrollback not cleared: %d entries", got)
-	}
-	wb.agentMu.Lock()
-	live := wb.agent
-	wb.agentMu.Unlock()
-	if live != nil {
-		t.Fatalf("driver not dropped; the model would keep its conversation memory")
-	}
-	if !driver.closed {
-		t.Fatalf("dropped driver was not closed")
-	}
-}
-
-func TestConsoleClearAgentCancelsRunningTurn(t *testing.T) {
-	wb := newMordorWorkbench(t)
-	srv := startTestServer(wb)
-	defer srv.Close()
-
-	// A driver that blocks until its context is cancelled — Clear must
-	// cancel the turn itself (it implies Stop), wait it out, then reset.
-	driver := &blockingDriver{release: make(chan struct{})}
-	wb.agent = driver
-	resp1 := postSignals(t, srv, "/console/prompt", map[string]any{"consolePrompt": "hi"})
-	_, _ = io.ReadAll(resp1.Body)
-	resp1.Body.Close()
-
-	resp2 := postSignals(t, srv, "/console/clear?tab=agent", map[string]any{})
-	_, _ = io.ReadAll(resp2.Body)
-	resp2.Body.Close()
-
-	if log := renderLog(wb, "agent"); log != "" {
-		t.Fatalf("agent scrollback not empty after mid-turn clear: %s", log)
-	}
-	wb.agentMu.Lock()
-	live := wb.agent
-	wb.agentMu.Unlock()
-	if live != nil {
-		t.Fatalf("mid-turn clear did not drop the driver")
-	}
-	if !driver.closed {
-		t.Fatalf("cancelled turn's driver was not closed")
-	}
-}
-
 // -- agent turn runner --------------------------------------------------------
 
 // fakeDriver scripts one turn's event sequence, standing in for kitDriver so
@@ -376,7 +99,7 @@ func TestRunAgentTurnTranscript(t *testing.T) {
 		stopReason: "stop",
 	}
 
-	wb.runAgentTurn(context.Background(), driver, "how many copies?")
+	wb.runAgentTurn(context.Background(), driver, "how many copies?", "agent")
 
 	log := renderLog(wb, "agent")
 	for _, want := range []string{
@@ -424,7 +147,7 @@ func TestRunAgentTurnMessageInterleavedWithToolBreaksAccumulator(t *testing.T) {
 		stopReason: "stop",
 	}
 
-	wb.runAgentTurn(context.Background(), driver, "how many copies?")
+	wb.runAgentTurn(context.Background(), driver, "how many copies?", "agent")
 
 	kinds := entryKinds(t, wb, "agent")
 	want := []string{"agent", "tool", "agent"}
@@ -471,7 +194,7 @@ func TestRunAgentTurnThoughtInterleavedWithMessageBreaksAccumulator(t *testing.T
 		stopReason: "stop",
 	}
 
-	wb.runAgentTurn(context.Background(), driver, "hi")
+	wb.runAgentTurn(context.Background(), driver, "hi", "agent")
 
 	kinds := entryKinds(t, wb, "agent")
 	want := []string{"agent", "thought", "agent"}
@@ -648,7 +371,7 @@ func TestRunAgentTurnNoReplyNote(t *testing.T) {
 		stopReason: "tool_calls",
 	}
 
-	wb.runAgentTurn(context.Background(), driver, "which hosts?")
+	wb.runAgentTurn(context.Background(), driver, "which hosts?", "agent")
 
 	log := renderLog(wb, "agent")
 	if !strings.Contains(log, "without a reply (stop reason: tool_calls)") {
@@ -661,7 +384,7 @@ func TestRunAgentTurnErrorDropsDriver(t *testing.T) {
 	driver := &fakeDriver{err: errors.New("provider exploded")}
 	wb.agent = driver
 
-	wb.runAgentTurn(context.Background(), driver, "hi")
+	wb.runAgentTurn(context.Background(), driver, "hi", "agent")
 
 	log := renderLog(wb, "agent")
 	if !strings.Contains(log, "turn failed: provider exploded") {
@@ -683,7 +406,7 @@ func TestRunAgentTurnCancelled(t *testing.T) {
 	cancel()
 	driver := &fakeDriver{events: []agentEvent{{Kind: "message", Text: "never"}}}
 
-	wb.runAgentTurn(ctx, driver, "hi")
+	wb.runAgentTurn(ctx, driver, "hi", "agent")
 
 	log := renderLog(wb, "agent")
 	if !strings.Contains(log, "turn cancelled") {
@@ -741,7 +464,7 @@ func TestRunAgentTurnPermissionRendersOptions(t *testing.T) {
 
 	turnDone := make(chan struct{})
 	go func() {
-		wb.runAgentTurn(context.Background(), driver, "change the rules")
+		wb.runAgentTurn(context.Background(), driver, "change the rules", "agent")
 		close(turnDone)
 	}()
 
@@ -776,7 +499,7 @@ func TestRunAgentTurnPermissionRendersOptions(t *testing.T) {
 		t.Fatalf("permission request not tracked in wb.pendingPerm")
 	}
 
-	resp := postSignals(t, srv, "/console/answer?requestID=req-1&optionID=allow", map[string]any{})
+	resp := postSignals(t, srv, "/answer?requestID=req-1&optionID=allow", map[string]any{})
 	defer resp.Body.Close()
 	_, _ = io.ReadAll(resp.Body)
 
@@ -808,7 +531,7 @@ func TestConsoleAnswerUnknownRequestRendersError(t *testing.T) {
 	// cancelled it) and a stale page replaying an old requestID. The
 	// handler must render an error entry, not panic on the missing map key
 	// or a nil driver.
-	resp := postSignals(t, srv, "/console/answer?requestID=req-does-not-exist&optionID=allow", map[string]any{})
+	resp := postSignals(t, srv, "/answer?requestID=req-does-not-exist&optionID=allow&tab=agent", map[string]any{})
 	defer resp.Body.Close()
 	_, _ = io.ReadAll(resp.Body)
 
@@ -843,7 +566,7 @@ func TestRunAgentTurnCancelledResolvesPendingPermission(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	driver := &cancelAfterPermissionDriver{cancel: cancel}
 
-	wb.runAgentTurn(ctx, driver, "hi")
+	wb.runAgentTurn(ctx, driver, "hi", "agent")
 
 	log := renderLog(wb, "agent")
 	if !strings.Contains(log, "cancelled: turn ended before the agent received an answer") {
@@ -890,7 +613,7 @@ func TestRunAgentTurnAutoAllowsReadOnlyTool(t *testing.T) {
 		stopReason: "stop",
 	}
 
-	wb.runAgentTurn(context.Background(), driver, "how many copies?")
+	wb.runAgentTurn(context.Background(), driver, "how many copies?", "agent")
 
 	if len(driver.answered) != 1 {
 		t.Fatalf("Answer called %d times, want 1: %+v", len(driver.answered), driver.answered)
@@ -929,7 +652,7 @@ func TestRunAgentTurnMutatingToolStillPrompts(t *testing.T) {
 
 	turnDone := make(chan struct{})
 	go func() {
-		wb.runAgentTurn(context.Background(), driver, "change the rules")
+		wb.runAgentTurn(context.Background(), driver, "change the rules", "agent")
 		close(turnDone)
 	}()
 
@@ -1001,7 +724,7 @@ func TestRunAgentTurnReadOnlyToolWithoutAllowOptionStillPrompts(t *testing.T) {
 
 	turnDone := make(chan struct{})
 	go func() {
-		wb.runAgentTurn(context.Background(), driver, "sample something")
+		wb.runAgentTurn(context.Background(), driver, "sample something", "agent")
 		close(turnDone)
 	}()
 
@@ -1047,7 +770,7 @@ func TestRunAgentTurnPlanMorphsInPlace(t *testing.T) {
 		stopReason: "stop",
 	}
 
-	wb.runAgentTurn(context.Background(), driver, "plan it out")
+	wb.runAgentTurn(context.Background(), driver, "plan it out", "agent")
 
 	log := renderLog(wb, "agent")
 	if strings.Count(log, "plan-checklist") != 1 {
@@ -1061,36 +784,65 @@ func TestRunAgentTurnPlanMorphsInPlace(t *testing.T) {
 	}
 }
 
-// -- prompt endpoint gating ---------------------------------------------------
+// -- send endpoint gating -----------------------------------------------------
 
-func TestConsolePromptGatesOneTurn(t *testing.T) {
+// TestConversationSendGatesOneTurn pins the global one-turn gate at the
+// send endpoint (workbench-v2 design decision 6): while conversation A's
+// turn runs, a send in conversation B is rejected with a "turn running in
+// <name>" error entry in B's OWN transcript, no user entry is appended for
+// the rejected prompt, and — critically — A's driver is not torn down by
+// B's driver-cache switch (the gate is acquired before conversationDriver
+// runs).
+func TestConversationSendGatesOneTurn(t *testing.T) {
 	wb := newMordorWorkbench(t)
+	cm, err := newConversationManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("newConversationManager: %v", err)
+	}
+	wb.conversations = cm
 	srv := startTestServer(wb)
 	defer srv.Close()
 
-	// A driver that blocks until released, so the second POST lands while
-	// the first turn is still "running".
+	convA, err := cm.Create(conversationModeQuery)
+	if err != nil {
+		t.Fatalf("Create A: %v", err)
+	}
+	convB, err := cm.Create(conversationModeQuery)
+	if err != nil {
+		t.Fatalf("Create B: %v", err)
+	}
+
+	// A driver that blocks until released, pre-bound to conversation A so
+	// the send path uses it instead of constructing a real kit agent.
 	release := make(chan struct{})
 	blocking := &blockingDriver{release: release}
 	wb.agent = blocking
+	wb.agentConvID = convA.ID
 
-	resp1 := postSignals(t, srv, "/console/prompt", map[string]any{"consolePrompt": "first"})
+	resp1 := postSignals(t, srv, "/c/"+convA.ID+"/send", map[string]any{"prompt": "first"})
 	_, _ = io.ReadAll(resp1.Body)
 	resp1.Body.Close()
 
-	resp2 := postSignals(t, srv, "/console/prompt", map[string]any{"consolePrompt": "second"})
+	resp2 := postSignals(t, srv, "/c/"+convB.ID+"/send", map[string]any{"prompt": "second"})
 	_, _ = io.ReadAll(resp2.Body)
 	resp2.Body.Close()
 
 	close(release)
-	waitFor(t, func() bool { return strings.Contains(renderLog(wb, "agent"), "done") })
+	waitFor(t, func() bool { return strings.Contains(renderLog(wb, convA.ID), "done") })
 
-	log := renderLog(wb, "agent")
-	if !strings.Contains(log, "a turn is already running") {
-		t.Fatalf("second prompt was not rejected: %s", log)
+	if blocking.closed {
+		t.Fatalf("conversation B's rejected send tore down A's running driver")
 	}
-	if strings.Count(log, `class='console-entry user'`) != 1 {
-		t.Fatalf("rejected prompt should not add a user entry: %s", log)
+	logB := renderLog(wb, convB.ID)
+	if !strings.Contains(logB, "turn running in") {
+		t.Fatalf("second conversation's send was not rejected with the gate's wording: %s", logB)
+	}
+	if strings.Contains(logB, `class='console-entry user'`) {
+		t.Fatalf("rejected send should not add a user entry: %s", logB)
+	}
+	logA := renderLog(wb, convA.ID)
+	if strings.Count(logA, `class='console-entry user'`) != 1 {
+		t.Fatalf("first conversation should hold exactly its own user entry: %s", logA)
 	}
 }
 

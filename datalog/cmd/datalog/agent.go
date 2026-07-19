@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -14,7 +13,6 @@ import (
 	"github.com/mark3labs/kit/pkg/kit"
 	"github.com/mark3labs/mcp-go/server"
 	html "github.com/swdunlop/html-go"
-	"github.com/swdunlop/html-go/datastar"
 	"github.com/swdunlop/html-go/tag"
 )
 
@@ -79,6 +77,7 @@ type agentPlanEntry struct {
 type pendingPermission struct {
 	entryID uint64
 	event   agentEvent
+	tab     string // conversation id whose transcript holds the entry
 }
 
 // agentDriver abstracts one conversational agent behind the chat pane
@@ -287,6 +286,13 @@ func (d *kitDriver) Answer(requestID, optionID string) error {
 
 func (d *kitDriver) Close() error { return d.k.Close() }
 
+// SetName names the driver's kit session (the conversation auto-title,
+// design decision 6) through the live kit instance — the session file is
+// already open under it, so this is the one write path that cannot race a
+// second file handle. Discovered via the interface probe in
+// handleConversationSend so acpDriver (no session to name) needs nothing.
+func (d *kitDriver) SetName(name string) error { return d.k.SetSessionName(name) }
+
 // readOnlyTools is the workbench's own read-only MCP tool set (mcp.go): the
 // tools that only ever read the session's schema/rules/facts back to the
 // caller, never mutate them. set_schema and sample_input are deliberately
@@ -451,94 +457,13 @@ func autoAllowOption(opts []agentOption) (agentOption, bool) {
 	return agentOption{}, false
 }
 
-// agentTurnJobKey gates the Agent tab on the jobs set: one turn at a time,
-// and Global Cancel (Stop) cancels the active turn's context — the
-// emergency-brake extension acp-integration.md observation 7 specifies.
-const agentTurnJobKey = "agent"
-
-// handleConsolePrompt is the Agent tab's send action (POST /console/prompt).
-// The turn runs in a background goroutine detached from the request context
-// — a turn takes as long as the model takes, must survive the POST
-// returning, and every page watches it over /events anyway. The POST's own
-// stream just clears the prompt input; busy-state, transcript entries, and
-// errors all travel the bus.
-func (wb *workbench) handleConsolePrompt(w http.ResponseWriter, r *http.Request) {
-	var sig consoleSignals
-	decodeErr := datastar.Decode(&sig, r)
-
-	stream, err := datastar.RequestStream(w, r)
-	if err != nil {
-		return
-	}
-	if decodeErr != nil {
-		wb.consoleAppend("agent", "error", html.Text(decodeErr.Error()))
-		return
-	}
-	text := strings.TrimSpace(sig.ConsolePrompt)
-	if text == "" {
-		return
-	}
-
-	driver, err := wb.agentDriver()
-	if err != nil {
-		wb.consoleAppend("agent", "error", html.Text(fmt.Sprintf(
-			"agent unavailable: %v — configure a model with --model (or KIT_MODEL / ~/.kit.yml) and restart serve", err)))
-		return
-	}
-
-	// context.Background, not r.Context(): the turn outlives the POST. The
-	// jobs entry is the turn's only cancellation path (Stop / CancelAll).
-	jobCtx, done := wb.jobs.Begin(context.Background(), agentTurnJobKey)
-	if jobCtx == nil {
-		wb.consoleAppend("agent", "error", html.Text("a turn is already running"))
-		return
-	}
-
-	_ = stream.Emit(datastar.Signal(map[string]any{"consolePrompt": ""}))
-	wb.consoleAppend("agent", "user", html.Text(text))
-	wb.publishBusy("agent")
-
-	go func() {
-		defer done()
-		defer wb.publishBusy("")
-		wb.runAgentTurn(jobCtx, driver, text)
-	}()
-}
-
-// agentDriver returns the lazily-constructed embedded agent, building it on
-// first use (acp-integration.md: "created/spawned lazily on the first
-// prompt and recreated on the next prompt after an exit or fatal error").
-// Construction failure is not cached — a fixed environment (say, an API key
-// exported and serve restarted... or kit config corrected) should be
-// retried, and until then each prompt reports the same error.
-func (wb *workbench) agentDriver() (agentDriver, error) {
-	wb.agentMu.Lock()
-	defer wb.agentMu.Unlock()
-	if wb.agent != nil {
-		return wb.agent, nil
-	}
-	if wb.agentCfg.AgentCommand != "" {
-		d, err := newACPDriver(wb.agentCfg)
-		if err != nil {
-			return nil, err
-		}
-		wb.agent = d
-		return d, nil
-	}
-	d, err := newKitDriver(context.Background(), wb.agentCfg, wb.mcpSrv)
-	if err != nil {
-		return nil, err
-	}
-	wb.agent = d
-	return d, nil
-}
-
 // dropAgentDriver discards the current driver after a fatal turn error so
 // the next prompt reconstructs it fresh.
 func (wb *workbench) dropAgentDriver(d agentDriver) {
 	wb.agentMu.Lock()
 	if wb.agent == d {
 		wb.agent = nil
+		wb.agentConvID = ""
 	}
 	wb.agentMu.Unlock()
 	_ = d.Close()
@@ -554,7 +479,7 @@ func (wb *workbench) dropAgentDriver(d agentDriver) {
 //   - a non-clean stop reason or turn error appends a terminal entry —
 //     never silence (acp-integration.md "Chat pane": an agent crash renders
 //     an explicit terminal state).
-func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text string) {
+func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text, tab string) {
 	var (
 		mu         sync.Mutex // orders entry updates; kit events fire from its goroutines
 		msgID      uint64
@@ -609,7 +534,7 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 			msgText.WriteString(ev.Text)
 			if msgID == 0 {
 				gotReply = true
-				msgID = wb.consoleAppend("agent", "agent", html.Text(msgText.String()))
+				msgID = wb.consoleAppend(tab, "agent", html.Text(msgText.String()))
 			} else {
 				wb.consoleUpdate(msgID, "agent", html.Text(msgText.String()))
 			}
@@ -619,13 +544,13 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 			thoughtBuf.WriteString(ev.Text)
 			body := thoughtEntry(thoughtBuf.String())
 			if thoughtID == 0 {
-				thoughtID = wb.consoleAppend("agent", "thought", body)
+				thoughtID = wb.consoleAppend(tab, "thought", body)
 			} else {
 				wb.consoleUpdate(thoughtID, "thought", body)
 			}
 		case "tool-call":
 			breakStreaming()
-			id := wb.consoleAppend("agent", "tool", toolEntry(ev, false))
+			id := wb.consoleAppend(tab, "tool", toolEntry(ev, false))
 			toolIDs[ev.ToolCallID] = id
 		case "tool-result":
 			// A morph in place, never an append — does not break the
@@ -636,11 +561,11 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 				wb.consoleUpdate(id, "tool", toolEntry(ev, true))
 			} else {
 				breakStreaming()
-				wb.consoleAppend("agent", "tool", toolEntry(ev, true))
+				wb.consoleAppend(tab, "tool", toolEntry(ev, true))
 			}
 		case "error":
 			breakStreaming()
-			wb.consoleAppend("agent", "error", html.Text(ev.Text))
+			wb.consoleAppend(tab, "error", html.Text(ev.Text))
 		case "permission":
 			// Auto-allow policy (doc/features/acp-integration.md's
 			// "Permission requests" bullet): a request recognizably gating
@@ -668,7 +593,7 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 			if _, ok := readOnlyToolName(ev.ToolName); ok {
 				if opt, ok := autoAllowOption(ev.Options); ok {
 					if err := driver.Answer(ev.RequestID, opt.ID); err == nil {
-						wb.consoleAppend("agent", "note",
+						wb.consoleAppend(tab, "note",
 							html.Text("auto-allowed: "+permissionSummary(ev)))
 						return
 					}
@@ -683,9 +608,9 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 			// from there. "A turn blocked on permission shows that state
 			// plainly": the entry's own phrasing carries that, so no
 			// second spinner is added alongside agentActivity.
-			id := wb.consoleAppend("agent", "permission", permissionEntry(ev))
+			id := wb.consoleAppend(tab, "permission", permissionEntry(ev, tab))
 			wb.permMu.Lock()
-			wb.pendingPerm[ev.RequestID] = pendingPermission{entryID: id, event: ev}
+			wb.pendingPerm[ev.RequestID] = pendingPermission{entryID: id, event: ev, tab: tab}
 			wb.permMu.Unlock()
 		case "plan":
 			body := planEntry(ev.PlanEntries)
@@ -697,7 +622,7 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 				// carries the complete list, per agentPlanEntry's doc
 				// comment) and must NOT break them.
 				breakStreaming()
-				planID = wb.consoleAppend("agent", "plan", body)
+				planID = wb.consoleAppend(tab, "plan", body)
 			} else {
 				wb.consoleUpdate(planID, "plan", body)
 			}
@@ -710,9 +635,9 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 	mu.Unlock()
 	switch {
 	case ctx.Err() != nil:
-		wb.consoleAppend("agent", "note", html.Text("turn cancelled"))
+		wb.consoleAppend(tab, "note", html.Text("turn cancelled"))
 	case err != nil:
-		wb.consoleAppend("agent", "error", html.Text(fmt.Sprintf("turn failed: %v", err)))
+		wb.consoleAppend(tab, "error", html.Text(fmt.Sprintf("turn failed: %v", err)))
 		wb.dropAgentDriver(driver)
 	case !reply:
 		// A model may end its turn on a tool round without composing any
@@ -722,10 +647,10 @@ func (wb *workbench) runAgentTurn(ctx context.Context, driver agentDriver, text 
 		if stopReason == "" {
 			stopReason = "unknown"
 		}
-		wb.consoleAppend("agent", "note",
+		wb.consoleAppend(tab, "note",
 			html.Text("the model ended the turn without a reply (stop reason: "+stopReason+")"))
 	case stopReason != "" && stopReason != "stop" && stopReason != "end_turn" && stopReason != "tool_calls":
-		wb.consoleAppend("agent", "note", html.Text("turn ended: "+stopReason))
+		wb.consoleAppend(tab, "note", html.Text("turn ended: "+stopReason))
 	}
 
 	// A cancelled or crashed turn can leave permission requests the driver
@@ -767,11 +692,14 @@ func permissionSummary(ev agentEvent) string {
 // permissionEntry renders one pending permission request: the phrasing
 // "agent is waiting for permission: ..." makes the blocked state plain
 // (acp-integration.md "Chat pane"), and one inline button per option —
-// posting RequestID/OptionID to POST /console/answer (handleConsoleAnswer,
-// console.go) — lets the operator resolve it without a second round-trip
-// through the tool-call entry. Resolving morphs the entry to
-// permissionResolvedEntry instead, which drops the buttons.
-func permissionEntry(ev agentEvent) html.Content {
+// posting RequestID/OptionID to POST /answer (handleAnswer, console.go) —
+// lets the operator resolve it without a second round-trip through the
+// tool-call entry. tab (the conversation id) rides the URL too, so a
+// click on a request the server no longer tracks (late answer, stale
+// page) can still anchor its error entry to the transcript the button
+// lives in. Resolving morphs the entry to permissionResolvedEntry
+// instead, which drops the buttons.
+func permissionEntry(ev agentEvent, tab string) html.Content {
 	summary := permissionSummary(ev)
 	buttons := make(html.Group, 0, len(ev.Options))
 	for _, opt := range ev.Options {
@@ -782,8 +710,8 @@ func permissionEntry(ev agentEvent) html.Content {
 			class += " allow"
 		}
 		buttons = append(buttons, tag.New("button."+class).
-			Set("data-on:click", "@post('/console/answer?requestID="+urlQueryEscape(ev.RequestID)+
-				"&optionID="+urlQueryEscape(opt.ID)+"')").
+			Set("data-on:click", "@post('/answer?requestID="+urlQueryEscape(ev.RequestID)+
+				"&optionID="+urlQueryEscape(opt.ID)+"&tab="+urlQueryEscape(tab)+"')").
 			Add(html.Text(opt.Name)))
 	}
 	return html.Group{

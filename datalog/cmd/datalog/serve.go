@@ -17,7 +17,6 @@ import (
 	"sync"
 
 	"github.com/mark3labs/mcp-go/server"
-	html "github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/datastar"
 	"swdunlop.dev/pkg/datalog/cmd/datalog/view"
 )
@@ -351,13 +350,17 @@ type workbench struct {
 	bus  *bus
 	jobs *jobs
 
-	// busyMu guards busyKey, the current $busy value as of the last
-	// publishBusy call — handleEvents replays it to a freshly connecting
-	// SSE subscription (see publishBusy's doc comment) so a tab opened
-	// mid-job can still see and stop the job, instead of showing idle
-	// (and offering no Stop control) until the job happens to end.
-	busyMu  sync.Mutex
-	busyKey string
+	// busyMu guards busyKey (the current $busy value as of the last
+	// publishBusy call) and busyConvID/busyConvName (WHICH conversation
+	// owns a running "agent" turn, riding the same signal batch) —
+	// handleEvents replays them to a freshly connecting SSE subscription
+	// (see publishBusy's doc comment) so a tab opened mid-job can still
+	// see and stop the job, instead of showing idle (and offering no Stop
+	// control) until the job happens to end.
+	busyMu       sync.Mutex
+	busyKey      string
+	busyConvID   string
+	busyConvName string
 
 	// console is the drawer's server-owned scrollback (console.go); mcpSrv
 	// is the shared MCP server value built in newWorkbench, consumed by
@@ -366,11 +369,15 @@ type workbench struct {
 	console *consoleLog
 	mcpSrv  *server.MCPServer
 
-	// agentMu guards the lazily-constructed embedded agent (agent.go).
+	// agentMu guards the lazily-constructed agent driver (agent.go) and
+	// agentConvID, the conversation it is currently bound to
+	// (conversations_http.go's conversationDriver — one live agent at a
+	// time, switched when the human sends in a different conversation).
 	// agentCfg is operator-trusted flag input, immutable after startup.
-	agentMu  sync.Mutex
-	agent    agentDriver
-	agentCfg agentConfig
+	agentMu     sync.Mutex
+	agent       agentDriver
+	agentConvID string
+	agentCfg    agentConfig
 
 	// conversations is the phase-2 conversation manager (conversation.go,
 	// doc/features/workbench-v2.md design decision 6), nil only if its
@@ -440,104 +447,33 @@ func (wb *workbench) currentSelection() (file string, row int, valid bool) {
 // full-page shell, static CSS, the /events subscription skeleton, and
 // Global Cancel are implemented completely in this wave.
 func (wb *workbench) routes(mux *http.ServeMux) {
-	// GET / has no natural pane composition of its own — it redirects to
-	// the Facts view, the authoring loop's usual starting point (raw data
-	// in, base facts out).
+	// Conversation UI (conversations_http.go; doc/features/workbench-v2.md
+	// phase 2): GET / lands on the newest conversation, /c/{id} is one
+	// conversation's page, create/delete are plain form POST+redirect.
 	mux.HandleFunc("GET /{$}", wb.handleRoot)
-	mux.HandleFunc("GET /facts", wb.handleFactsView)
-	mux.HandleFunc("GET /rules", wb.handleRulesView)
+	mux.HandleFunc("GET /c/{id}", wb.handleConversationPage)
+	mux.HandleFunc("POST /conversations", wb.handleConversationCreate)
+	mux.HandleFunc("POST /c/{id}/delete", wb.handleConversationDelete)
+	mux.HandleFunc("POST /c/{id}/send", wb.handleConversationSend)
+	mux.HandleFunc("POST /answer", wb.handleAnswer)
+
 	mux.HandleFunc("GET /oat.css", wb.handleOatCSS)
 	mux.HandleFunc("GET /workbench.css", wb.handleWorkbenchCSS)
 	mux.HandleFunc("GET /events", wb.handleEvents)
 
-	// Data Browser (view/data_browser.go stubs; wave 5 fills in).
+	// Browser: Data tab (data_browser.go).
 	mux.HandleFunc("GET /data", wb.handleDataList)
 	mux.HandleFunc("GET /data/{file}", wb.handleDataFile)
-	mux.HandleFunc("GET /jsonfacts/test/{file}/{row}", wb.handleJSONFactsTest)
+	mux.HandleFunc("GET /data/select/{file}/{row}", wb.handleDataSelect)
 
-	// jsonfacts Editor (view/jsonfacts_editor.go stubs; wave 6 fills in).
-	mux.HandleFunc("POST /jsonfacts/preview", wb.handleJSONFactsPreview)
-	mux.HandleFunc("POST /jsonfacts/apply", wb.handleJSONFactsApply)
-
-	// Datalog Editor (view/rules_editor.go stubs; wave 7 fills in).
-	mux.HandleFunc("POST /rules/check", wb.handleRulesCheck)
-	mux.HandleFunc("POST /rules/run", wb.handleRulesRun)
-
-	// Fact Browser (view/fact_browser.go stub; wave 8 fills in).
+	// Browser: Facts tab (fact_browser.go), including the why? affordance
+	// (doc/features/provenance.md), which renders into the tab's
+	// #why-output surface.
 	mux.HandleFunc("GET /facts/{predicate}/{arity}", wb.handleFacts)
-
-	// Fact Browser "why?" affordance (doc/features/provenance.md): explains
-	// one derived fact into the console drawer's Query tab.
 	mux.HandleFunc("POST /why/{predicate}/{arity}", wb.handleWhy)
 
-	// Console drawer (console.go, agent.go): the Query tab's ad-hoc probe
-	// and the Agent tab's prompt (doc/features/web-ui.md "Console drawer").
-	mux.HandleFunc("POST /console/query", wb.handleConsoleQuery)
-	mux.HandleFunc("POST /console/prompt", wb.handleConsolePrompt)
-	mux.HandleFunc("POST /console/answer", wb.handleConsoleAnswer)
-	mux.HandleFunc("POST /console/clear", wb.handleConsoleClear)
-
-	// Global Cancel — implemented fully now (doc/features/web-ui.md
-	// "Execution sandbox").
+	// Global Cancel (doc/features/web-ui.md "Execution sandbox").
 	mux.HandleFunc("POST /cancel", wb.handleCancel)
-
-	// Save/git (save.go).
-}
-
-// handleRoot redirects GET / to the Facts view, the authoring loop's usual
-// starting point (raw data in, base facts out).
-func (wb *workbench) handleRoot(w http.ResponseWriter, r *http.Request) {
-	http.Redirect(w, r, "/facts", http.StatusFound)
-}
-
-// handleFactsView renders the Facts view (view/page.go's doc comment):
-// Data Browser | jsonfacts Editor | Fact Browser (base) — authoring how
-// base facts are extracted from JSONL. This and handleRulesView are the
-// only handlers that render a full <html> document (doc/notes/datastar.md
-// §1: full renders happen only on browser navigation).
-func (wb *workbench) handleFactsView(w http.ResponseWriter, r *http.Request) {
-	wb.h.mu.Lock()
-	schemaText := wb.h.sess.schemaText
-	wb.h.mu.Unlock()
-
-	output := wb.renderJSONFactsSelection()
-
-	page := view.Page{
-		Title:  "Datalog Workbench — facts",
-		Active: "facts",
-		Columns: []html.Content{
-			view.DataBrowser(),
-			view.JSONFactsEditor(schemaText, output),
-			view.FactBrowser("base", "Base Facts"),
-		},
-		Console: view.Console(wb.console.Render("query"), wb.console.Render("agent")),
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	buf := html.Append(nil, page)
-	_, _ = w.Write(buf)
-}
-
-// handleRulesView renders the Rules view: Fact Browser (base) | Datalog
-// Editor | Fact Browser (derived) — authoring how rules derive facts from
-// base facts.
-func (wb *workbench) handleRulesView(w http.ResponseWriter, r *http.Request) {
-	wb.h.mu.Lock()
-	rulesText := wb.h.sess.rulesText
-	wb.h.mu.Unlock()
-
-	page := view.Page{
-		Title:  "Datalog Workbench — Rules",
-		Active: "rules",
-		Columns: []html.Content{
-			view.FactBrowser("base", "Base Facts"),
-			view.RulesEditor(rulesText),
-			view.FactBrowser("derived", "Derived Facts"),
-		},
-		Console: view.Console(wb.console.Render("query"), wb.console.Render("agent")),
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	buf := html.Append(nil, page)
-	_, _ = w.Write(buf)
 }
 
 // handleOatCSS serves the embedded, self-hosted oat.css base.
@@ -577,17 +513,31 @@ func (wb *workbench) handleCancel(w http.ResponseWriter, r *http.Request) {
 // this call publishes so handleEvents can replay it to a page that connects
 // mid-job (see busyKey's doc comment on workbench).
 func (wb *workbench) publishBusy(key string) {
-	wb.busyMu.Lock()
-	wb.busyKey = key
-	wb.busyMu.Unlock()
-	wb.bus.Publish(datastar.Signal(map[string]any{"busy": key}))
+	wb.publishBusySignals(key, "", "")
 }
 
-// currentBusy returns the $busy value as of the last publishBusy call.
-func (wb *workbench) currentBusy() string {
+// publishBusyConv is publishBusy for a conversation turn: the "agent" key
+// plus WHICH conversation owns it (id and display name), so every
+// composer can tell "my turn is running" from "a turn is running
+// elsewhere" (view/conversation.go's signal vocabulary).
+func (wb *workbench) publishBusyConv(convID, convName string) {
+	wb.publishBusySignals("agent", convID, convName)
+}
+
+func (wb *workbench) publishBusySignals(key, convID, convName string) {
+	wb.busyMu.Lock()
+	wb.busyKey, wb.busyConvID, wb.busyConvName = key, convID, convName
+	wb.busyMu.Unlock()
+	wb.bus.Publish(datastar.Signal(map[string]any{
+		"busy": key, "busyConv": convID, "busyConvName": convName,
+	}))
+}
+
+// currentBusy returns the $busy signal values as of the last publish.
+func (wb *workbench) currentBusy() (key, convID, convName string) {
 	wb.busyMu.Lock()
 	defer wb.busyMu.Unlock()
-	return wb.busyKey
+	return wb.busyKey, wb.busyConvID, wb.busyConvName
 }
 
 // handleEvents is the page's one long-lived subscription connection
@@ -627,8 +577,10 @@ func (wb *workbench) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// gap is still caught by the subscription rather than missed entirely)
 	// fixes that for every fresh connection, not just ones that happen to be
 	// open when a job starts.
-	if key := wb.currentBusy(); key != "" {
-		_ = stream.Emit(datastar.Signal(map[string]any{"busy": key}))
+	if key, convID, convName := wb.currentBusy(); key != "" {
+		_ = stream.Emit(datastar.Signal(map[string]any{
+			"busy": key, "busyConv": convID, "busyConvName": convName,
+		}))
 	}
 
 	for { // 3. drain anything that arrived between 1 and 2, plus all future events

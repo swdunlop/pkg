@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"swdunlop.dev/pkg/datalog"
 )
@@ -367,23 +368,60 @@ func TestSessionPolicy_REPLEnablesProvenanceByDefault(t *testing.T) {
 	}
 }
 
+// applyTestRules primes a workbench's ruleset and derived cache directly —
+// the v1 /rules/run endpoint these tests used to POST died with the
+// textarea editors (workbench-v2 phase 2). It mirrors serve.go's startup
+// evaluation: set rules, evaluate once, cache db+prov under the lock.
+func applyTestRules(t *testing.T, wb *workbench, rulesText string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), evalTimeout)
+	defer cancel()
+	wb.h.mu.Lock()
+	defer wb.h.mu.Unlock()
+	if _, err := wb.h.sess.setRulesWithQueries(rulesText); err != nil {
+		t.Fatalf("setRulesWithQueries: %v", err)
+	}
+	db, prov, err := wb.h.sess.evaluate(ctx)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	wb.h.sess.derivedDB = db
+	wb.h.sess.derivedProv = prov
+}
+
+// collectWhyOutput drains sub until an event morphing #why-output arrives
+// (or the deadline passes), returning its rendered SSE text.
+func collectWhyOutput(t *testing.T, sub *subscriber) string {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case ev := <-sub.Events():
+			if out := renderEvent(ev); strings.Contains(out, "why-output") {
+				return out
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for a #why-output event on the bus")
+			return ""
+		}
+	}
+}
+
 // -- Fact Browser "why?" affordance (HTTP) -----------------------------------
 
-// TestHandleWhy_RendersExplanationIntoConsole drives the "why?" button's
+// TestHandleWhy_RendersExplanationIntoWhyOutput drives the "why?" button's
 // actual HTTP target end to end: POST /why/{predicate}/{arity}?fact=<literal>
-// must append a rendered derivation tree to the console drawer's Query tab
-// scrollback (view.ExplainEntry), the same surface handleConsoleQuery's
-// results land in.
-func TestHandleWhy_RendersExplanationIntoConsole(t *testing.T) {
+// must publish a rendered derivation tree into the Facts tab's #why-output
+// surface (view.WhyOutput) over the bus.
+func TestHandleWhy_RendersExplanationIntoWhyOutput(t *testing.T) {
 	wb := newTestWorkbench(t, t.TempDir(), "", nil, "test-token")
 	srv := startTestServer(wb)
 	defer srv.Close()
 
-	resp := postSignals(t, srv, "/rules/run", map[string]any{
-		"rulesText": "event(\"h1\").\nderived(X) :- event(X).\n",
-	})
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	applyTestRules(t, wb, "event(\"h1\").\nderived(X) :- event(X).\n")
+
+	sub := wb.bus.Subscribe()
+	defer sub.Close()
 
 	req, err := http.NewRequest(http.MethodPost, srv.URL+`/why/derived/1?fact=`+`derived("h1")`, nil)
 	if err != nil {
@@ -397,15 +435,12 @@ func TestHandleWhy_RendersExplanationIntoConsole(t *testing.T) {
 	defer whyResp.Body.Close()
 	io.Copy(io.Discard, whyResp.Body)
 
-	log := renderLog(wb, "query")
-	if !strings.Contains(log, "explain") {
-		t.Fatalf("expected an explain-kind entry in the query scrollback: %s", log)
+	out := collectWhyOutput(t, sub)
+	if !strings.Contains(out, `derived(&quot;h1&quot;)`) && !strings.Contains(out, `derived("h1")`) {
+		t.Fatalf("expected the derived fact in the rendered tree: %s", out)
 	}
-	if !strings.Contains(log, `derived(&quot;h1&quot;)`) && !strings.Contains(log, `derived("h1")`) {
-		t.Fatalf("expected the derived fact in the rendered tree: %s", log)
-	}
-	if !strings.Contains(log, "event") {
-		t.Fatalf("expected the base fact citation in the rendered tree: %s", log)
+	if !strings.Contains(out, "event") {
+		t.Fatalf("expected the base fact citation in the rendered tree: %s", out)
 	}
 }
 
@@ -416,11 +451,10 @@ func TestHandleWhy_UnknownFactRendersError(t *testing.T) {
 	srv := startTestServer(wb)
 	defer srv.Close()
 
-	resp := postSignals(t, srv, "/rules/run", map[string]any{
-		"rulesText": "event(\"h1\").\nderived(X) :- event(X).\n",
-	})
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	applyTestRules(t, wb, "event(\"h1\").\nderived(X) :- event(X).\n")
+
+	sub := wb.bus.Subscribe()
+	defer sub.Close()
 
 	req, err := http.NewRequest(http.MethodPost, srv.URL+`/why/derived/1?fact=`+`derived("nope")`, nil)
 	if err != nil {
@@ -434,9 +468,9 @@ func TestHandleWhy_UnknownFactRendersError(t *testing.T) {
 	defer whyResp.Body.Close()
 	io.Copy(io.Discard, whyResp.Body)
 
-	log := renderLog(wb, "query")
-	if !strings.Contains(log, "no such derived fact") {
-		t.Fatalf("expected a not-found error entry: %s", log)
+	out := collectWhyOutput(t, sub)
+	if !strings.Contains(out, "no such derived fact") {
+		t.Fatalf("expected a not-found error in #why-output: %s", out)
 	}
 }
 
@@ -452,17 +486,8 @@ func TestHandleFacts_WhyButtonOnlyOnDerivedPredicate(t *testing.T) {
 	srv := startTestServer(wb)
 	defer srv.Close()
 
-	resp, err := postSignalsSetSchema(t, srv)
-	if err != nil {
-		t.Fatalf("set schema: %v", err)
-	}
-	resp.Body.Close()
-
-	runResp := postSignals(t, srv, "/rules/run", map[string]any{
-		"rulesText": `derived(X) :- event(X, _, _).`,
-	})
-	io.Copy(io.Discard, runResp.Body)
-	runResp.Body.Close()
+	applyTestSchema(t, wb, syntheticSchemaYAML)
+	applyTestRules(t, wb, `derived(X) :- event(X, _, _).`)
 
 	baseResp, err := http.Get(srv.URL + "/facts/event/3")
 	if err != nil {
@@ -579,11 +604,7 @@ func TestHandleFacts_WhyButtonOnBoolAndNullTerms(t *testing.T) {
 	srv := startTestServer(wb)
 	defer srv.Close()
 
-	resp := postSignals(t, srv, "/rules/run", map[string]any{
-		"rulesText": "event(\"h1\").\nflagged(X, true) :- event(X).\nunset(X, null) :- event(X).\n",
-	})
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	applyTestRules(t, wb, "event(\"h1\").\nflagged(X, true) :- event(X).\nunset(X, null) :- event(X).\n")
 
 	flaggedResp, err := http.Get(srv.URL + "/facts/flagged/2")
 	if err != nil {

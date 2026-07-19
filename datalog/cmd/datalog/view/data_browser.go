@@ -96,7 +96,7 @@ type DataRowInfo struct {
 func DataRow(file string, row int, raw string, selected bool) html.Content {
 	li := tag.New("li").
 		Set("id", fmt.Sprintf("data-row-%d", row)).
-		Set("data-on:click", fmt.Sprintf("@get('/jsonfacts/test/%s/%d')", pathEscape(file), row)).
+		Set("data-on:click", fmt.Sprintf("@get('/data/select/%s/%d')", pathEscape(file), row)).
 		Add(html.Text(raw))
 	if selected {
 		li = li.Class("selected")

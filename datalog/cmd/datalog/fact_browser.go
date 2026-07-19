@@ -131,17 +131,16 @@ func (wb *workbench) handleWhy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if arityErr != nil {
-		wb.consoleAppend("query", "error", html.Text("why: invalid arity in request path"))
+		wb.publishWhyError("why: invalid arity in request path")
 		return
 	}
 	fact, err := parseFactStatement(factText)
 	if err != nil {
-		wb.consoleAppend("query", "error", html.Text("why: "+err.Error()))
+		wb.publishWhyError("why: " + err.Error())
 		return
 	}
 	if fact.Name != name || len(fact.Terms) != arity {
-		wb.consoleAppend("query", "error", html.Text(
-			"why: fact does not match the row's predicate/arity"))
+		wb.publishWhyError("why: fact does not match the row's predicate/arity")
 		return
 	}
 
@@ -156,10 +155,17 @@ func (wb *workbench) handleWhy(w http.ResponseWriter, r *http.Request) {
 	// N frontends" rule (serve.go).
 	out, err := wb.h.explain(ctx, explainInput{Fact: factText})
 	if err != nil {
-		wb.consoleAppend("query", "error", html.Text("why: "+err.Error()))
+		wb.publishWhyError("why: " + err.Error())
 		return
 	}
-	wb.consoleAppend("query", "explain", view.ExplainEntry(factText, out.Tree))
+	wb.bus.Publish(datastar.Elements(view.WhyOutput(view.WhyResult(factText, out.Tree))))
+}
+
+// publishWhyError renders a why? failure into the Facts tab's #why-output
+// surface on every open page — the same div a success replaces, so only
+// one why? outcome shows at a time.
+func (wb *workbench) publishWhyError(msg string) {
+	wb.bus.Publish(datastar.Elements(view.WhyOutput(view.WhyError(msg))))
 }
 
 // renderFactRow renders one fact's terms: scalars via constantToJSON's

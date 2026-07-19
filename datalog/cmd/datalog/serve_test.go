@@ -8,10 +8,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -227,89 +227,83 @@ func postSignals(t *testing.T, srv *httptest.Server, path string, signals map[st
 
 func TestHTTP_GoldenLoop(t *testing.T) {
 	wb := newMordorWorkbench(t)
+	cm, err := newConversationManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("newConversationManager: %v", err)
+	}
+	wb.conversations = cm
 	srv := startTestServer(wb)
 	defer srv.Close()
 
-	// GET / redirects to the Facts view.
+	// GET / with no conversations renders the empty-state page: rail with
+	// the mode picker on the left, browser tabs on the right, with the
+	// preloaded schema and rules text parked in their interim panels.
 	resp, err := srv.Client().Get(srv.URL + "/")
 	if err != nil {
 		t.Fatalf("GET /: %v", err)
 	}
 	defer resp.Body.Close()
-	if got := resp.Request.URL.Path; got != "/facts" {
-		t.Errorf("GET /: expected redirect to /facts, landed on %s", got)
-	}
-
-	// The Facts view (Data Browser | jsonfacts Editor | Fact Browser base)
-	// carries the preloaded schema text; the Rules view (Fact Browser base |
-	// Datalog Editor | Fact Browser derived) carries the preloaded rules
-	// text.
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("reading GET /facts body: %v", err)
+		t.Fatalf("reading GET / body: %v", err)
 	}
-	factsPage := string(body)
+	page := string(body)
 
 	// html-go renders attribute values with single quotes (id='...'), not
 	// double quotes.
 	for _, id := range []string{
+		`id='conversations'`,
+		`id='conv-rail'`,
+		`id='conv-empty'`,
+		`id='browser'`,
 		`id='pane-data-browser'`,
-		`id='pane-jsonfacts-editor'`,
 		`id='pane-fact-browser-base'`,
-	} {
-		if !strings.Contains(factsPage, id) {
-			t.Errorf("GET /facts: missing pane %s", id)
-		}
-	}
-	if !strings.Contains(factsPage, "net_conn") {
-		t.Error("GET /facts: preloaded schema text not present in page (expected to contain \"net_conn\")")
-	}
-
-	rulesResp, err := http.Get(srv.URL + "/rules")
-	if err != nil {
-		t.Fatalf("GET /rules: %v", err)
-	}
-	defer rulesResp.Body.Close()
-	rulesBody, err := io.ReadAll(rulesResp.Body)
-	if err != nil {
-		t.Fatalf("reading GET /rules body: %v", err)
-	}
-	rulesPage := string(rulesBody)
-
-	for _, id := range []string{
-		`id='pane-fact-browser-base'`,
-		`id='pane-rules-editor'`,
 		`id='pane-fact-browser-derived'`,
 	} {
-		if !strings.Contains(rulesPage, id) {
-			t.Errorf("GET /rules: missing pane %s", id)
+		if !strings.Contains(page, id) {
+			t.Errorf("GET /: missing %s", id)
 		}
 	}
-	if !strings.Contains(rulesPage, "lateral_movement") {
-		t.Error("GET /rules: preloaded rules text not present in page (expected to contain \"lateral_movement\")")
+	if !strings.Contains(page, "net_conn") {
+		t.Error("GET /: preloaded schema text not present in the Schema panel (expected to contain \"net_conn\")")
+	}
+	if !strings.Contains(page, "lateral_movement") {
+		t.Error("GET /: preloaded rules text not present in the Rules panel (expected to contain \"lateral_movement\")")
 	}
 
-	// POST /rules/run with the mordor rules plus the lateral_movement query
-	// returns the known row in the #rules-results fragment.
-	rulesData, err := os.ReadFile(filepath.Join("..", "..", "examples", "mordor", "rules.dl"))
+	// Creating a conversation is a plain form POST that redirects to the
+	// new conversation's page, which carries the composer and rail entry.
+	form := url.Values{"mode": {"query"}}
+	convResp, err := srv.Client().PostForm(srv.URL+"/conversations", form)
 	if err != nil {
-		t.Fatalf("reading rules.dl: %v", err)
+		t.Fatalf("POST /conversations: %v", err)
 	}
-	rulesText := string(rulesData) + "\nlateral_movement(User, Src, Target, Path)?\n"
-
-	resp = postSignals(t, srv, "/rules/run", map[string]any{"rulesText": rulesText})
-	defer resp.Body.Close()
-	events := sseFragments(t, resp.Body, 10)
-	joined := strings.Join(events, "\n")
-
-	if !strings.Contains(joined, "rules-results") {
-		t.Fatalf("POST /rules/run: no #rules-results fragment in response:\n%s", joined)
+	defer convResp.Body.Close()
+	if got := convResp.Request.URL.Path; !strings.HasPrefix(got, "/c/") {
+		t.Fatalf("POST /conversations: expected redirect to /c/{id}, landed on %s", got)
 	}
-	for _, want := range []string{"pgustavo", "172.18.39.5", "WORKSTATION6.theshire.local", "GruntHTTP.exe"} {
-		if !strings.Contains(joined, want) {
-			t.Errorf("POST /rules/run: expected result row to contain %q, got:\n%s", want, joined)
+	convBody, err := io.ReadAll(convResp.Body)
+	if err != nil {
+		t.Fatalf("reading conversation page: %v", err)
+	}
+	convPage := string(convBody)
+	for _, want := range []string{`id='composer'`, `class='badge mode-query'`, `id='send'`} {
+		if !strings.Contains(convPage, want) {
+			t.Errorf("conversation page missing %s", want)
 		}
 	}
+
+	// GET / now lands on that newest conversation instead of the empty
+	// state.
+	again, err := srv.Client().Get(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("GET / (second): %v", err)
+	}
+	defer again.Body.Close()
+	if got := again.Request.URL.Path; !strings.HasPrefix(got, "/c/") {
+		t.Errorf("GET / with conversations: expected redirect to /c/{id}, landed on %s", got)
+	}
+	io.Copy(io.Discard, again.Body)
 }
 
 // -- 2. /events subscription: subscribe-before-render + mutation patch ------
@@ -380,14 +374,12 @@ func TestHTTP_EventsSubscription(t *testing.T) {
 		t.Fatal("timed out waiting for initial /events frame")
 	}
 
-	// Trigger a mutation via POST /rules/run (Run publishes on success).
-	rulesData, err := os.ReadFile(filepath.Join("..", "..", "examples", "mordor", "rules.dl"))
-	if err != nil {
-		t.Fatalf("reading rules.dl: %v", err)
-	}
-	mutResp := postSignals(t, srv, "/rules/run", map[string]any{"rulesText": string(rulesData)})
-	io.Copy(io.Discard, mutResp.Body)
-	mutResp.Body.Close()
+	// Trigger the session-changed fan-out directly (publishSessionChanged's
+	// documented contract: h.mu held). The mutation-to-publish linkage
+	// itself is covered end to end by TestMCP_InitializeAndPutRuleGroupPatchesBack.
+	wb.h.mu.Lock()
+	wb.publishSessionChanged()
+	wb.h.mu.Unlock()
 
 	// Assert a #predicates patch arrives on the subscription after the
 	// mutation.
@@ -527,37 +519,32 @@ func TestHTTP_ConfinementRejectsEscape(t *testing.T) {
 
 // -- 4. timeout / cancel -----------------------------------------------------
 
-// TestHTTP_CancelDuringRun exercises POST /cancel against an in-flight
-// /rules/run. A reliable timer-based "evaluation timed out" test would need
-// a combinatorial ruleset engineered to reliably exceed evalTimeout (5s)
-// without also making the test suite slow or flaky on a loaded CI box; the
-// mordor dataset's rules compile and evaluate in milliseconds, so there is
-// no readily available "genuinely slow but deterministic" ruleset to hang
-// off of here. Per the task's explicit allowance ("if a reliable
-// timer-based test is not achievable without flakiness, test cancellation
-// instead"), this test exercises the Global Cancel path instead: it starts
-// a Run, immediately fires /cancel, and asserts the run's own jobs entry is
-// gone afterward (i.e. Cancel reached the right key) — the deeper claim
-// that a cancelled context produces a clean, non-hanging response is already
-// covered unit-style by mcp_test.go's TestQuery_CancelledContext, which
-// exercises the same ctx.Err() checks in runQuery/seminaive that a real
-// mid-flight cancel would hit.
-func TestHTTP_CancelDuringRun(t *testing.T) {
+// TestHTTP_CancelDuringTurn exercises POST /cancel against an in-flight
+// conversation turn: Global Cancel must reach the turn's context through
+// the shared jobs set (the turn gate registers under it), ending the turn
+// with the "turn cancelled" note rather than leaving it running.
+func TestHTTP_CancelDuringTurn(t *testing.T) {
 	wb := newMordorWorkbench(t)
+	cm, err := newConversationManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("newConversationManager: %v", err)
+	}
+	wb.conversations = cm
 	srv := startTestServer(wb)
 	defer srv.Close()
 
-	rulesData, err := os.ReadFile(filepath.Join("..", "..", "examples", "mordor", "rules.dl"))
+	conv, err := cm.Create(conversationModeQuery)
 	if err != nil {
-		t.Fatalf("reading rules.dl: %v", err)
+		t.Fatalf("Create: %v", err)
 	}
+	blocking := &blockingDriver{release: make(chan struct{})}
+	wb.agent = blocking
+	wb.agentConvID = conv.ID
 
-	resp := postSignals(t, srv, "/rules/run", map[string]any{"rulesText": string(rulesData)})
-	defer resp.Body.Close()
+	resp := postSignals(t, srv, "/c/"+conv.ID+"/send", map[string]any{"prompt": "hang out"})
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 
-	// Fire Cancel while the run's SSE response may still be draining; this
-	// exercises the same code path a user's Cancel click would in a slow
-	// run, without depending on timing to observe an in-progress state.
 	cancelResp, err := http.Post(srv.URL+"/cancel", "", nil)
 	if err != nil {
 		t.Fatalf("POST /cancel: %v", err)
@@ -567,96 +554,31 @@ func TestHTTP_CancelDuringRun(t *testing.T) {
 		t.Errorf("POST /cancel: status = %d, want 204", cancelResp.StatusCode)
 	}
 
-	// Drain the run's response; it should complete (successfully or having
-	// observed cancellation) without hanging the test.
-	io.Copy(io.Discard, resp.Body)
+	waitFor(t, func() bool {
+		return strings.Contains(renderLog(wb, conv.ID), "turn cancelled")
+	})
+	// The gate releases via the send goroutine's LIFO defers just AFTER the
+	// cancelled note is appended — poll rather than race that window.
+	waitFor(t, func() bool {
+		_, running := wb.turnGate.Running()
+		return !running
+	})
 }
 
-// TestHTTP_SequentialRunsReflectLatest exercises stale suppression at the
-// handler level: two /rules/run requests for different rules text, run back
-// to back. handleRulesRun is job-gated (only one Run in flight at a time via
-// wb.jobs.Begin(rulesRunJobKey)), so the second call is serialized after the
-// first completes — genuine mid-flight staleness on THIS specific job key is
-// not directly observable via two sequential HTTP calls. What this asserts:
-// the final #rules-results fragment reflects the LAST call's rules text, not
-// a stale intermediate result — i.e. no interleaving artifact survives into
-// the final state. (This test previously also asserted a workbench-level
-// wb.gen token advanced across calls; that mechanism was dead — nothing
-// outside this handler's own single in-flight call could ever make a token
-// stale, since Begin already serializes every Run on rulesRunJobKey — and
-// was removed rather than kept alive just to be observed.)
-func TestHTTP_SequentialRunsReflectLatest(t *testing.T) {
-	dir := t.TempDir()
-	writeSyntheticData(t, dir, 3)
-	wb := newTestWorkbench(t, dir, "", nil, "test-token")
-	srv := startTestServer(wb)
-	defer srv.Close()
-
-	if _, err := postSignalsSetSchema(t, srv); err != nil {
-		t.Fatalf("priming schema: %v", err)
-	}
-
-	resp1 := postSignals(t, srv, "/rules/run", map[string]any{"rulesText": "foo(X) :- event(_, X, _).\nfoo(X)?\n"})
-	io.Copy(io.Discard, resp1.Body)
-	resp1.Body.Close()
-
-	resp2 := postSignals(t, srv, "/rules/run", map[string]any{"rulesText": "bar(X) :- event(_, X, _).\nbar(X)?\n"})
-	body2, _ := io.ReadAll(resp2.Body)
-	resp2.Body.Close()
-
-	joined := string(body2)
-	if !strings.Contains(joined, "bar") {
-		t.Errorf("second Run's response should reflect bar(X)? results, got:\n%s", joined)
-	}
-}
-
-// postSignalsSetSchema is a small helper for TestHTTP_StaleSuppression: it
-// applies syntheticSchemaYAML (from mcp_test.go) via POST /jsonfacts/apply
-// so the workbench has predicates to run rules against.
-func postSignalsSetSchema(t *testing.T, srv *httptest.Server) (*http.Response, error) {
+// applyTestSchema primes a workbench's schema through the same
+// prepareSchema/applySchemaLocked mechanism the schema CRUD tools use —
+// the v1 /jsonfacts/apply endpoint that tests used to POST died with the
+// textarea editors (workbench-v2 phase 2).
+func applyTestSchema(t *testing.T, wb *workbench, schemaYAML string) {
 	t.Helper()
-	resp := postSignals(t, srv, "/jsonfacts/apply", map[string]any{"schemaText": syntheticSchemaYAML})
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return resp, nil
-}
-
-// -- 5. busy gate -------------------------------------------------------------
-
-func TestHTTP_BusyGate(t *testing.T) {
-	wb := newMordorWorkbench(t)
-	srv := startTestServer(wb)
-	defer srv.Close()
-
-	rulesData, err := os.ReadFile(filepath.Join("..", "..", "examples", "mordor", "rules.dl"))
+	authoring, runtime, db, err := prepareSchema(schemaYAML, "yaml", wb.h.fsys, wb.h.confine)
 	if err != nil {
-		t.Fatalf("reading rules.dl: %v", err)
+		t.Fatalf("prepareSchema: %v", err)
 	}
-	rulesText := string(rulesData)
-
-	var wg sync.WaitGroup
-	results := make([]string, 2)
-	wg.Add(2)
-	for i := 0; i < 2; i++ {
-		i := i
-		go func() {
-			defer wg.Done()
-			resp := postSignals(t, srv, "/rules/run", map[string]any{"rulesText": rulesText})
-			body, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			results[i] = string(body)
-		}()
-	}
-	wg.Wait()
-
-	busyCount := 0
-	for _, r := range results {
-		if strings.Contains(r, "already running") {
-			busyCount++
-		}
-	}
-	if busyCount == 0 {
-		t.Errorf("expected at least one of two concurrent /rules/run calls to report \"already running\", got responses:\n1: %s\n2: %s", results[0], results[1])
+	wb.h.mu.Lock()
+	defer wb.h.mu.Unlock()
+	if _, err := wb.h.applySchemaLocked(schemaYAML, authoring, runtime, db); err != nil {
+		t.Fatalf("applySchemaLocked: %v", err)
 	}
 }
 

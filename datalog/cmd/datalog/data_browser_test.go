@@ -56,9 +56,7 @@ func TestHTTP_DataBrowserLoadMoreDoesNotNestOrDuplicate(t *testing.T) {
 	srv := startTestServer(wb)
 	defer srv.Close()
 
-	if _, err := postSignalsSetSchema(t, srv); err != nil {
-		t.Fatalf("priming schema: %v", err)
-	}
+	applyTestSchema(t, wb, syntheticSchemaYAML)
 
 	// GET /data/{file} (offset 0, an explicit re-select — exercises the
 	// same replace path handleDataList's auto-load also takes) primes the
@@ -167,9 +165,7 @@ declarations:
   - name: event
     use: "a process execution event"
 `
-	resp := postSignals(t, srv, "/jsonfacts/apply", map[string]any{"schemaText": schemaYAML})
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	applyTestSchema(t, wb, schemaYAML)
 
 	dataResp, err := http.Get(srv.URL + "/data/" + url.PathEscape("logs/events.jsonl"))
 	if err != nil {

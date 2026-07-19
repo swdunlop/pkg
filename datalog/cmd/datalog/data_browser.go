@@ -149,13 +149,13 @@ func readDataChunk(wb *workbench, ref string, offset, limit int) ([]view.DataRow
 	return rows, hasMore, nil
 }
 
-// handleJSONFactsTest is the Data Browser's "Test" button handler
-// (GET /jsonfacts/test/{file}/{row}): selects that record as the jsonfacts
-// editor's evaluation target and, in the same response, patches the newly
-// and previously selected #data-row-N elements (to move the highlight) and
-// #jsonfacts-output (live extraction of that single record against the
-// CURRENT session config).
-func (wb *workbench) handleJSONFactsTest(w http.ResponseWriter, r *http.Request) {
+// handleDataSelect (GET /data/select/{file}/{row}) selects one record as
+// the Data tab's current selection — the `!` composer command's evaluation
+// target (doc/features/workbench-v2.md design decision 8; the v1 Test
+// button this selection used to drive died with the jsonfacts editor) —
+// and patches the newly and previously selected #data-row-N elements to
+// move the highlight.
+func (wb *workbench) handleDataSelect(w http.ResponseWriter, r *http.Request) {
 	stream, err := datastar.RequestStream(w, r)
 	if err != nil {
 		return
@@ -200,13 +200,6 @@ func (wb *workbench) handleJSONFactsTest(w http.ResponseWriter, r *http.Request)
 	if prevValid && prevFile == file && prevRow != row {
 		_ = stream.Emit(datastar.Elements(view.DataRow(prevFile, prevRow, prevRecord, false)))
 	}
-
-	lines, extractErr := wb.extractSelectedRow()
-	if extractErr != nil {
-		_ = stream.Emit(datastar.Elements(view.JSONFactsOutputMessage(extractErr.Error())))
-		return
-	}
-	_ = stream.Emit(datastar.Elements(view.JSONFactsOutput(lines)))
 }
 
 // readDataLine opens ref (already confined) and returns the row-th

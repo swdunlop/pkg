@@ -7,30 +7,29 @@ import (
 	html "github.com/swdunlop/html-go"
 )
 
-// TestConsoleSendButtonGatesOnQueryBusy is the regression for the console
-// send button (#console-send) not being gated on $busy === 'query': before
-// this fix, its data-attr:disabled expression only checked 'run'/'apply',
-// so starting an agent turn while a query was in flight clobbered the
-// query's Stop affordance instead of being blocked, and the query's own
-// $busy '' cleanup on completion (publishBusy is last-writer-wins across
-// distinct job keys) could then stomp the agent turn's busy state mid-turn.
-// This asserts the button's disabled expression mirrors
-// BusyActionButton's own "$busy && $busy !== <own key>" gate (page.go) —
-// disabled whenever $busy holds any key other than the button's own
-// 'agent' — rather than a hardcoded list of the other keys that has to be
-// kept in sync by hand.
-func TestConsoleSendButtonGatesOnQueryBusy(t *testing.T) {
-	out := string(html.Append(nil, Console(nil, nil)))
+// TestComposerSendButtonGatesOnOtherBusy is the regression (carried over
+// from the v1 console drawer's send button) for the composer send button's
+// disabled expression: it must disable whenever $busy holds ANY state that
+// isn't this conversation's own running turn — another conversation's turn
+// ($busy 'agent' but a different $busyConv) and every other busy key
+// ('run', 'apply', 'query') alike — rather than a hardcoded list of other
+// keys kept in sync by hand. Before the v1 fix, 'query' was missing from
+// the list, so starting a turn mid-query clobbered the query's Stop
+// affordance and the query's $busy ” cleanup could stomp the running
+// turn's busy state (publishBusy is last-writer-wins).
+func TestComposerSendButtonGatesOnOtherBusy(t *testing.T) {
+	out := string(html.Append(nil, Composer("cid123")))
 
-	i := strings.Index(out, `id='console-send'`)
+	i := strings.Index(out, `id='send'`)
 	if i < 0 {
-		t.Fatalf("console-send button not found in rendered console:\n%s", out)
+		t.Fatalf("send button not found in rendered composer:\n%s", out)
 	}
 	// The disabled expression sits on the same element; scanning a small
 	// window after the id avoids depending on html-go's attribute order.
-	window := out[i:min(i+400, len(out))]
+	window := out[i:min(i+500, len(out))]
 
-	if !strings.Contains(window, `data-attr:disabled='$busy &amp;&amp; $busy !== &apos;agent&apos;'`) {
-		t.Fatalf("console-send's disabled expression must gate on any busy key other than its own ('agent'), including 'query'; got window:\n%s", window)
+	want := `data-attr:disabled='$busy &amp;&amp; !($busy === &apos;agent&apos; &amp;&amp; $busyConv === &apos;cid123&apos;)'`
+	if !strings.Contains(window, want) {
+		t.Fatalf("send's disabled expression must gate on any busy state other than this conversation's own turn; got window:\n%s", window)
 	}
 }
