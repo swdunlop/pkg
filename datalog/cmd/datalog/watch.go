@@ -52,6 +52,7 @@ type reloadStatus struct {
 func (wb *workbench) recordReload(status reloadStatus) {
 	wb.reloadMu.Lock()
 	wb.lastReload = status
+	wb.reloadSeq++
 	wb.reloadMu.Unlock()
 
 	switch {

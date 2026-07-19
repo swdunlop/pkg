@@ -10,6 +10,7 @@ import (
 	"github.com/mark3labs/kit/pkg/kit"
 	html "github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/datastar"
+	"github.com/swdunlop/html-go/tag"
 	"swdunlop.dev/pkg/datalog/cmd/datalog/view"
 )
 
@@ -158,6 +159,10 @@ func (wb *workbench) handleConversationDelete(w http.ResponseWriter, r *http.Req
 	}
 	wb.dropConversationDriver(id)
 	wb.console.Clear(id)
+	wb.cmdMu.Lock()
+	delete(wb.pendingCmds, id)
+	delete(wb.reloadSeen, id)
+	wb.cmdMu.Unlock()
 	if err := wb.conversations.Delete(id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -204,6 +209,14 @@ func (wb *workbench) handleConversationSend(w http.ResponseWriter, r *http.Reque
 		wb.consoleAppend(id, "error", html.Text(fmt.Sprintf("conversation unavailable: %v", err)))
 		return
 	}
+
+	// `?`/`!` commands run and return — a command never grants the agent a
+	// turn (design decision 8; commands_composer.go).
+	if kind, rest, isCmd := composerCommand(text); isCmd {
+		_ = stream.Emit(datastar.Signal(map[string]any{"prompt": ""}))
+		wb.runComposerCommand(id, info.Mode, kind, rest)
+		return
+	}
 	name := conversationTitle(*info)
 	if name == "" {
 		name = "a new conversation"
@@ -248,10 +261,18 @@ func (wb *workbench) handleConversationSend(w http.ResponseWriter, r *http.Reque
 	wb.consoleAppend(id, "user", html.Text(text))
 	wb.publishBusyConv(id, name)
 
+	// The prompt the model sees carries the workbench preamble (design
+	// decision 8): command/result pairs run since its last turn, plus a
+	// disk-change notice when fsnotify reloaded between turns. Consumed
+	// under the gate, so a racing command lands in the NEXT turn's
+	// preamble, never a torn half of this one. The transcript shows only
+	// the user's own text — the commands already rendered when they ran.
+	promptText := framePromptWithPreamble(wb.consumePreamble(id), text)
+
 	go func() {
 		defer done()
 		defer wb.publishBusy("")
-		wb.runAgentTurn(jobCtx, driver, text, id)
+		wb.runAgentTurn(jobCtx, driver, promptText, id)
 		wb.publishRail()
 	}()
 }
@@ -334,7 +355,7 @@ func (wb *workbench) seedTranscript(info *conversationInfo) {
 		return // unreadable history is not fatal to the page; live turns still work
 	}
 	defer tm.Close()
-	for _, entry := range renderSessionHistory(tm.GetLLMMessages()) {
+	for _, entry := range renderSessionHistory(tm) {
 		wb.console.Append(info.ID, entry.kind, entry.content)
 	}
 }
@@ -345,13 +366,22 @@ type historyEntry struct {
 	content html.Content
 }
 
-// renderSessionHistory projects a kit session's message history into the
-// transcript's entry vocabulary — the same shapes runAgentTurn streams
-// live (user/agent/thought/tool), so a resumed conversation reads
-// identically to the turn as it happened. Tool results are correlated to
-// their calls by ToolCallID first, so each tool entry renders complete
-// (call + result) the way a live entry ends up after its result morph.
-func renderSessionHistory(msgs []kit.LLMMessage) []historyEntry {
+// renderSessionHistory projects a kit session into the transcript's entry
+// vocabulary — the same shapes runAgentTurn streams live
+// (user/agent/thought/tool), so a resumed conversation reads identically
+// to the turn as it happened. It walks the session tree's current branch
+// so persisted `?`/`!` command entries (commandExtType extension data,
+// design decision 8) land in order BETWEEN the turns they actually ran
+// between, not lumped at either end. Tool results are correlated to their
+// calls by ToolCallID first, so each tool entry renders complete (call +
+// result) the way a live entry ends up after its result morph. The user's
+// prompt text is stripped of any workbench preamble framing
+// (framePromptWithPreamble) so the transcript shows what the human typed,
+// as it did live.
+func renderSessionHistory(tm *kit.TreeManager) []historyEntry {
+	sm := kit.NewTreeManagerAdapter(tm)
+	msgs := tm.GetLLMMessages()
+
 	results := map[string]agentEvent{}
 	for _, msg := range msgs {
 		if string(msg.Role) != string(kit.LLMRoleTool) {
@@ -365,11 +395,21 @@ func renderSessionHistory(msgs []kit.LLMMessage) []historyEntry {
 		}
 	}
 
-	var out []historyEntry
-	for _, msg := range msgs {
+	// Persisted command entries, keyed by tree-entry id so the branch walk
+	// below can render each at its own position.
+	cmdEntries := map[string]commandRecord{}
+	for _, e := range sm.GetExtensionData(commandExtType) {
+		var rec commandRecord
+		if json.Unmarshal([]byte(e.Data), &rec) == nil {
+			cmdEntries[e.ID] = rec
+		}
+	}
+
+	renderMessage := func(msg kit.LLMMessage) []historyEntry {
+		var out []historyEntry
 		switch string(msg.Role) {
 		case string(kit.LLMRoleUser):
-			if text := messageText(msg); text != "" {
+			if text := strippedPreamble(messageText(msg)); text != "" {
 				out = append(out, historyEntry{kind: "user", content: html.Text(text)})
 			}
 		case string(kit.LLMRoleAssistant):
@@ -393,8 +433,55 @@ func renderSessionHistory(msgs []kit.LLMMessage) []historyEntry {
 				}
 			}
 		}
+		return out
+	}
+
+	var out []historyEntry
+	msgIdx := 0
+	for _, be := range sm.GetCurrentBranch() {
+		if rec, ok := cmdEntries[be.ID]; ok {
+			out = append(out, historyEntry{kind: "query", content: commandHistoryEntry(rec)})
+			continue
+		}
+		if string(be.Type) == "message" && msgIdx < len(msgs) {
+			out = append(out, renderMessage(msgs[msgIdx])...)
+			msgIdx++
+		}
+	}
+	// A branch shape this walk doesn't recognize (compaction collapsing
+	// entries, a future kit format change) must not silently drop turns:
+	// render any messages the walk didn't reach, unpositioned but present.
+	for ; msgIdx < len(msgs); msgIdx++ {
+		out = append(out, renderMessage(msgs[msgIdx])...)
 	}
 	return out
+}
+
+// commandHistoryEntry renders a persisted command/result pair on resume —
+// the plain-text sibling of the live rendering (runComposerCommand), which
+// carried richer HTML the record deliberately doesn't store.
+func commandHistoryEntry(rec commandRecord) html.Content {
+	marker := "? "
+	if rec.Kind == "expr" {
+		marker = "! "
+	}
+	return html.Group{
+		queryEcho(marker + rec.Input),
+		tag.New("pre", html.Text(rec.Result)),
+	}
+}
+
+// strippedPreamble removes the workbench-context framing a persisted
+// prompt may carry (framePromptWithPreamble) so a resumed transcript shows
+// the human's own words, as the live transcript did.
+func strippedPreamble(text string) string {
+	const endMark = "[end workbench context]\n\n"
+	if strings.HasPrefix(text, "[workbench context]\n") {
+		if i := strings.Index(text, endMark); i >= 0 {
+			return text[i+len(endMark):]
+		}
+	}
+	return text
 }
 
 // messageText joins a message's plain-text parts — a user message is

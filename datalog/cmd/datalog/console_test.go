@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -60,6 +61,12 @@ type fakeDriver struct {
 	answerable bool
 	answerErr  error
 	answered   []answerCall
+
+	// promptMu/prompts record every Prompt text for assertions on what the
+	// model actually received (the preamble tests); guarded because the
+	// send path runs turns on their own goroutine.
+	promptMu sync.Mutex
+	prompts  []string
 }
 
 type answerCall struct {
@@ -67,6 +74,9 @@ type answerCall struct {
 }
 
 func (d *fakeDriver) Prompt(ctx context.Context, text string, sink func(agentEvent)) (string, error) {
+	d.promptMu.Lock()
+	d.prompts = append(d.prompts, text)
+	d.promptMu.Unlock()
 	for _, ev := range d.events {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
@@ -74,6 +84,12 @@ func (d *fakeDriver) Prompt(ctx context.Context, text string, sink func(agentEve
 		sink(ev)
 	}
 	return d.stopReason, d.err
+}
+
+func (d *fakeDriver) promptTexts() []string {
+	d.promptMu.Lock()
+	defer d.promptMu.Unlock()
+	return append([]string(nil), d.prompts...)
 }
 
 func (d *fakeDriver) Answer(requestID, optionID string) error {

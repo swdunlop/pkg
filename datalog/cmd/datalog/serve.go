@@ -174,6 +174,8 @@ func newWorkbench(dataDir, configPath string, ruleFiles []string, rulesDir strin
 		agentCfg:    agentCfg,
 		mcpToken:    token,
 		pendingPerm: map[string]pendingPermission{},
+		pendingCmds: map[string][]commandRecord{},
+		reloadSeen:  map[string]int{},
 	}
 	wb.turnGate = newConversationTurnGate(wb.jobs)
 
@@ -408,12 +410,23 @@ type workbench struct {
 	// workbench-v2.md design decision 3: "Parse/compile errors land in a
 	// persistent status surface and are visible to the next agent turn"):
 	// the fsnotify watcher's most recent reload outcome — what changed, or
-	// why the reload was refused and the last good state kept. Phase 2's
-	// agent-turn preamble and status rendering consume this; for phase 1d it
-	// is recorded here (under reloadMu, NOT h.mu — status reads must not
-	// contend with the session mutex) and logged to stderr.
+	// why the reload was refused and the last good state kept. Recorded
+	// under reloadMu, NOT h.mu — status reads must not contend with the
+	// session mutex. reloadSeq counts recordReload calls so the agent-turn
+	// preamble (commands_composer.go's consumePreamble) can tell "changed
+	// since this conversation's last turn" from "ever changed."
 	reloadMu   sync.Mutex
 	lastReload reloadStatus
+	reloadSeq  int
+
+	// cmdMu guards the composer-command bookkeeping (commands_composer.go):
+	// pendingCmds holds each conversation's command/result pairs run since
+	// its last turn (consumed into the next prompt's preamble), and
+	// reloadSeen holds each conversation's reload watermark (the reloadSeq
+	// value as of its last turn).
+	cmdMu       sync.Mutex
+	pendingCmds map[string][]commandRecord
+	reloadSeen  map[string]int
 
 	// mcpToken is the bearer token required on /mcp (doc/features/web-ui.md
 	// Deployment section). Generated at startup if --mcp-token was not
