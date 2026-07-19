@@ -248,3 +248,56 @@ func TestRenderSessionHistoryInterleavesCommands(t *testing.T) {
 		t.Fatalf("stripped prompt lost the user's text: %s", all)
 	}
 }
+
+// acpishDriver is fakeDriver plus the NeedsModePreamble marker acpDriver
+// carries — the shape of a driver that cannot hold a per-conversation
+// system prompt.
+type acpishDriver struct{ fakeDriver }
+
+func (d *acpishDriver) NeedsModePreamble() bool { return true }
+
+// TestModePreambleFirstPromptOnly pins design decision 7's ACP leg: a
+// driver needing in-band mode instructions gets them on the
+// conversation's first prompt only, and the conversation still gets its
+// rail title through the manager's offline fallback (no SetName on the
+// driver).
+func TestModePreambleFirstPromptOnly(t *testing.T) {
+	wb, conv := newConversationWorkbench(t, conversationModeQuery)
+	srv := startTestServer(wb)
+	defer srv.Close()
+
+	driver := &acpishDriver{fakeDriver{events: []agentEvent{{Kind: "message", Text: "ok"}}, stopReason: "stop"}}
+	wb.agent = driver
+	wb.agentConvID = conv.ID
+
+	resp := postSignals(t, srv, "/c/"+conv.ID+"/send", map[string]any{"prompt": "what is loaded?"})
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	waitFor(t, func() bool { return len(driver.promptTexts()) == 1 })
+
+	first := driver.promptTexts()[0]
+	if !strings.Contains(first, "[conversation mode]") || !strings.Contains(first, "QUERY MODE") {
+		t.Fatalf("first prompt missing mode instructions: %q", first)
+	}
+	if !strings.HasSuffix(first, "what is loaded?") {
+		t.Fatalf("user text must end the first prompt: %q", first)
+	}
+
+	resp = postSignals(t, srv, "/c/"+conv.ID+"/send", map[string]any{"prompt": "and derived?"})
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	waitFor(t, func() bool { return len(driver.promptTexts()) == 2 })
+	if second := driver.promptTexts()[1]; strings.Contains(second, "[conversation mode]") {
+		t.Fatalf("mode instructions repeated on a later prompt: %q", second)
+	}
+
+	// The offline title fallback named the conversation from the first
+	// message even though the driver has no SetName.
+	info, err := wb.conversations.Get(conv.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if info.Name != "what is loaded?" {
+		t.Fatalf("conversation title = %q, want the first message", info.Name)
+	}
+}

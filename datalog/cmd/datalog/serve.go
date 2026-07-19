@@ -166,16 +166,17 @@ func newWorkbench(dataDir, configPath string, ruleFiles []string, rulesDir strin
 	h.registerTools(srv)
 
 	wb := &workbench{
-		h:           h,
-		bus:         newBus(),
-		jobs:        newJobs(),
-		console:     &consoleLog{},
-		mcpSrv:      srv,
-		agentCfg:    agentCfg,
-		mcpToken:    token,
-		pendingPerm: map[string]pendingPermission{},
-		pendingCmds: map[string][]commandRecord{},
-		reloadSeen:  map[string]int{},
+		h:             h,
+		bus:           newBus(),
+		jobs:          newJobs(),
+		console:       &consoleLog{},
+		mcpSrv:        srv,
+		agentCfg:      agentCfg,
+		mcpToken:      token,
+		pendingPerm:   map[string]pendingPermission{},
+		pendingCmds:   map[string][]commandRecord{},
+		reloadSeen:    map[string]int{},
+		modePreambled: map[string]bool{},
 	}
 	wb.turnGate = newConversationTurnGate(wb.jobs)
 
@@ -427,6 +428,10 @@ type workbench struct {
 	cmdMu       sync.Mutex
 	pendingCmds map[string][]commandRecord
 	reloadSeen  map[string]int
+	// modePreambled marks conversations whose ACP driver already received
+	// their mode instructions in-band (commands_composer.go's
+	// frameModePreamble); kit conversations never enter it.
+	modePreambled map[string]bool
 
 	// mcpToken is the bearer token required on /mcp (doc/features/web-ui.md
 	// Deployment section). Generated at startup if --mcp-token was not

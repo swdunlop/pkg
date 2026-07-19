@@ -254,6 +254,17 @@ func (wb *workbench) handleConversationSend(w http.ResponseWriter, r *http.Reque
 				_ = namer.SetName(title)
 				name = title
 			}
+		} else if info.Name == "" {
+			// A driver with no session of its own (ACP) still gets a rail
+			// title: the manager's offline append is safe here precisely
+			// because no kit instance holds the file. Guarded on Name ==
+			// "" so a restart (which resets MessageCount to the persisted
+			// zero — ACP turns never append messages) cannot overwrite an
+			// earlier title with a later first-send.
+			if title := truncateTitle(text, conversationTitleMaxLen); title != "" {
+				_ = wb.conversations.AutoTitle(id, title)
+				name = title
+			}
 		}
 	}
 
@@ -268,6 +279,15 @@ func (wb *workbench) handleConversationSend(w http.ResponseWriter, r *http.Reque
 	// preamble, never a torn half of this one. The transcript shows only
 	// the user's own text — the commands already rendered when they ran.
 	promptText := framePromptWithPreamble(wb.consumePreamble(id), text)
+
+	// Design decision 7's ACP leg: a driver that cannot carry a
+	// per-conversation system prompt (acpDriver — the agent subprocess owns
+	// its own) gets the mode instructions as a preamble on the
+	// conversation's FIRST prompt instead. Instruction-only scoping: the
+	// shared /mcp mount still exposes the full tool surface to an ACP
+	// agent — per-conversation tool filtering (a conversation-identity
+	// bearer token) stays deferred per the feature doc's risk note.
+	promptText = wb.frameModePreamble(driver, id, info.Mode, promptText)
 
 	go func() {
 		defer done()

@@ -488,6 +488,12 @@ func (d *acpDriver) Answer(requestID, optionID string) error {
 // graceful-then-forceful sequence — Close is only called after the driver
 // is already being discarded (dropAgentDriver, Clear), so there is no
 // in-flight turn whose graceful stop reason matters anymore.
+// NeedsModePreamble marks this driver for in-band mode instructions on a
+// conversation's first prompt (design decision 7's ACP leg): the agent
+// subprocess owns its own system prompt, so the workbench cannot install a
+// per-conversation one the way newConversationKit does for kit.
+func (d *acpDriver) NeedsModePreamble() bool { return true }
+
 func (d *acpDriver) Close() error {
 	if d.cmd.Process == nil {
 		return nil

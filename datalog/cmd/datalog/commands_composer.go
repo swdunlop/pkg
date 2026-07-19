@@ -349,3 +349,27 @@ func framePromptWithPreamble(preamble, text string) string {
 	}
 	return "[workbench context]\n" + preamble + "\n[end workbench context]\n\n" + text
 }
+
+// frameModePreamble prepends the conversation's mode instructions to the
+// FIRST prompt sent through a driver that needs them in-band (design
+// decision 7: ACP conversations get the same mode choice, with "mode
+// instructions ride the first prompt as preamble" — the kit driver
+// carries them as its system prompt instead and never matches here).
+// Tracked in memory per conversation: an ACP session is not resumable
+// across restarts anyway (decision 7), so a restart re-sending the
+// instructions on the next first prompt is correct, not a bug.
+func (wb *workbench) frameModePreamble(driver agentDriver, convID string, mode conversationMode, text string) string {
+	np, ok := driver.(interface{ NeedsModePreamble() bool })
+	if !ok || !np.NeedsModePreamble() {
+		return text
+	}
+	wb.cmdMu.Lock()
+	sent := wb.modePreambled[convID]
+	wb.modePreambled[convID] = true
+	wb.cmdMu.Unlock()
+	if sent {
+		return text
+	}
+	return "[conversation mode]\n" + conversationSystemPrompt(mode) +
+		"\nUse only the tools this mode describes, even if others are reachable.\n[end conversation mode]\n\n" + text
+}
