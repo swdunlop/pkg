@@ -18,7 +18,8 @@
 //
 // A [Config] contains three sections:
 //
-//   - Sources -- map JSONL files to predicates via [Mapping] entries
+//   - Sources -- map JSONL files (optionally gzip-compressed, by .gz
+//     extension) to predicates via [Mapping] entries
 //   - Matchers -- apply string pattern matching to loaded facts
 //   - Declarations -- name predicate terms for structured JSONL output
 //

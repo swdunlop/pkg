@@ -31,6 +31,9 @@ go.work.sum
 # .idea/
 # .vscode/
 
+# Downloaded datasets (see datalog/examples/optc/README.md)
+datalog/examples/optc/data/
+
 # Private planning notes
 TODO.md
 notes

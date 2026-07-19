@@ -3,6 +3,7 @@ package jsonfacts
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -171,7 +172,21 @@ func loadSource(src Source, fsys fs.FS, counter *idCounter, onMappingError func(
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
+	// A .gz source is decompressed transparently, so large datasets (e.g.
+	// the OpTC eCAR release, which expands ~10x) can stay compressed on
+	// disk. Extension-based rather than sniffed: a mis-named file should
+	// fail loudly here, not load as JSONL whose first line is gzip bytes.
+	var r io.Reader = f
+	if strings.HasSuffix(src.File, ".gz") {
+		gz, err := gzip.NewReader(f)
+		if err != nil {
+			return nil, fmt.Errorf("opening %s: %w", src.File, err)
+		}
+		defer gz.Close()
+		r = gz
+	}
+
+	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
 	lineNum := 0
 
