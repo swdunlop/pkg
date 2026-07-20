@@ -58,14 +58,13 @@ initial compromise plus 24 benign neighbor hosts.
 The starter slice is ~2.2 GB compressed, and the loader reads the `.gz`
 files directly — nothing gets decompressed on disk.
 
-### Option A: setup.sh (uses gdown)
+### Option A: the fetch command
 
-If you have [gdown](https://github.com/wkentaro/gdown) installed
-(`pipx install gdown`), the setup script downloads the starter slice
-into `data/` and verifies it:
+From this directory (needs only the Go toolchain — it handles Google
+Drive's virus-scan interstitial itself and verifies the gzips):
 
 ```
-./setup.sh
+go run ./fetch
 ```
 
 ### Option B: browser
@@ -77,7 +76,7 @@ to `ecar/evaluation/23Sep19-red/AIA-201-225/` and download both files:
 - `AIA-201-225.ecar-last.json.gz`
 
 Place them in `data/` here, keeping their original names, then run
-`./setup.sh` to verify them.
+`go run ./fetch` to verify them.
 
 ### Option C: rclone (for bigger slices)
 
@@ -98,8 +97,10 @@ examples/optc/
 ├── data/
 │   ├── AIA-201-225.ecar-2019-12-08T11-05-10.046.json.gz
 │   └── AIA-201-225.ecar-last.json.gz
-├── README.md
-└── setup.sh
+├── fetch/          # go run ./fetch — downloads and verifies the slice
+├── optc.yaml       # jsonfacts schema: eCAR records → flat predicates
+├── rules.dl        # day-1 Empire kill-chain detection rules
+└── README.md
 ```
 
 The loader decompresses `.gz` sources transparently, so the files stay
@@ -111,9 +112,33 @@ Also download `OpTCRedTeamGroundTruth.pdf` from the top of the Drive
 folder and keep it beside the data; it is the answer key for validating
 any detection rules you write.
 
-## Status
+## Running it
 
-Data acquisition only, so far. The jsonfacts schema (`optc.yaml`) and
-detection rules for the day-1 PowerShell Empire kill chain are the next
-step — see the mordor example for the schema/rules pattern they will
-follow.
+```
+datalog -c optc.yaml rules.dl
+```
+
+`optc.yaml` maps process/flow/file/module/shell/thread/registry/task/
+session events to flat predicates keyed by eCAR's actor/object UUIDs,
+and seeds matchers for Empire command-line tells, encoded-command
+payloads, script drops, autorun keys, and internal-vs-external flow
+destinations. `rules.dl` finds the Empire stager by its stacked
+command-line tells, then propagates taint along the UUID provenance
+chain (child processes and remote-thread injection targets) so C2
+beaconing, payload drops, persistence, and shell activity are
+attributed by ancestry rather than per-event signatures.
+
+On the starter slice (~6 minutes, ~8.7 GB peak RSS) the rules
+reconstruct the documented day-1 scenario: four stager launches as
+`zleazer`, 317 tainted processes, 2,331 C2 flows — all to the
+documented Empire C2 at `132.197.158.98` — the `Updater` run-key
+persistence, and lateral spread from SysClient0201 to SysClient0205.
+Useful queries once the REPL is up:
+
+```
+stager_launch(Host, Proc, Pid, User, Cmd, Time)?
+c2_channel(Host, Ip, N)?
+empire_autorun(Host, Action, Key, Data, Time)?
+empire_kill_chain(Host, User, Proc, C2Ip)?
+compromised_host(Host)?
+```

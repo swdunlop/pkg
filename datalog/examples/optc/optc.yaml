@@ -1,0 +1,433 @@
+# jsonfacts config for the DARPA OpTC starter slice (see README.md).
+#
+# Dataset: OpTC eCAR endpoint telemetry, host bucket AIA-201-225, red-team
+# day 1 (23 Sep 2019, PowerShell Empire). Every record is one JSON object
+# with hostname/object/action, actorID/objectID UUIDs that chain events
+# into provenance, and an object-specific properties map.
+#
+# Usage:
+#   datalog -c optc.yaml rules.dl
+#
+# Design notes:
+#   - actorID is the UUID of the acting process; for PROCESS CREATE,
+#     objectID is the UUID of the created process. Facts carry these UUIDs
+#     as `proc`/`parent` terms so rules join events into process trees
+#     without relying on pid reuse.
+#   - FLOW facts are filtered to outbound-or-TCP: in this slice ~97% of
+#     flow events are inbound UDP multicast chatter (LLMNR/mDNS/NetBIOS),
+#     and C2 beaconing (outbound) and lateral movement (TCP) survive the
+#     filter. FLOW MESSAGE summaries are dropped entirely.
+#   - Also dropped as low-signal-per-fact for this scenario: PROCESS OPEN,
+#     THREAD CREATE/TERMINATE (REMOTE_CREATE is kept -- that's injection),
+#     FILE READ/MODIFY, and HOST records.
+#   - module_load omits the timestamp: it is a join table (what loaded
+#     what), not a sequencing signal, and per-fact distinct timestamps are
+#     the single biggest interning cost at this volume.
+#   - Optional properties are coalesced to "" (expr `??`) rather than left
+#     to become Null terms, so OnMappingError stays quiet for fields that
+#     are legitimately absent (e.g. dest_ip on inbound FLOW OPEN).
+#   - Sources name files exactly (no globs): pulling more host buckets or
+#     days means adding a `file:` entry per new file, aliasing the shared
+#     mapping block below.
+
+x-ecar-mappings: &ecar-mappings
+  # -- PROCESS --
+
+  - predicate: proc_create
+    args:
+      - "value.hostname"
+      - "value.objectID"                          # the new process
+      - "value.actorID"                           # its parent
+      - "value.pid"
+      - "value.ppid"
+      - "value.properties.image_path"
+      - 'value.properties.parent_image_path ?? ""'
+      - 'value.properties.command_line ?? ""'
+      - 'value.properties.user ?? value.principal'
+      - "value.timestamp"
+    filter: 'value.object == "PROCESS" && value.action == "CREATE"'
+
+  - predicate: proc_end
+    args:
+      - "value.hostname"
+      - "value.objectID"
+      - "value.pid"
+      - 'value.properties.image_path ?? ""'
+      - "value.timestamp"
+    filter: 'value.object == "PROCESS" && value.action == "TERMINATE"'
+
+  # -- FLOW (outbound or TCP only; see design notes) --
+
+  - predicate: flow
+    args:
+      - "value.hostname"
+      - "value.actorID"
+      - "value.pid"
+      - 'value.properties.image_path ?? ""'
+      - "value.properties.direction"
+      - 'value.properties.src_ip ?? ""'
+      - 'value.properties.src_port ?? ""'
+      - 'value.properties.dest_ip ?? ""'
+      - 'value.properties.dest_port ?? ""'
+      - 'value.properties.l4protocol ?? ""'
+      - "value.timestamp"
+    filter: >-
+      value.object == "FLOW" && value.action in ["START", "OPEN"]
+      && (value.properties.direction == "outbound" || value.properties.l4protocol == "6")
+
+  # -- FILE --
+
+  - predicate: file_event
+    args:
+      - "value.hostname"
+      - "value.actorID"
+      - "value.action"
+      - "value.pid"
+      - 'value.properties.image_path ?? ""'
+      - "value.properties.file_path"
+      - "value.timestamp"
+    filter: 'value.object == "FILE" && value.action in ["CREATE", "WRITE", "DELETE"]'
+
+  - predicate: file_rename
+    args:
+      - "value.hostname"
+      - "value.actorID"
+      - "value.pid"
+      - 'value.properties.image_path ?? ""'
+      - "value.properties.file_path"
+      - "value.properties.new_path"
+      - "value.timestamp"
+    filter: 'value.object == "FILE" && value.action == "RENAME"'
+
+  # -- MODULE --
+
+  - predicate: module_load
+    args:
+      - "value.hostname"
+      - "value.actorID"
+      - "value.pid"
+      - 'value.properties.image_path ?? ""'
+      - "value.properties.module_path"
+    filter: 'value.object == "MODULE" && value.action == "LOAD"'
+
+  # -- SHELL (PowerShell command logging; rare and precious) --
+
+  - predicate: shell_command
+    args:
+      - "value.hostname"
+      - "value.actorID"
+      - "value.pid"
+      - 'value.properties.image_path ?? ""'
+      - 'value.properties.payload ?? ""'
+      - 'value.properties.context_info ?? ""'
+      - "value.timestamp"
+    filter: 'value.object == "SHELL" && value.action == "COMMAND"'
+
+  # -- THREAD REMOTE_CREATE (cross-process injection) --
+
+  - predicate: remote_thread
+    args:
+      - "value.hostname"
+      - "value.actorID"
+      - 'value.properties.src_pid ?? ""'
+      - 'value.properties.tgt_pid ?? ""'
+      - 'value.properties.tgt_pid_uuid ?? ""'
+      - 'value.properties.image_path ?? ""'
+      - "value.timestamp"
+    filter: 'value.object == "THREAD" && value.action == "REMOTE_CREATE"'
+
+  # -- REGISTRY --
+
+  - predicate: registry
+    args:
+      - "value.hostname"
+      - "value.actorID"
+      - "value.action"
+      - "value.pid"
+      - 'value.properties.image_path ?? ""'
+      - "value.properties.key"
+      - 'value.properties.value ?? ""'
+      - 'value.properties.data ?? ""'
+      - "value.timestamp"
+    filter: 'value.object == "REGISTRY"'
+
+  # -- TASK (scheduled tasks: persistence and execution) --
+
+  - predicate: task
+    args:
+      - "value.hostname"
+      - "value.actorID"
+      - "value.action"
+      - "value.pid"
+      - 'value.properties.image_path ?? ""'
+      - 'value.properties.task_name ?? ""'
+      - 'value.properties.path ?? ""'
+      - 'value.properties.task_pid ?? ""'
+      - 'value.properties.user_name ?? ""'
+      - "value.timestamp"
+    filter: 'value.object == "TASK"'
+
+  # -- USER_SESSION --
+
+  - predicate: session
+    args:
+      - "value.hostname"
+      - "value.action"
+      - 'value.properties.user ?? value.principal'
+      - 'value.properties.logon_id ?? ""'
+      - 'value.properties.requesting_user ?? ""'
+      - 'value.properties.requesting_logon_id ?? ""'
+      - 'value.properties.src_ip ?? ""'
+      - "value.timestamp"
+    filter: 'value.object == "USER_SESSION" && value.action != "GRANT"'
+
+  - predicate: session_priv
+    args:
+      - "value.hostname"
+      - 'value.properties.user ?? value.principal'
+      - 'value.properties.logon_id ?? ""'
+      - 'value.properties.privileges ?? ""'
+      - "value.timestamp"
+    filter: 'value.object == "USER_SESSION" && value.action == "GRANT"'
+
+sources:
+  - file: data/AIA-201-225.ecar-2019-12-08T11-05-10.046.json.gz
+    mappings: *ecar-mappings
+  - file: data/AIA-201-225.ecar-last.json.gz
+    mappings: *ecar-mappings
+
+matchers:
+  # Empire/download-cradle tells in command lines. windash folds / and -
+  # so "/nop" and "-nop" both hit.
+  - predicate: proc_create
+    term: 7
+    case_insensitive: true
+    windash: true
+    contains:
+      - "-nop"
+      - "-noni"
+      - "-enc"
+      - "-w hidden"
+      - "bypass"
+      - "downloadstring"
+      - "downloadfile"
+      - "webclient"
+      - "frombase64string"
+      - "invoke-expression"
+      - "iex("
+      - "iex "
+
+  # The same tells hidden inside -EncodedCommand payloads (UTF-16LE
+  # base64, checked at all three alignment offsets). Caveat: needles are
+  # case-sensitive by construction (base64 of "IeX" shares nothing with
+  # base64 of "IEX"), and Empire case-randomizes its payloads -- so this
+  # matcher misses day-1 stagers; rules.dl anchors on stacked plaintext
+  # tells instead and keeps this as a tier for cruder attackers.
+  - predicate: proc_create
+    term: 7
+    base64_utf16le:
+      - "IEX"
+      - "Net.WebClient"
+      - "DownloadString"
+      - "FromBase64String"
+      - "Invoke-Expression"
+
+  # Executable and script drops.
+  - predicate: file_event
+    term: 5
+    case_insensitive: true
+    ends_with:
+      - ".exe"
+      - ".dll"
+      - ".ps1"
+      - ".bat"
+      - ".vbs"
+      - ".js"
+      - ".hta"
+
+  # Autorun persistence locations.
+  - predicate: registry
+    term: 5
+    case_insensitive: true
+    contains:
+      - '\currentversion\run'
+      - '\winlogon'
+      - '\image file execution options'
+
+  # Classify flow destinations: these ranges are the systemia.com
+  # enterprise (142.20/16, 10/8) and multicast noise (224/4). Emits
+  # cidr_match(ip, range) facts; an outbound flow whose dest_ip has NO
+  # cidr_match fact is a candidate external C2 destination -- rules key
+  # off the absence.
+  - predicate: flow
+    term: 7
+    cidr:
+      - "10.0.0.0/8"
+      - "142.20.0.0/16"
+      - "224.0.0.0/4"
+
+declarations:
+  - name: proc_create
+    use: >-
+      A process was created (eCAR PROCESS CREATE). proc is the new
+      process's UUID and parent is the creating process's UUID; join on
+      these, not pids, which are reused.
+    terms:
+      - {name: host}
+      - {name: proc, use: UUID of the new process (record objectID)}
+      - {name: parent, use: UUID of the creating process (record actorID)}
+      - {name: pid}
+      - {name: ppid}
+      - {name: image, use: executable path of the new process}
+      - {name: parent_image, use: executable path of the parent}
+      - {name: cmd, use: full command line of the new process}
+      - {name: user, use: the account the process runs as}
+      - {name: time}
+
+  - name: proc_end
+    use: A process exited (eCAR PROCESS TERMINATE).
+    terms:
+      - {name: host}
+      - {name: proc, use: UUID of the exiting process}
+      - {name: pid}
+      - {name: image}
+      - {name: time}
+
+  - name: flow
+    use: >-
+      A network flow started or opened (eCAR FLOW START/OPEN), kept only
+      when outbound or TCP. dest_ip may be "" for inbound opens. proc is
+      the owning process UUID.
+    terms:
+      - {name: host}
+      - {name: proc, use: UUID of the process that owns the flow}
+      - {name: pid}
+      - {name: image, use: executable path of the owning process}
+      - {name: direction, use: '"inbound" or "outbound"'}
+      - {name: src_ip}
+      - {name: src_port}
+      - {name: dest_ip}
+      - {name: dest_port}
+      - {name: proto, use: 'IP protocol number as a string: "6" TCP, "17" UDP'}
+      - {name: time}
+
+  - name: file_event
+    use: >-
+      A file was created, written, or deleted (eCAR FILE CREATE/WRITE/
+      DELETE) by the process with UUID proc.
+    terms:
+      - {name: host}
+      - {name: proc, use: UUID of the acting process}
+      - {name: action, use: '"CREATE", "WRITE", or "DELETE"'}
+      - {name: pid}
+      - {name: image, use: executable path of the acting process}
+      - {name: path, use: filesystem path of the file}
+      - {name: time}
+
+  - name: file_rename
+    use: A file was renamed (eCAR FILE RENAME) from `from` to `to`.
+    terms:
+      - {name: host}
+      - {name: proc, use: UUID of the acting process}
+      - {name: pid}
+      - {name: image}
+      - {name: from, use: path before the rename}
+      - {name: to, use: path after the rename}
+      - {name: time}
+
+  - name: module_load
+    use: >-
+      A module was loaded into a process (eCAR MODULE LOAD). No
+      timestamp: this is a join table, not a sequencing signal.
+    terms:
+      - {name: host}
+      - {name: proc, use: UUID of the loading process}
+      - {name: pid}
+      - {name: image, use: executable path of the loading process}
+      - {name: module, use: path of the loaded module}
+
+  - name: shell_command
+    use: >-
+      A PowerShell command invocation captured by shell auditing (eCAR
+      SHELL COMMAND). payload is the command; context includes the host
+      application line that launched the shell.
+    terms:
+      - {name: host}
+      - {name: proc, use: UUID of the shell process}
+      - {name: pid}
+      - {name: image}
+      - {name: payload, use: the invoked command and bound parameters}
+      - {name: context, use: 'PowerShell host context (application, user, runspace)'}
+      - {name: time}
+
+  - name: remote_thread
+    use: >-
+      A thread was created in ANOTHER process (eCAR THREAD
+      REMOTE_CREATE) -- the shape code injection takes. Benign for a few
+      system processes (e.g. vmtoolsd); anchor on the source image.
+    terms:
+      - {name: host}
+      - {name: proc, use: UUID of the source (injecting) process}
+      - {name: src_pid}
+      - {name: tgt_pid}
+      - {name: tgt_proc, use: UUID of the target process}
+      - {name: image, use: executable path of the source process}
+      - {name: time}
+
+  - name: registry
+    use: >-
+      A registry key or value was added, edited, or removed (eCAR
+      REGISTRY ADD/EDIT/REMOVE).
+    terms:
+      - {name: host}
+      - {name: proc, use: UUID of the acting process}
+      - {name: action, use: '"ADD", "EDIT", or "REMOVE"'}
+      - {name: pid}
+      - {name: image}
+      - {name: key, use: full registry key path}
+      - {name: value_name, use: 'the value name under the key, "" for key-level ops'}
+      - {name: data, use: 'the written data, "" when absent'}
+      - {name: time}
+
+  - name: task
+    use: >-
+      A scheduled task was created, modified, deleted, or started (eCAR
+      TASK). Task creation by a non-admin tool is a persistence tell;
+      START links the task to the process it launched.
+    terms:
+      - {name: host}
+      - {name: proc, use: UUID of the acting process}
+      - {name: action, use: '"CREATE", "MODIFY", "DELETE", or "START"'}
+      - {name: pid}
+      - {name: image, use: executable path of the acting process}
+      - {name: name, use: scheduled task name}
+      - {name: task_image, use: 'program the task runs (START only), "" otherwise'}
+      - {name: task_pid, use: 'pid the task started (START only), "" otherwise'}
+      - {name: user, use: 'account the task runs as (CREATE only), "" otherwise'}
+      - {name: time}
+
+  - name: session
+    use: >-
+      A logon session event (eCAR USER_SESSION LOGIN/LOGOUT/REMOTE/
+      INTERACTIVE/UNLOCK). REMOTE carries the client src_ip -- that is
+      the RDP/remote-logon trail.
+    terms:
+      - {name: host}
+      - {name: action, use: '"LOGIN", "LOGOUT", "REMOTE", "INTERACTIVE", or "UNLOCK"'}
+      - {name: user}
+      - {name: logon_id, use: 'Windows logon id, e.g. "0x3e7"'}
+      - {name: requesting_user, use: 'account that requested the logon, "" when absent'}
+      - {name: requesting_logon_id}
+      - {name: src_ip, use: 'client address for REMOTE sessions, "" otherwise'}
+      - {name: time}
+
+  - name: session_priv
+    use: >-
+      Privileges granted to a logon session (eCAR USER_SESSION GRANT) --
+      SeDebugPrivilege and friends mark administrative sessions.
+    terms:
+      - {name: host}
+      - {name: user}
+      - {name: logon_id}
+      - {name: privileges, use: newline-separated privilege list}
+      - {name: time}

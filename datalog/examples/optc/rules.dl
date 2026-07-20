@@ -1,0 +1,144 @@
+% Day-1 PowerShell Empire kill-chain detection over the OpTC starter
+% slice (host bucket AIA-201-225, 23 Sep 2019 -- see README.md).
+%
+% Strategy: find the Empire stager by its launch shape, then follow the
+% eCAR actorID/objectID provenance chain instead of pattern-matching
+% every event. Taint propagates two ways -- process creation and remote
+% thread injection -- so everything the implant does downstream
+% (beaconing, drops, persistence, shell activity) is attributed by
+% ancestry, not by signature.
+%
+% Ground truth (OpTCRedTeamGroundTruth.pdf): the day-1 scenario begins
+% on SysClient0201 with an encoded `powershell -noP -sta -w 1 -enc ...`
+% stager that pulls its second stage from an external C2 over HTTP.
+%
+%   ATT&CK: T1059.001 (PowerShell), T1027 (Obfuscation),
+%           T1071.001 (Web C2), T1055 (Process Injection),
+%           T1547.001 (Run Keys), T1053.005 (Scheduled Task)
+
+% -- Initial execution -------------------------------------------------
+
+%% A process launched with download-cradle or Empire tells in its plain
+%% command line (matcher: ci_wd_contains over proc_create cmd). Broad
+%% triage tier -- admin scripts land here too; the stager rules narrow.
+cradle_launch(Host, Proc, Pid, User, Cmd, Time) :-
+    proc_create(Host, Proc, ?, Pid, ?, ?, ?, Cmd, User, Time),
+    ci_wd_contains(Cmd, ?).
+
+%% A process launched with an -EncodedCommand payload that decodes to
+%% IEX / WebClient / FromBase64String tells (matcher:
+%% base64_utf16le_contains). High signal when it fires, but Empire
+%% randomizes the case of its encoded payload ("IeX", "nEt.weBcLIent"),
+%% and base64 of case-randomized text shares no substring with base64
+%% of the canonical spelling -- so day-1 Empire stagers do NOT land
+%% here. Kept as a tier for attackers that don't case-randomize.
+encoded_launch(Host, Proc, Pid, User, Cmd, Time) :-
+    proc_create(Host, Proc, ?, Pid, ?, ?, ?, Cmd, User, Time),
+    base64_utf16le_contains(Cmd, ?).
+
+%% The Empire stager shape: a command line carrying at least two
+%% DISTINCT launch tells (-nop plus -enc, -noni, -w hidden, ...).
+%% One tell appears in admin scripts; the stacked combination is how
+%% Empire launches. Case folding and windash happen in the matcher, so
+%% -NoP / /nop / -noP all count as "-nop". This catches the day-1
+%% initial compromise on SysClient0201.
+stager_launch(Host, Proc, Pid, User, Cmd, Time) :-
+    proc_create(Host, Proc, ?, Pid, ?, ?, ?, Cmd, User, Time),
+    ci_wd_contains(Cmd, Tell1),
+    ci_wd_contains(Cmd, Tell2),
+    Tell1 != Tell2.
+
+%% An encoded launch that also carries a plaintext tell is a stager
+%% even if only one plaintext tell is present.
+stager_launch(Host, Proc, Pid, User, Cmd, Time) :-
+    cradle_launch(Host, Proc, Pid, User, Cmd, Time),
+    encoded_launch(Host, Proc, Pid, User, Cmd, Time).
+
+% -- Taint: the Empire process set -------------------------------------
+
+%% Proc is attributed to the Empire intrusion: it is the stager itself,
+%% a descendant the implant spawned, or a victim process the implant
+%% injected a thread into. Provenance rides the eCAR UUIDs, so pid
+%% reuse cannot cross-contaminate.
+empire_proc(Host, Proc) :-
+    stager_launch(Host, Proc, ?, ?, ?, ?).
+%% ...children of tainted processes are tainted.
+empire_proc(Host, Child) :-
+    empire_proc(Host, Parent),
+    proc_create(Host, Child, Parent, ?, ?, ?, ?, ?, ?, ?).
+%% ...and so are remote-thread injection targets (T1055): once the
+%% implant runs code in another process, that process is theirs.
+empire_proc(Host, Target) :-
+    empire_proc(Host, Proc),
+    remote_thread(Host, Proc, ?, ?, Target, ?, ?),
+    Target != "".
+
+% -- Command and control -----------------------------------------------
+
+%% An outbound flow to an address outside every classified range (no
+%% cidr_match fact: not enterprise 142.20/16 or 10/8, not multicast).
+%% What remains is the simulated internet -- candidate C2 space.
+external_flow(Host, Proc, Image, DestIp, DestPort, Time) :-
+    flow(Host, Proc, ?, Image, "outbound", ?, ?, DestIp, DestPort, ?, Time),
+    DestIp != "",
+    not cidr_match(DestIp, ?).
+
+%% An Empire-attributed process talked to an external address --
+%% the C2 channel itself (T1071.001), tied to the intrusion by
+%% provenance rather than by traffic shape.
+c2_flow(Host, Proc, DestIp, DestPort, Time) :-
+    empire_proc(Host, Proc),
+    external_flow(Host, Proc, ?, DestIp, DestPort, Time).
+
+%% Beacon volume per host and destination: hundreds of flows to one
+%% external address is C2 polling, not browsing.
+c2_channel(Host, DestIp, N) :-
+    N = count : c2_flow(Host, ?, DestIp, ?, ?).
+
+% -- Post-exploitation activity, attributed by taint -------------------
+
+%% An Empire process created a thread in another process (T1055) --
+%% the injection events themselves, with source and target pids.
+empire_injection(Host, SrcPid, TgtPid, Target, Time) :-
+    empire_proc(Host, Proc),
+    remote_thread(Host, Proc, SrcPid, TgtPid, Target, ?, Time).
+
+%% An Empire process dropped or removed an executable or script
+%% artifact (T1105 ingress tool transfer / staging).
+empire_drop(Host, Action, Path, Time) :-
+    empire_proc(Host, Proc),
+    file_event(Host, Proc, Action, ?, ?, Path, Time),
+    ci_ends_with(Path, ?).
+
+%% An Empire process touched an autorun location -- Run keys, Winlogon,
+%% Image File Execution Options (T1547.001 persistence).
+empire_autorun(Host, Action, Key, Data, Time) :-
+    empire_proc(Host, Proc),
+    registry(Host, Proc, Action, ?, ?, Key, ?, Data, Time),
+    ci_contains(Key, ?).
+
+%% An Empire process created or modified a scheduled task (T1053.005
+%% persistence / privileged execution).
+empire_task(Host, Action, Name, User, Time) :-
+    empire_proc(Host, Proc),
+    task(Host, Proc, Action, ?, ?, Name, ?, ?, User, Time),
+    Action != "START".
+
+%% PowerShell commands the implant actually ran, from shell auditing --
+%% the hands-on-keyboard transcript of the intrusion.
+empire_shell(Host, Pid, Payload, Time) :-
+    empire_proc(Host, Proc),
+    shell_command(Host, Proc, Pid, ?, Payload, ?, Time).
+
+% -- Kill chain roll-up ------------------------------------------------
+
+%% The corroborated day-1 kill chain: a stager launched as User on Host
+%% and a process in its taint set beacons to external address C2Ip.
+%% Execution plus command-and-control, chained by provenance.
+empire_kill_chain(Host, User, Proc, C2Ip) :-
+    stager_launch(Host, Proc, ?, User, ?, ?),
+    c2_flow(Host, ?, C2Ip, ?, ?).
+
+%% Host has a corroborated Empire intrusion.
+compromised_host(Host) :-
+    empire_kill_chain(Host, ?, ?, ?).
