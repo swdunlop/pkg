@@ -392,7 +392,7 @@ func compositeDetail(c *datalog.Composite) html.Content {
 // bytes go to every subscriber (doc/notes/datastar.md §8's pre-rendered
 // fan-out). Callers must hold wb.h.mu, since rendering reads session state.
 func (wb *workbench) publishSessionChanged() {
-	base, derived := renderPredicates(wb.h.sess)
+	base, derived := renderPredicates(wb.h.sess, wb.isLoading())
 	schema, rules := wb.renderBrowserPanels()
 	wb.bus.Publish(datastar.Batch(
 		datastar.Elements(base),
@@ -405,7 +405,14 @@ func (wb *workbench) publishSessionChanged() {
 // renderPredicates builds the #predicates-base and #predicates-derived
 // fragments from session state. Callers must hold wb.h.mu (or otherwise
 // ensure exclusive access to sess), since it reads facts/rules/aggRules/
-// dataDB directly.
+// dataDB directly. loading threads through to view.Predicates so both
+// fragments carry the "loading dataset…" tell (doc/features/
+// workbench-scale.md design decision 3) while the background startup-load
+// job has not yet applied the base DB — callers pass wb.isLoading()
+// (handleEvents' initial render and publishSessionChanged both do); it is a
+// plain bool parameter rather than this function reaching into *workbench
+// itself, so renderPredicates stays testable against a bare *session with
+// no workbench required.
 //
 // EDB/IDB labeling rule: a predicate/arity pair is "derived" (IDB) if any
 // loaded rule or aggregate rule has it as a head; otherwise "base" (EDB). A
@@ -415,7 +422,7 @@ func (wb *workbench) publishSessionChanged() {
 // since the point of the label is "does a rule explain this data," and if a
 // rule exists for it the answer is yes regardless of what else populated
 // the same predicate/arity.
-func renderPredicates(sess *session) (base, derived html.Content) {
+func renderPredicates(sess *session, loading bool) (base, derived html.Content) {
 	type key struct {
 		name  string
 		arity int
@@ -475,5 +482,5 @@ func renderPredicates(sess *session) (base, derived html.Content) {
 	byNameArity(baseEntries)
 	byNameArity(derivedEntries)
 
-	return view.Predicates("base", baseEntries), view.Predicates("derived", derivedEntries)
+	return view.Predicates("base", baseEntries, loading), view.Predicates("derived", derivedEntries, loading)
 }

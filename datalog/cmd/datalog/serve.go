@@ -17,8 +17,10 @@ import (
 	"sync"
 
 	"github.com/mark3labs/mcp-go/server"
+	html "github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/datastar"
 	"swdunlop.dev/pkg/datalog/cmd/datalog/view"
+	"swdunlop.dev/pkg/datalog/memory"
 )
 
 // runServe implements the `datalog serve` subcommand: a hypermedia
@@ -69,7 +71,14 @@ func runServe(args []string) {
 		os.Exit(1)
 	}
 
-	wb, closeFn, err := newWorkbench(*dataDir, *configPath, ruleFiles, *rulesDir, *mcpToken,
+	// newWorkbenchAsync, not newWorkbench: serve's whole reason for this
+	// split (doc/features/workbench-scale.md design decision 3) is bringing
+	// the listener up WITHOUT waiting for loadDone — a real dataset's load
+	// takes minutes, and an operator staring at a dead terminal can't tell
+	// load from hang. loadDone is only consumed below, to sequence the
+	// watcher's start (see the comment there) — runServe itself never blocks
+	// on it before opening the listener.
+	wb, closeFn, loadDone, err := newWorkbenchAsync(*dataDir, *configPath, ruleFiles, *rulesDir, *mcpToken,
 		agentConfig{
 			Model:          *model,
 			ProviderURL:    *providerURL,
@@ -89,12 +98,43 @@ func runServe(args []string) {
 	// Fatal on error: an operator who started serve with -c/--rules is
 	// relying on saves being seen — a silently dead watcher would bring
 	// back exactly the stale-workbench bug this feature exists to fix.
-	stopWatcher, err := wb.startWatcher()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "datalog serve: %v\n", err)
-		os.Exit(1)
-	}
-	defer stopWatcher()
+	//
+	// Started only AFTER the background load job finishes (loadDone, in its
+	// own goroutine below), not before: the watcher's reload path
+	// (watch.go's reloadFromDisk/reloadSchema) reads/writes the same session
+	// fields the load job is still populating, through the same h.mu — the
+	// load job holds h.mu only for the swap itself (loadDeferredSchema), not
+	// across the whole multi-minute prepareSchema read, so a vim save
+	// landing mid-load COULD interleave a reload's applySchemaLocked with
+	// the load's own loadDeferredSchema call. Rather than reason about that
+	// interleaving (both take h.mu, but "atomic under the lock" doesn't make
+	// "which one's result wins" meaningful when the load's own file read
+	// races the save), the watcher simply isn't listening yet: a save that
+	// happens to land during the minutes-long initial load is picked up the
+	// FIRST time fsnotify's watch registers, same as if the operator saved
+	// again after noticing "dataset loaded" in the console. This can only
+	// ever delay noticing an edit made during the load window, never lose
+	// or corrupt one, since disk itself is unaffected either way.
+	var stopWatcher func() = func() {}
+	watcherReady := make(chan struct{})
+	go func() {
+		<-loadDone
+		sw, err := wb.startWatcher()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "datalog serve: %v\n", err)
+			os.Exit(1)
+		}
+		stopWatcher = sw
+		close(watcherReady)
+	}()
+	defer func() {
+		select {
+		case <-watcherReady:
+			stopWatcher()
+		default:
+			// Shutdown raced the load itself; nothing to stop yet.
+		}
+	}()
 
 	fmt.Fprintf(os.Stderr, "datalog serve: /mcp bearer token: %s\n", wb.mcpToken)
 
@@ -121,27 +161,60 @@ func runServe(args []string) {
 	}
 }
 
-// newWorkbench builds a *workbench wired exactly like runServe does: it
-// opens the data source, preloads schema/rules, generates (or accepts) the
-// /mcp bearer token, builds the shared MCP server value, and wires the
-// onChange patch-back seam — everything runServe needs except the flag
-// parsing and the HTTP listener itself. Factored out so tests can build a
-// workbench against a temp directory or the mordor example without going
-// through flag parsing or os.Exit calls. tokenFlag is the --mcp-token
-// flag's value; empty means "generate one". rulesDir is the --rules
-// directory-store path (empty means "use ruleFiles instead", the legacy
-// monolithic path) — runServe has already rejected the case where both are
-// given, mirroring runMCP's identical check, so newWorkbench itself does
-// not re-validate that here (newMCPHandlers just prefers rulesDir when set).
-// maxFacts and evalTimeout are runServe's resolved --max-facts/--eval-timeout
-// flag values (doc/features/workbench-scale.md work item 1), threaded
-// straight into newMCPHandlers so every evaluation this workbench runs
-// shares the one operator-set budget/deadline; <= 0 means "no cap"/"no
-// deadline" respectively, per newMCPHandlers' and evalContext's doc comments.
+// newWorkbench builds a *workbench wired exactly like runServe does, blocking
+// until the base dataset is fully loaded and the initial rule evaluation has
+// run — i.e. the synchronous contract every existing test in this package
+// relies on (newWorkbench "keeps a synchronous variant for tests" per
+// doc/features/workbench-scale.md work item 4's test brief). It is a thin
+// wrapper over newWorkbenchAsync that waits on the returned done channel;
+// runServe itself calls newWorkbenchAsync directly so the HTTP listener does
+// NOT wait for a multi-minute load. See newWorkbenchAsync's doc comment for
+// the full picture of what "opens the data source, preloads schema/rules...”
+// covers and what got deferred to the background load job.
 func newWorkbench(dataDir, configPath string, ruleFiles []string, rulesDir string, tokenFlag string, agentCfg agentConfig, maxFacts int, evalTimeout time.Duration) (*workbench, func() error, error) {
-	h, closeFn, err := newMCPHandlers(dataDir, configPath, ruleFiles, rulesDir, evalTimeout, maxFacts)
+	wb, closeFn, done, err := newWorkbenchAsync(dataDir, configPath, ruleFiles, rulesDir, tokenFlag, agentCfg, maxFacts, evalTimeout)
 	if err != nil {
 		return nil, nil, err
+	}
+	<-done
+	return wb, closeFn, nil
+}
+
+// loadJobKey is the Jobs key for the background dataset-load job (doc/
+// features/workbench-scale.md design decision 3): registered so Global
+// Cancel can stop a load exactly like a Run's, and doubling as the $busy
+// vocabulary for the one-spinner rule while the load runs. A cancelled load
+// leaves the workbench up with an empty dataset and the cancellation
+// recorded as a console/status error — the same "stay up, report the
+// failure" posture a failed load gets (see runLoadJob's doc comment) rather
+// than a special case, since from the session's point of view a cancelled
+// load and a failed one both mean "the base DB never got applied."
+const loadJobKey = "load"
+
+// newWorkbenchAsync is newWorkbench's real implementation: it constructs the
+// workbench and returns it USABLE IMMEDIATELY — routes wired, /mcp mounted,
+// rules loaded and (if the ruleset is non-empty) ready to evaluate — with
+// the configPath dataset load and the initial rule evaluation running in a
+// background job instead of inline. The returned done channel closes when
+// that job finishes (success OR failure); runServe never waits on it (the
+// whole point is bringing the listener up before a 6-minute load completes,
+// doc/features/workbench-scale.md design decision 3), but newWorkbench
+// (the test-facing synchronous wrapper) does, and a caller that legitimately
+// wants "wait until ready" (a future CLI flag, a health-check endpoint) has
+// somewhere to hook in without re-deriving this ordering.
+//
+// When configPath == "", there is nothing to defer: the load job still runs
+// (for the initial rule evaluation, if any rules were given) but finishes
+// near-instantly, and wb.isLoading() is false from construction.
+func newWorkbenchAsync(dataDir, configPath string, ruleFiles []string, rulesDir string, tokenFlag string, agentCfg agentConfig, maxFacts int, evalTimeout time.Duration) (*workbench, func() error, <-chan struct{}, error) {
+	// deferConfigLoad is unconditional (even for configPath == ""): the one
+	// load-job code path below (runLoadJob) is shared regardless of whether
+	// there is an actual config load to perform, so there is no second
+	// "startup eval only, no deferred load" variant to keep in sync with the
+	// first (see runLoadJob's doc comment).
+	h, closeFn, err := newMCPHandlers(dataDir, configPath, ruleFiles, rulesDir, evalTimeout, maxFacts, true)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
 	token := tokenFlag
@@ -149,7 +222,7 @@ func newWorkbench(dataDir, configPath string, ruleFiles []string, rulesDir strin
 		token, err = generateToken()
 		if err != nil {
 			closeFn()
-			return nil, nil, fmt.Errorf("generating /mcp bearer token: %w", err)
+			return nil, nil, nil, fmt.Errorf("generating /mcp bearer token: %w", err)
 		}
 	}
 	// The token is only known once resolved above, but acpDriver needs it
@@ -212,44 +285,181 @@ func newWorkbench(dataDir, configPath string, ruleFiles []string, rulesDir strin
 	// is unchanged.
 	h.onChange = wb.publishSessionChanged
 
-	// Evaluate the preloaded ruleset once at startup, mirroring what Run
-	// does (rules_editor.go handleRulesRun): the -c schema is already
-	// applied by newMCPHandlers (setSchema loads the data), but nothing
-	// populates session.derivedDB until someone presses Run — and the
-	// agent has no Run button, so without this it would see every derived
-	// predicate as 0 facts until the human remembered to click. Errors
-	// are non-fatal: parse errors were already fatal in newMCPHandlers,
-	// and a compile/timeout problem here is fixable in the running
-	// editor, so warn and serve rather than refuse to start.
-	if len(h.sess.rules)+len(h.sess.aggRules) > 0 {
-		ctx, cancel := h.evalContext(context.Background())
+	// The background load job (doc/features/workbench-scale.md design
+	// decision 3): loads configPath's dataset (if any, via
+	// h.loadDeferredSchema — the deferred half of newMCPHandlers'
+	// construction above) and then runs the initial rule evaluation,
+	// mirroring what Run does (rules_editor.go handleRulesRun) — nothing
+	// populates session.derivedDB until someone presses Run, and the agent
+	// has no Run button, so without an initial evaluation it would see every
+	// derived predicate as 0 facts until the human remembered to click.
+	// wb.loading is set BEFORE the goroutine starts (not inside it) so a
+	// caller that checks it immediately after newWorkbenchAsync returns
+	// never sees a false "not loading" window before the goroutine gets
+	// scheduled.
+	wb.setLoading(true)
+	done := make(chan struct{})
+	go wb.runLoadJob(done)
+
+	return wb, closeFn, done, nil
+}
+
+// setLoading records whether the background load job is in flight, read by
+// isLoading (render paths) and toggled exactly twice per job: true right
+// before runLoadJob's goroutine is scheduled, false at its completion path.
+func (wb *workbench) setLoading(v bool) {
+	wb.loadMu.Lock()
+	wb.loading = v
+	wb.loadMu.Unlock()
+}
+
+// isLoading reports whether the background dataset load (and initial rule
+// evaluation) is still running — the signal render paths use to show
+// "loading dataset…" instead of a convincingly empty session (doc/features/
+// workbench-scale.md design decision 3).
+func (wb *workbench) isLoading() bool {
+	wb.loadMu.Lock()
+	defer wb.loadMu.Unlock()
+	return wb.loading
+}
+
+// runLoadJob is the background startup-load job newWorkbenchAsync launches:
+// it loads configPath's dataset (if any — h.configPath is empty when serve
+// was started with no -c) via h.loadDeferredSchema, the SAME setSchema
+// chokepoint every other schema write goes through (loadConfigSchema's doc
+// comment), then runs the initial rule evaluation exactly as newWorkbench
+// used to do inline before this feature. It rides the established job/
+// busy/console plumbing (wb.jobs.Begin + wb.publishBusy + runRecovered is
+// "the established pattern," per this task's brief, matching
+// autoReevaluate's shape in watch.go) rather than inventing new machinery:
+//   - wb.jobs.Begin(loadJobKey) registers the job so Global Cancel
+//     (handleCancel) can stop a load exactly like a Run's.
+//   - wb.publishBusy(loadJobKey) drives the $busy spinner/Stop-button UI.
+//   - A start console entry ("loading dataset…") and a completion entry
+//     (predicate/fact counts and elapsed time, or the error) bracket the
+//     job, so the operator can tell load-in-progress from a hung server
+//     (the console drawer is "the natural place for... notifications," per
+//     the brief) — this is deliberately the ONE progress checkpoint on each
+//     end, not a granular per-file/per-record stream: jsonfacts's loader
+//     exposes no cheap incremental hook today, and the brief explicitly
+//     accepts "do not invent deep machinery for it."
+//
+// done is closed exactly once, after wb.setLoading(false) and the console/
+// busy bookkeeping below — so a caller waiting on it (newWorkbench's
+// synchronous test wrapper) never observes isLoading() still true or a
+// stale busy key once done has fired.
+//
+// A cancelled load (Global Cancel firing mid-load) and a failed load both
+// leave the workbench's dataset empty and are reported identically: an
+// error console entry plus a non-nil error recorded on the job (there is no
+// separate "load was cancelled" status surface — see loadJobKey's doc
+// comment). The workbench itself stays up and reachable either way; only
+// the session's data/derived predicates are empty until an operator fixes
+// the config and restarts (there is no retry-in-place for a failed initial
+// load in this task's scope).
+func (wb *workbench) runLoadJob(done chan<- struct{}) {
+	defer close(done)
+
+	jobCtx, jobDone := wb.jobs.Begin(context.Background(), loadJobKey)
+	if jobCtx == nil {
+		// Should not happen (nothing else registers loadJobKey this early),
+		// but a busy key must not silently strand isLoading() at true.
+		wb.setLoading(false)
+		return
+	}
+	defer jobDone()
+	wb.publishBusy(loadJobKey)
+	defer wb.publishBusy("")
+
+	start := time.Now()
+	const loadTab = "" // startup load has no owning conversation; the empty tab is the shared/global scrollback (consoleLog.Render("") — see handleRoot's empty-state page, which reads the same tab).
+	wb.consoleAppend(loadTab, "status", html.Text("loading dataset…"))
+
+	var loadErr error
+	if wb.h.configPath != "" {
+		loadErr = wb.h.loadDeferredSchema()
+	}
+
+	// The rules-present check takes h.mu: an agent's put_rule_group over
+	// /mcp can land while the load job runs (the listener is up — that is
+	// the point of this job), and session.rules is only stable under the
+	// session mutex.
+	haveRules := false
+	if loadErr == nil {
+		wb.h.mu.Lock()
+		haveRules = len(wb.h.sess.rules)+len(wb.h.sess.aggRules) > 0
+		wb.h.mu.Unlock()
+	}
+	if haveRules {
+		ctx, cancel := wb.h.evalContext(jobCtx)
 		evalErr := <-runRecovered(func() error {
-			h.mu.Lock()
-			defer h.mu.Unlock()
-			db, prov, err := h.sess.evaluate(ctx)
+			wb.h.mu.Lock()
+			defer wb.h.mu.Unlock()
+			db, prov, err := wb.h.sess.evaluate(ctx)
 			if err != nil {
 				return err
 			}
-			if err := h.checkFactCap(db); err != nil {
+			if err := wb.h.checkFactCap(db); err != nil {
 				return err
 			}
 			// prov rides beside db under the same generation guard every
 			// other derivedDB writer uses (doc/features/provenance.md
-			// "Session cache interaction") — here there is no concurrent
-			// mutation possible (h.mu has been held since before evaluate
-			// started), so the cache is unconditional, unlike Run/query's
+			// "Session cache interaction") — unconditional here (no
+			// concurrent mutation is possible: h.mu has been held since
+			// before evaluate started, and this is the first evaluation
+			// this session has ever run), unlike Run/query's
 			// snapGen-checked writes.
-			h.sess.derivedDB = db
-			h.sess.derivedProv = prov
+			wb.h.sess.derivedDB = db
+			wb.h.sess.derivedProv = prov
 			return nil
 		})
 		cancel()
-		if evalErr != nil {
-			fmt.Fprintf(os.Stderr, "datalog serve: initial rule evaluation: %v\n", evalErr)
-		}
+		loadErr = evalErr
 	}
 
-	return wb, closeFn, nil
+	wb.setLoading(false)
+
+	if loadErr != nil {
+		fmt.Fprintf(os.Stderr, "datalog serve: background dataset load: %v\n", loadErr)
+		wb.consoleAppend(loadTab, "error", html.Text("dataset load failed: "+loadErr.Error()))
+		return
+	}
+
+	wb.h.mu.Lock()
+	n := 0
+	predicates := 0
+	if db, err := wb.h.sess.evaluatedDB(); err == nil {
+		// PredicateCounts is the O(1)-per-predicate tally (the same one
+		// renderPredicates uses) — a full db.Facts walk here would re-scan
+		// every base fact under h.mu right after a multi-GB load, exactly
+		// the O(offset)-style full scan workbench-scale.md's design
+		// decision 5 exists to retire. The non-*memory.Database fallback
+		// walks, but no session path produces one (evaluatedDB's contract).
+		if mdb, ok := db.(*memory.Database); ok {
+			for _, c := range mdb.PredicateCounts() {
+				predicates++
+				n += c
+			}
+		} else {
+			for name, arity := range db.Predicates() {
+				predicates++
+				for range db.Facts(name, arity) {
+					n++
+				}
+			}
+		}
+	}
+	// publishSessionChanged repaints every open page's predicate lists and
+	// Schema/Rules panels now that the base DB (and, if there were rules, the
+	// derived DB) is populated — the panes were rendering wb.isLoading()'s
+	// "loading dataset…" tell against an empty session until this call
+	// (fact_browser.go's publishSessionChanged, called under h.mu per its
+	// documented contract).
+	wb.publishSessionChanged()
+	wb.h.mu.Unlock()
+
+	wb.consoleAppend(loadTab, "status", html.Text(fmt.Sprintf(
+		"dataset loaded: %d facts in %d predicates (took %s)", n, predicates, time.Since(start).Round(time.Millisecond))))
 }
 
 // mcpURL derives the /mcp URL an acpDriver hands its agent from the
@@ -371,6 +581,20 @@ type workbench struct {
 	busyKey      string
 	busyConvID   string
 	busyConvName string
+
+	// loadMu guards loading, which is true from the moment newWorkbenchAsync
+	// launches the background load job until runLoadJob's completion path
+	// clears it (success or failure — a failed load is still "done loading,"
+	// not "still loading"). Render paths that would otherwise show a
+	// convincingly-empty dataset (renderPredicates and friends, fact_browser.go)
+	// read wb.isLoading() to render a "loading dataset…" tell instead (doc/
+	// features/workbench-scale.md design decision 3's pane-loading-state
+	// requirement). A separate mutex from busyMu: loading is a render-time
+	// fact about session readiness, not a $busy-signal transition, and the
+	// two must not be conflated even though the load job ALSO rides the
+	// $busy machinery (publishBusy(loadJobKey)) for the Stop button/spinner.
+	loadMu  sync.Mutex
+	loading bool
 
 	// console is the drawer's server-owned scrollback (console.go); mcpSrv
 	// is the shared MCP server value built in newWorkbench, consumed by
@@ -593,7 +817,7 @@ func (wb *workbench) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// view actually has on screen; Datastar morphs whichever id is present
 	// and no-ops on the other (view/page.go's doc comment).
 	wb.h.mu.Lock()
-	base, derived := renderPredicates(wb.h.sess)
+	base, derived := renderPredicates(wb.h.sess, wb.isLoading())
 	wb.h.mu.Unlock()
 	_ = stream.Emit(datastar.Batch(datastar.Elements(base), datastar.Elements(derived)))
 

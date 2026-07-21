@@ -45,10 +45,38 @@ type PredicateEntry struct {
 // its facts via GET /facts/{name}/{arity} (design doc's literal wiring:
 // data-on:click="@get('/facts/<name>/<arity>')"), which replaces the
 // entry's (initially empty) facts container with the first page.
-func Predicates(kind string, entries []PredicateEntry) html.Content {
-	return tag.New("div#"+predicatesID(kind),
-		html.Map(entries, predicateEntry),
-	)
+//
+// loading is true while the background startup-load job (doc/features/
+// workbench-scale.md design decision 3) has not yet applied the base
+// dataset: entries is necessarily empty or stale in that window (the
+// session it was rendered from has no data yet, or — mid-load — only
+// whatever was there before a reload), so this renders the SAME oat
+// [aria-busy] spinner tell every other long-running action in this
+// workbench uses (workbench UI conventions: "the oat [aria-busy] spinner is
+// the one activity indicator") instead of letting the pane read as a
+// genuinely empty dataset. entries is still rendered underneath (normally
+// empty during an initial load, but this keeps the function honest for a
+// RELOAD that happens to race a later load) so nothing is hidden, only
+// annotated.
+func Predicates(kind string, entries []PredicateEntry, loading bool) html.Content {
+	content := []html.Content{html.Map(entries, predicateEntry)}
+	if loading {
+		content = append([]html.Content{loadingNotice()}, content...)
+	}
+	return tag.New("div#"+predicatesID(kind), content...)
+}
+
+// loadingNotice is the shared "loading dataset…" tell for render paths
+// that would otherwise show a convincingly empty session during the
+// background startup load. Today only the two Predicates fragments carry
+// it; the Schema/Rules panels stay bare during the load window and repaint
+// via publishSessionChanged when the load lands — the predicate lists plus
+// the $busy spinner and the console's load entries are the operator-facing
+// tells (doc/features/workbench-scale.md design decision 3).
+func loadingNotice() html.Content {
+	return tag.New("p.loading-notice").
+		Set("aria-busy", "true").
+		Add(html.Text("loading dataset…"))
 }
 
 func predicateEntry(e PredicateEntry) html.Content {

@@ -25,6 +25,17 @@ func newConversationWorkbench(t *testing.T, mode conversationMode) (*workbench, 
 	return wb, conv
 }
 
+// waitTurnIdle waits for the conversation turn gate to release. A driver
+// records its prompt BEFORE the turn's cleanup releases the gate, so a test
+// that fires its next /send the moment promptTexts() reaches N can race the
+// release and be refused as busy (turnGate.Begin's errConversationTurnBusy),
+// hanging its next waitFor. Every send that follows a completed turn must
+// wait on the gate, not just the prompt count.
+func waitTurnIdle(t *testing.T, wb *workbench) {
+	t.Helper()
+	waitFor(t, func() bool { _, running := wb.turnGate.Running(); return !running })
+}
+
 // TestComposerQueryCommand pins design decision 8's `?` command: it runs
 // the query through the session pipeline, renders the result into the
 // conversation's transcript, persists the pair as extension data, queues
@@ -142,6 +153,7 @@ func TestComposerPreamblePrependedToNextTurn(t *testing.T) {
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	waitFor(t, func() bool { return len(driver.promptTexts()) == 1 })
+	waitTurnIdle(t, wb)
 
 	// Between turns: one command and one disk reload.
 	resp = postSignals(t, srv, "/c/"+conv.ID+"/send", map[string]any{
@@ -156,6 +168,7 @@ func TestComposerPreamblePrependedToNextTurn(t *testing.T) {
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	waitFor(t, func() bool { return len(driver.promptTexts()) == 2 })
+	waitTurnIdle(t, wb)
 
 	prompts := driver.promptTexts()
 	if strings.Contains(prompts[0], "workbench context") {
@@ -282,6 +295,8 @@ func TestModePreambleFirstPromptOnly(t *testing.T) {
 	if !strings.HasSuffix(first, "what is loaded?") {
 		t.Fatalf("user text must end the first prompt: %q", first)
 	}
+
+	waitTurnIdle(t, wb)
 
 	resp = postSignals(t, srv, "/c/"+conv.ID+"/send", map[string]any{"prompt": "and derived?"})
 	io.Copy(io.Discard, resp.Body)

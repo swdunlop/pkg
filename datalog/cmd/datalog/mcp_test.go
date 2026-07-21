@@ -73,7 +73,7 @@ func newMordorHandlers(t *testing.T) *mcpHandlers {
 	if _, err := os.Stat(zipPath); err != nil {
 		t.Fatalf("mordor zip not found at %s: %v", zipPath, err)
 	}
-	h, closeFn, err := newMCPHandlers(zipPath, "", nil, "", 5*time.Second, defaultMaxFacts)
+	h, closeFn, err := newMCPHandlers(zipPath, "", nil, "", 5*time.Second, defaultMaxFacts, false)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestNewMCPHandlers_WarnsOnEmbeddedQueriesInRuleFiles(t *testing.T) {
 	origStderr := os.Stderr
 	os.Stderr = w
 
-	h, closeFn, err := newMCPHandlers(dir, "", []string{rulesPath}, "", 5*time.Second, defaultMaxFacts)
+	h, closeFn, err := newMCPHandlers(dir, "", []string{rulesPath}, "", 5*time.Second, defaultMaxFacts, false)
 
 	os.Stderr = origStderr
 	w.Close()
@@ -638,7 +638,7 @@ const testFactCap = 1000
 func TestQuery_ZeroRulesCrossProductExceedsFactCap(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 15)
-	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, testFactCap)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, testFactCap, false)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -669,7 +669,7 @@ func TestQuery_ZeroRulesCrossProductExceedsFactCap(t *testing.T) {
 func TestQuery_RulesBaseStageExceedsFactCap(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 40) // cross product: 40*40 = 1600 > testFactCap (1000)
-	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, testFactCap)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, testFactCap, false)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -699,7 +699,7 @@ func TestQuery_RulesBaseStageExceedsFactCap(t *testing.T) {
 func TestQuery_UnderCapStillSucceeds(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 5)
-	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, testFactCap)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, testFactCap, false)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -740,7 +740,7 @@ func TestQuery_UnderCapStillSucceeds(t *testing.T) {
 func TestQuery_DerivationAboveOldHardcodedCapSucceedsUnderNewDefault(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 60) // cross product: 60*60 = 3600 > old factCap (1000)
-	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, defaultMaxFacts)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, defaultMaxFacts, false)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -771,7 +771,7 @@ func TestQuery_DerivationAboveOldHardcodedCapSucceedsUnderNewDefault(t *testing.
 func TestQuery_CapErrorNamesConfiguredLimitAndFlag(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 40) // 40*40 = 1600 > testFactCap (1000)
-	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, testFactCap)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, testFactCap, false)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -866,7 +866,7 @@ func TestEvalContext_ZeroTimeoutNeverExpires(t *testing.T) {
 func TestCheckFactCap_ZeroMaxFactsNeverCaps(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 60) // 60*60 = 3600 facts once queried as a cross product
-	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, 0)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, 0, false)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -1049,7 +1049,7 @@ func TestQuery_StaleWriteBackDropped(t *testing.T) {
 func TestQuery_CacheRefusesOverFactCapBase(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 1500)
-	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, testFactCap)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, testFactCap, false)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}

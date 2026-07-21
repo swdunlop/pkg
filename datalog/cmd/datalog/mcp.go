@@ -68,7 +68,7 @@ func runMCP(args []string) {
 		os.Exit(1)
 	}
 
-	h, closeFn, err := newMCPHandlers(*dataDir, *configPath, flags.Args(), *rulesDir, *timeout, *maxFacts)
+	h, closeFn, err := newMCPHandlers(*dataDir, *configPath, flags.Args(), *rulesDir, *timeout, *maxFacts, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "datalog mcp: %v\n", err)
 		os.Exit(1)
@@ -247,7 +247,25 @@ func (h *mcpHandlers) cacheDerivedQuery(base datalog.Database, prov *seminaive.P
 // mcpHandlers.maxFacts's doc comment): <= 0 means no cap, in which case
 // seminaive.WithFactLimit is omitted from session.engineOpts entirely rather
 // than being called with a non-positive limit.
-func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir string, timeout time.Duration, maxFacts int) (*mcpHandlers, func() error, error) {
+//
+// deferConfigLoad, when true, skips the configPath data load below (the
+// setSchema call that reads and parses every jsonfacts source — the
+// multi-minute, multi-GB part of startup on a real dataset) and leaves it to
+// the caller. This is `datalog serve`'s background-startup-load seam
+// (doc/features/workbench-scale.md design decision 3): runMCP (stdio
+// `datalog mcp`) always passes false, so its behavior is byte-for-byte
+// unchanged — the stdio path stays synchronous by design. newWorkbench
+// passes true and completes the load itself via loadDeferredSchema, in a
+// background job, so the ONE setSchema call site here is shared by both the
+// synchronous and deferred paths rather than duplicated — a second copy of
+// this loading logic is exactly the kind of call-site patch this repo's
+// review doctrine rejects (see the mechanism note on loadDeferredSchema).
+// Rules always load synchronously regardless of deferConfigLoad: a rules/
+// directory or monolithic rule file is small (parse-bound, not I/O-bound
+// like the base data corpus) and newWorkbench's callers (put_rule_group,
+// the Rules pane) assume h.sess.rules/aggRules are populated the moment the
+// handlers exist.
+func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir string, timeout time.Duration, maxFacts int, deferConfigLoad bool) (*mcpHandlers, func() error, error) {
 	var (
 		fsys    fs.FS
 		confine confineRef
@@ -311,19 +329,10 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir str
 		provenanceEnabled: true,
 	}
 
-	if configPath != "" {
-		data, err := os.ReadFile(configPath)
-		if err != nil {
+	if configPath != "" && !deferConfigLoad {
+		if err := loadConfigSchema(sess, configPath, fsys, confine); err != nil {
 			closeFn()
-			return nil, nil, fmt.Errorf("reading config %s: %w", configPath, err)
-		}
-		format := "yaml"
-		if ext := filepath.Ext(configPath); ext == ".json" {
-			format = "json"
-		}
-		if err := sess.setSchema(string(data), format, fsys, confine); err != nil {
-			closeFn()
-			return nil, nil, fmt.Errorf("loading config %s: %w", configPath, err)
+			return nil, nil, err
 		}
 	}
 
@@ -387,16 +396,85 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir str
 	}
 
 	// schemaRev is built from whatever sess.authoringCfg ended up holding above
-	// (empty if configPath == "", exactly like a freshly loaded config with
-	// no items). A configPath == "" session still gets a non-nil schemaRev
-	// even though every write tool refuses it outright (errSchemaPathRequired)
-	// — get_config's read path (schema_reads.go) has no such restriction and
-	// must never nil-panic on a schema-less session.
+	// (empty if configPath == "" OR deferConfigLoad is true — exactly like a
+	// freshly loaded config with no items). A configPath == "" session still
+	// gets a non-nil schemaRev even though every write tool refuses it
+	// outright (errSchemaPathRequired) — get_config's read path
+	// (schema_reads.go) has no such restriction and must never nil-panic on a
+	// schema-less session. When deferConfigLoad is true, loadDeferredSchema
+	// rebuilds schemaRev from the real authoringCfg once the load completes —
+	// this empty one is a placeholder for the loading window only.
 	return &mcpHandlers{
 		sess: sess, fsys: fsys, confine: confine, timeout: timeout, maxFacts: maxFacts, rules: store,
 		configPath: configPath,
 		schemaRev:  newSchemaRevisions(sess.authoringCfg),
 	}, closeFn, nil
+}
+
+// loadConfigSchema reads configPath and applies it to sess via setSchema —
+// the ONE code path both the synchronous newMCPHandlers construction (runMCP,
+// and newWorkbench when it is not deferring) and the deferred background-load
+// job (newWorkbench's loadDeferredSchema, doc/features/workbench-scale.md
+// design decision 3) use to load the base dataset. A second, parallel
+// implementation of "read configPath, sniff format from its extension, call
+// setSchema" is exactly the kind of call-site duplication this repo's review
+// doctrine rejects (CLAUDE.md "fix at the mechanism, not the call site") —
+// any future change to how a config file is loaded (a new format, a
+// different sniffing rule) only has to land here.
+func loadConfigSchema(sess *session, configPath string, fsys fs.FS, confine confineRef) error {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return fmt.Errorf("reading config %s: %w", configPath, err)
+	}
+	format := "yaml"
+	if ext := filepath.Ext(configPath); ext == ".json" {
+		format = "json"
+	}
+	if err := sess.setSchema(string(data), format, fsys, confine); err != nil {
+		return fmt.Errorf("loading config %s: %w", configPath, err)
+	}
+	return nil
+}
+
+// loadDeferredSchema performs the configPath load newMCPHandlers skipped
+// when constructed with deferConfigLoad (h.configPath is set either way, so
+// this reads the exact same file). It takes h.mu around the whole
+// read-parse-load-and-swap, matching setSchema's atomic-replacement contract
+// (session.setSchema's doc comment: "the session is left exactly as it was
+// before the call... either fully replaces the old one or not at all") — a
+// query or workbench pane racing this load sees either the pre-load empty
+// session or the fully loaded one, never a partial swap. On success it
+// rebuilds h.schemaRev from the freshly loaded sess.authoringCfg (the
+// construction-time value was necessarily built from an empty config, since
+// the real one had not loaded yet) and fires h.onChange under the same lock,
+// exactly like applySchemaLocked does for every other schema write, so the
+// workbench's patch-back (publishSessionChanged) sees the new state. Callers
+// (newWorkbench's background load job) must NOT hold h.mu when calling this
+// — it manages its own locking so the load itself (prepareSchema's file
+// walk, potentially minutes on a real dataset) never blocks every other tool
+// call or pane for its whole duration... except that setSchema's signature
+// leaves no lock-free window (see setSchema's own doc comment steering
+// lock-free callers to prepareSchema directly instead) — this method
+// accepts holding h.mu for the full load rather than adding a second
+// lock-free variant, because the very first load has no prior state for a
+// concurrent reader to see anyway (every read path already treats a nil/
+// empty session as "nothing loaded yet, show a loading state" per the
+// workbench-scale.md background-load design) and the alternative (a
+// prepareSchema-then-relock dance) would be new machinery duplicating
+// reloadSchema's (watch.go) already-careful TOCTOU handling for a case that
+// does not need it: nothing else can have mutated schemaText before the
+// first load ever completes.
+func (h *mcpHandlers) loadDeferredSchema() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := loadConfigSchema(h.sess, h.configPath, h.fsys, h.confine); err != nil {
+		return err
+	}
+	h.schemaRev = newSchemaRevisions(h.sess.authoringCfg)
+	if h.onChange != nil {
+		h.onChange()
+	}
+	return nil
 }
 
 // toolMode scopes which tools registerToolsForMode wires into a server
