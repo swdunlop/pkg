@@ -11,25 +11,87 @@ import (
 	"swdunlop.dev/pkg/datalog/seminaive"
 )
 
-// evalTimeout bounds Run, Apply, and agent query calls (doc/features/web-ui.md
-// "Execution sandbox"); the fixpoint loop checks ctx.Err() per iteration and
-// between strata, so even a hung ruleset is cleanly cancellable. Keystroke
-// evaluation (parse+compile only) needs no timeout at all.
-const evalTimeout = 5 * time.Second
+// defaultMaxFacts and defaultEvalTimeout are the operator-facing defaults for
+// --max-facts (datalog serve) / -max-facts (datalog mcp) and --eval-timeout /
+// -timeout respectively (doc/features/workbench-scale.md design decision 1):
+// sized for a real dataset (the OpTC starter slice derives ~300k facts over
+// ~6 minutes of base load), not the old 1000-fact/5-second demo guillotine
+// tuned for examples/mordor's 506 events. Both flags accept 0 to disable
+// their respective mechanism entirely ("no cap, rely on Stop + OOM" /
+// "no deadline, Stop is the only brake"); these constants are only the
+// starting point an operator gets without passing either flag.
+const (
+	defaultMaxFacts    = 10_000_000
+	defaultEvalTimeout = 5 * time.Minute
+)
 
-// factCap is the hard per-evaluation output-fact limit (doc/features/web-ui.md):
-// hitting it halts evaluation and reports "rule too broad" rather than
-// letting a combinatorial ruleset run away. Every seminaive.Engine the
-// workbench builds is constructed with seminaive.WithFactLimit(factCap) (see
-// session.engineOpts, set once in newMCPHandlers and threaded through every
-// Compile call — evaluateSnapshot, runQuery's two stages, and the trial
-// compiles in handleRulesCheck/setRules), so the cap is enforced DURING
-// Transform: evaluation halts with a seminaive.FactLimitError the moment the
-// derived-fact count crosses factCap, rather than after a runaway cross
-// product has already materialized every tuple and exhausted memory.
-// translateFactLimit turns that typed error into the same "rule too broad"
-// wording checkFactCap below used to produce post-hoc.
-const factCap = 1000
+// evalContext derives ctx from parent for one bounded evaluation (Run, Apply,
+// agent query, the Fact Browser's "why?", autoReevaluate, the composer's
+// query command — every site that used to hardcode context.WithTimeout(ctx,
+// evalTimeout), doc/features/workbench-scale.md work item 2). h.timeout is
+// the operator-resolved --eval-timeout ("datalog mcp"'s -timeout flag, or
+// "datalog serve"'s --eval-timeout, both defaulting to a value sized for real
+// data, not the old 5s demo guillotine); this is the ONE place that turns
+// that duration into a context, so no site can silently keep a stale
+// deadline. h.timeout <= 0 means "no deadline — Stop is the only brake": the
+// returned context is WithCancel, never WithDeadline, so it does not
+// pre-expire the instant it's created. The fixpoint loop's own ctx.Err()
+// checks per iteration/stratum still make even an unbounded evaluation
+// cleanly cancellable via Global Cancel. Keystroke evaluation (parse+compile
+// only) must keep bypassing this helper entirely — it needs no timeout at
+// all, bounded or not.
+func (h *mcpHandlers) evalContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if h.timeout <= 0 {
+		return context.WithCancel(parent)
+	}
+	return context.WithTimeout(parent, h.timeout)
+}
+
+// checkFactCap counts db's total facts across every predicate — base facts
+// loaded from the input source PLUS everything derived — and reports an
+// error identifying the evaluation as exceeding the operator's --max-facts
+// budget if that total exceeds h.maxFacts. This measures something
+// WithFactLimit does not and so is NOT subsumed by it: WithFactLimit (wired
+// into every session.engineOpts, see newMCPHandlers) only counts facts
+// derived DURING one Transform call, deliberately excluding whatever was
+// already loaded, so a query against a large but legitimate already-loaded
+// dataset still runs to completion. checkFactCap's total-size check exists
+// for a different purpose — deciding whether Run's result is small enough to
+// cache into session.derivedDB (rules_editor.go's handleRulesRun) or to keep
+// resident after startup evaluation (serve.go's newWorkbench) — where what
+// matters is how much this evaluation will hold in memory as the workbench's
+// cached "derived" view, not just how much of it this one Transform call
+// newly computed. It remains a post-Transform check (there is no cheaper way
+// to size a whole database), called only after Transform has already
+// succeeded — WithFactLimit's mid-evaluation halt still bounds peak
+// allocation during that Transform itself. h.maxFacts <= 0 means "no cap":
+// every db passes, matching --max-facts 0's "no cap, rely on Stop + OOM"
+// contract.
+func (h *mcpHandlers) checkFactCap(db datalog.Database) error {
+	if h.maxFacts <= 0 {
+		return nil
+	}
+	total := 0
+	for name, arity := range db.Predicates() {
+		for range db.Facts(name, arity) {
+			total++
+			if total > h.maxFacts {
+				return fmt.Errorf(capExceededMsg, h.maxFacts)
+			}
+		}
+	}
+	return nil
+}
+
+// capExceededMsg is the wording shared by checkFactCap's post-hoc check and
+// translateFactLimit's mid-Transform translation (doc/features/
+// workbench-scale.md work item 3): both mechanisms catch the same class of
+// runaway ruleset by different means, and must read identically to a human
+// or agent regardless of which one fired. It names the limit and how to
+// raise it — replacing the old "rule too broad" wording, which reads as "you
+// wrote a bad rule" even when a developer is legitimately deriving millions
+// of facts and just hasn't raised the flag yet.
+const capExceededMsg = "evaluation exceeded the --max-facts limit (%d); raise it with --max-facts or stop the run"
 
 // jobs is the Global Cancel cancel-set (doc/notes/datastar.md §9): each
 // running operation registers a CancelFunc under a job name key
@@ -111,50 +173,19 @@ func runRecovered(fn func() error) <-chan error {
 	return done
 }
 
-// checkFactCap counts db's total facts across every predicate — base facts
-// loaded from the input source PLUS everything derived — and reports an
-// error identifying the ruleset as too broad if that total exceeds factCap.
-// This measures something WithFactLimit does not and so is NOT subsumed by
-// it: WithFactLimit (wired into every session.engineOpts, see factCap's doc
-// comment) only counts facts derived DURING one Transform call, deliberately
-// excluding whatever was already loaded, so a query against a large but
-// legitimate already-loaded dataset still runs to completion. checkFactCap's
-// total-size check exists for a different purpose — deciding whether Run's
-// result is small enough to cache into session.derivedDB (rules_editor.go's
-// handleRulesRun) or to keep resident after startup evaluation (serve.go's
-// newWorkbench) — where what matters is how much this evaluation will hold
-// in memory as the workbench's cached "derived" view, not just how much of
-// it this one Transform call newly computed. It remains a post-Transform
-// check (there is no cheaper way to size a whole database), called only
-// after Transform has already succeeded — WithFactLimit's mid-evaluation
-// halt still bounds peak allocation during that Transform itself.
-func checkFactCap(db datalog.Database) error {
-	total := 0
-	for name, arity := range db.Predicates() {
-		for range db.Facts(name, arity) {
-			total++
-			if total > factCap {
-				return fmt.Errorf("rule too broad: output exceeds %d facts, halting", factCap)
-			}
-		}
-	}
-	return nil
-}
-
 // translateFactLimit rewords a seminaive.FactLimitError (matchable via
 // errors.As — see WithFactLimit's doc comment in seminaive/engine.go) into
-// the same "rule too broad ... halting" phrasing checkFactCap's post-hoc
-// check used, so a caller can't tell from the message alone which mechanism
-// caught the runaway ruleset: the mid-evaluation halt and the old post-hoc
-// check are meant to read identically to the human or agent on the other
-// end. err is returned unchanged if it does not wrap a FactLimitError.
+// the same capExceededMsg phrasing checkFactCap's post-hoc check uses, so a
+// caller can't tell from the message alone which mechanism caught the
+// runaway ruleset: the mid-evaluation halt and the post-hoc check are meant
+// to read identically to the human or agent on the other end. err is
+// returned unchanged if it does not wrap a FactLimitError.
 // Callers wrap every Transform call whose error can reach a user-facing
 // surface (evaluateSnapshot, runQuery's two stages) with this.
 func translateFactLimit(err error) error {
 	var limitErr seminaive.FactLimitError
 	if errors.As(err, &limitErr) {
-		return fmt.Errorf("rule too broad: evaluation derived more than %d facts, halting", limitErr.Limit)
+		return fmt.Errorf(capExceededMsg, limitErr.Limit)
 	}
 	return err
 }
-

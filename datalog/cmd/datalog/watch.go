@@ -329,14 +329,15 @@ func (wb *workbench) reloadSchema() (changed []string, swapped bool, err error) 
 	return changed, true, nil
 }
 
-// autoReevaluate runs the full 5s-capped Transform after a successful
-// reload swap, mirroring handleRulesRun's snapshot/evaluate/write-back
-// split (rules_editor.go): h.mu is held only to capture the snapshot and to
-// commit the result under the generation guard; the Transform itself runs
-// lock-free under the reload job so Global Cancel can stop it and the
-// spinner shows. The write-back is gen-guarded exactly like Run's: if
-// anything else mutated the session while the Transform ran, the result is
-// discarded (whoever mutated will have invalidated derivedDB themselves).
+// autoReevaluate runs the full Transform, bounded by wb.h.evalContext's
+// resolved --eval-timeout, after a successful reload swap, mirroring
+// handleRulesRun's snapshot/evaluate/write-back split (rules_editor.go): h.mu
+// is held only to capture the snapshot and to commit the result under the
+// generation guard; the Transform itself runs lock-free under the reload job
+// so Global Cancel can stop it and the spinner shows. The write-back is
+// gen-guarded exactly like Run's: if anything else mutated the session while
+// the Transform ran, the result is discarded (whoever mutated will have
+// invalidated derivedDB themselves).
 func (wb *workbench) autoReevaluate() error {
 	jobCtx, done := wb.jobs.Begin(context.Background(), reloadJobKey)
 	if jobCtx == nil {
@@ -350,7 +351,7 @@ func (wb *workbench) autoReevaluate() error {
 	wb.publishBusy(reloadJobKey)
 	defer wb.publishBusy("")
 
-	ctx, cancel := context.WithTimeout(jobCtx, evalTimeout)
+	ctx, cancel := wb.h.evalContext(jobCtx)
 	defer cancel()
 
 	wb.h.mu.Lock()
@@ -369,7 +370,7 @@ func (wb *workbench) autoReevaluate() error {
 	}
 	var capErr error
 	if evalErr == nil {
-		capErr = checkFactCap(evaluated)
+		capErr = wb.h.checkFactCap(evaluated)
 	}
 
 	wb.h.mu.Lock()

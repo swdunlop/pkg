@@ -41,6 +41,8 @@ func runServe(args []string) {
 	providerURL := flags.String("provider-url", "", "override the agent model provider's base URL (e.g. an OpenAI-compatible llama-swap endpoint)")
 	providerKey := flags.String("provider-api-key", "", "override the agent model provider's API key; empty defers to provider env vars")
 	agentCmd := flags.String("agent", "", "external ACP agent command, split shell-style (e.g. 'npx @agentclientprotocol/claude-agent-acp'); empty uses the embedded kit agent")
+	maxFacts := flags.Int("max-facts", defaultMaxFacts, "cap on total facts (base + derived) an evaluation may hold before it is refused as too large; 0 = no cap, rely on Stop + OOM (doc/features/workbench-scale.md)")
+	evalTimeout := flags.Duration("eval-timeout", defaultEvalTimeout, "deadline for Run/Apply/agent query/Fact Browser evaluations; 0 = no deadline, Stop is the only brake (doc/features/workbench-scale.md)")
 	if err := flags.Parse(args); err != nil {
 		// flag.ExitOnError already printed usage and exited on real errors;
 		// this only returns for -h/-help.
@@ -74,7 +76,7 @@ func runServe(args []string) {
 			ProviderAPIKey: *providerKey,
 			AgentCommand:   *agentCmd,
 			MCPURL:         mcpURL(*listen),
-		})
+		}, *maxFacts, *evalTimeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "datalog serve: %v\n", err)
 		os.Exit(1)
@@ -131,8 +133,13 @@ func runServe(args []string) {
 // monolithic path) — runServe has already rejected the case where both are
 // given, mirroring runMCP's identical check, so newWorkbench itself does
 // not re-validate that here (newMCPHandlers just prefers rulesDir when set).
-func newWorkbench(dataDir, configPath string, ruleFiles []string, rulesDir string, tokenFlag string, agentCfg agentConfig) (*workbench, func() error, error) {
-	h, closeFn, err := newMCPHandlers(dataDir, configPath, ruleFiles, rulesDir, evalTimeout)
+// maxFacts and evalTimeout are runServe's resolved --max-facts/--eval-timeout
+// flag values (doc/features/workbench-scale.md work item 1), threaded
+// straight into newMCPHandlers so every evaluation this workbench runs
+// shares the one operator-set budget/deadline; <= 0 means "no cap"/"no
+// deadline" respectively, per newMCPHandlers' and evalContext's doc comments.
+func newWorkbench(dataDir, configPath string, ruleFiles []string, rulesDir string, tokenFlag string, agentCfg agentConfig, maxFacts int, evalTimeout time.Duration) (*workbench, func() error, error) {
+	h, closeFn, err := newMCPHandlers(dataDir, configPath, ruleFiles, rulesDir, evalTimeout, maxFacts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -215,7 +222,7 @@ func newWorkbench(dataDir, configPath string, ruleFiles []string, rulesDir strin
 	// and a compile/timeout problem here is fixable in the running
 	// editor, so warn and serve rather than refuse to start.
 	if len(h.sess.rules)+len(h.sess.aggRules) > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), evalTimeout)
+		ctx, cancel := h.evalContext(context.Background())
 		evalErr := <-runRecovered(func() error {
 			h.mu.Lock()
 			defer h.mu.Unlock()
@@ -223,7 +230,7 @@ func newWorkbench(dataDir, configPath string, ruleFiles []string, rulesDir strin
 			if err != nil {
 				return err
 			}
-			if err := checkFactCap(db); err != nil {
+			if err := h.checkFactCap(db); err != nil {
 				return err
 			}
 			// prov rides beside db under the same generation guard every

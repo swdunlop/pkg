@@ -476,11 +476,12 @@ what's on disk right now, including comments and formatting).`
 
 // mcpQueryDescription documents the query tool. It takes the server's
 // actual per-query timeout rather than hardcoding a number: `datalog mcp`
-// defaults to 60s but is operator-configurable via --timeout, while
-// `datalog serve`'s /mcp mount has no such flag and always runs under the
-// same 5s evalTimeout as the rest of the web UI (Run/Apply/agent query) —
-// a single fixed claim in the doc text would be wrong for whichever mode
-// didn't match it. See registerTools' call site.
+// defaults to 60s but is operator-configurable via -timeout, while
+// `datalog serve`'s /mcp mount has no dedicated flag of its own and always
+// runs under the same --eval-timeout as the rest of the web UI (Run/Apply/
+// agent query — mcpHandlers.evalContext, sandbox.go), default 5m — a single
+// fixed claim in the doc text would be wrong for whichever mode didn't match
+// it. See registerTools' call site.
 func mcpQueryDescription(timeout time.Duration) string {
 	return `Evaluate one Datalog query against the current schema + rules + loaded
 data, and return matching rows plus per-stratum evaluation stats. This is

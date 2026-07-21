@@ -73,9 +73,10 @@ func (wb *workbench) runComposerCommand(convID string, mode conversationMode, ki
 }
 
 // runComposerQuery runs one `?` command through the same pipeline the
-// query tool uses (lockedSnapshot → runQuery under evalTimeout, outcomes
-// ordered by classifyQueryOutcome), returning the transcript rendering and
-// the plain-text summary for persistence/preamble.
+// query tool uses (lockedSnapshot → runQuery under wb.h.evalContext's
+// resolved --eval-timeout, outcomes ordered by classifyQueryOutcome),
+// returning the transcript rendering and the plain-text summary for
+// persistence/preamble.
 func (wb *workbench) runComposerQuery(input string) (html.Content, string) {
 	echo := queryEcho("? " + input)
 	if input == "" {
@@ -113,7 +114,7 @@ func (wb *workbench) runComposerQuery(input string) (html.Content, string) {
 	wb.publishBusy("query")
 	defer wb.publishBusy("")
 
-	ctx, cancel := context.WithTimeout(jobCtx, evalTimeout)
+	ctx, cancel := wb.h.evalContext(jobCtx)
 	defer cancel()
 
 	parts := html.Group{echo}

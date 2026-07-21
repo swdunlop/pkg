@@ -40,7 +40,8 @@ func runMCP(args []string) {
 	dataDir := flags.String("d", "", "data directory or .zip file (required unless --proxy is given; the security boundary for all file access)")
 	configPath := flags.String("c", "", "path to a JSON or YAML jsonfacts config file to preload")
 	rulesDir := flags.String("rules", "", "path to a rules/ directory store (one <head>_<arity>.dl file per rule group); mutually exclusive with positional rule files")
-	timeout := flags.Duration("timeout", 60*time.Second, "per-query evaluation timeout")
+	timeout := flags.Duration("timeout", 60*time.Second, "per-query evaluation timeout; 0 = no deadline, Stop is the only brake")
+	maxFacts := flags.Int("max-facts", defaultMaxFacts, "cap on total facts (base + derived) an evaluation may hold before it is refused as too large; 0 = no cap, rely on Stop + OOM (doc/features/workbench-scale.md); shares defaultMaxFacts with `datalog serve`'s --max-facts so both entrypoints are sized for real data")
 	proxy := flags.String("proxy", "", "bridge stdio to a remote streamable-HTTP MCP endpoint (e.g. a running datalog serve's /mcp) instead of serving a local session; the bearer token comes from DATALOG_MCP_TOKEN, never a flag — argv is visible to every process listing")
 	if err := flags.Parse(args); err != nil {
 		// flag.ExitOnError already printed usage and exited on real errors;
@@ -67,7 +68,7 @@ func runMCP(args []string) {
 		os.Exit(1)
 	}
 
-	h, closeFn, err := newMCPHandlers(*dataDir, *configPath, flags.Args(), *rulesDir, *timeout)
+	h, closeFn, err := newMCPHandlers(*dataDir, *configPath, flags.Args(), *rulesDir, *timeout, *maxFacts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "datalog mcp: %v\n", err)
 		os.Exit(1)
@@ -105,6 +106,17 @@ type mcpHandlers struct {
 	fsys    fs.FS      // confined data filesystem: dataRoot.FS() or a *zip.Reader
 	confine confineRef // validates a ref against the data root; nil-safe (treated as "no restriction") only in tests
 	timeout time.Duration
+
+	// maxFacts is the resolved --max-facts budget (datalog serve) / -max-facts
+	// budget (datalog mcp), doc/features/workbench-scale.md work items 1-2: the
+	// SAME number backs two distinct mechanisms — it is passed to
+	// seminaive.WithFactLimit in session.engineOpts below (the mid-Transform
+	// derived-fact halt) and read by checkFactCap (sandbox.go, the
+	// cache-admission total-size check) — so an operator's one flag tunes both
+	// without either mechanism drifting out of sync. <= 0 means "no cap, rely
+	// on Stop + OOM": WithFactLimit is omitted from engineOpts entirely (never
+	// passed a non-positive limit) and checkFactCap always passes.
+	maxFacts int
 
 	// onChange, if set, is invoked after a SUCCESSFUL setSchema or setRules
 	// call, while h.mu is STILL HELD (matching publishSessionChanged's
@@ -198,7 +210,7 @@ func (h *mcpHandlers) cacheDerivedQuery(base datalog.Database, prov *seminaive.P
 	if base == nil {
 		return
 	}
-	if err := checkFactCap(base); err != nil {
+	if err := h.checkFactCap(base); err != nil {
 		return
 	}
 	h.mu.Lock()
@@ -230,7 +242,12 @@ func (h *mcpHandlers) cacheDerivedQuery(base datalog.Database, prov *seminaive.P
 // pane, etc.) keeps seeing one document exactly as it did for a monolithic
 // file. The loaded *ruleStore itself is kept on the returned handlers (see
 // mcpHandlers.rules's doc comment) for a later CRUD task to build on.
-func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir string, timeout time.Duration) (*mcpHandlers, func() error, error) {
+//
+// maxFacts is the resolved --max-facts / -max-facts budget (see
+// mcpHandlers.maxFacts's doc comment): <= 0 means no cap, in which case
+// seminaive.WithFactLimit is omitted from session.engineOpts entirely rather
+// than being called with a non-positive limit.
+func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir string, timeout time.Duration, maxFacts int) (*mcpHandlers, func() error, error) {
 	var (
 		fsys    fs.FS
 		confine confineRef
@@ -263,7 +280,7 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir str
 		closeFn = root.Close
 	}
 
-	// WithFactLimit(factCap) (sandbox.go) is the default engine option for
+	// WithFactLimit(maxFacts) (sandbox.go) is the default engine option for
 	// every seminaive.Engine this session's methods build — set here, once,
 	// rather than at each of the several Compile call sites (session.go's
 	// setRules/setRulesWithQueries/evaluateSnapshot/runQuery, rules_editor.go's
@@ -273,6 +290,11 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir str
 	// `datalog mcp` (runMCP) and `datalog serve` (newWorkbench) build their
 	// session through this constructor, so both get the cap; the bare REPL
 	// (repl.go's newREPL) is a separate, uncapped surface not in scope here.
+	// maxFacts <= 0 ("no cap, rely on Stop + OOM" — doc/features/
+	// workbench-scale.md design decision 1) omits WithFactLimit from
+	// engineOpts entirely rather than passing it a non-positive limit, which
+	// would either panic or (worse) silently cap at zero depending on
+	// WithFactLimit's own validation.
 	// provenanceEnabled: true by default for every cmd/datalog session
 	// (doc/features/provenance.md "Session policy" — interactive scale, the
 	// memory cost is bounded per doc/features/provenance.md's Risks section).
@@ -280,8 +302,12 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir str
 	// their session through this constructor, so both get it; the library
 	// default (seminaive.WithProvenance never used unless a caller opts in)
 	// is unchanged for callers outside cmd/datalog.
+	var engineOpts []seminaive.Option
+	if maxFacts > 0 {
+		engineOpts = []seminaive.Option{seminaive.WithFactLimit(maxFacts)}
+	}
 	sess := &session{
-		engineOpts:        []seminaive.Option{seminaive.WithFactLimit(factCap)},
+		engineOpts:        engineOpts,
 		provenanceEnabled: true,
 	}
 
@@ -367,7 +393,7 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir str
 	// — get_config's read path (schema_reads.go) has no such restriction and
 	// must never nil-panic on a schema-less session.
 	return &mcpHandlers{
-		sess: sess, fsys: fsys, confine: confine, timeout: timeout, rules: store,
+		sess: sess, fsys: fsys, confine: confine, timeout: timeout, maxFacts: maxFacts, rules: store,
 		configPath: configPath,
 		schemaRev:  newSchemaRevisions(sess.authoringCfg),
 	}, closeFn, nil
@@ -819,7 +845,7 @@ func (h *mcpHandlers) query(ctx context.Context, in queryInput) (queryOutput, er
 		limit = maxQueryLimit
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, h.timeout)
+	ctx, cancel := h.evalContext(ctx)
 	defer cancel()
 
 	snap, err := h.lockedSnapshot()
@@ -994,7 +1020,7 @@ func (h *mcpHandlers) explainDerivation(ctx context.Context, in explainInput) (s
 		return seminaive.Derivation{}, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, h.timeout)
+	ctx, cancel := h.evalContext(ctx)
 	defer cancel()
 
 	h.mu.Lock()
@@ -1023,7 +1049,7 @@ func (h *mcpHandlers) explainDerivation(ctx context.Context, in explainInput) (s
 			return seminaive.Derivation{}, err
 		}
 		prov = fresh
-		if err := checkFactCap(out); err == nil {
+		if err := h.checkFactCap(out); err == nil {
 			h.mu.Lock()
 			if h.sess.gen == snapGen {
 				h.sess.derivedDB = out

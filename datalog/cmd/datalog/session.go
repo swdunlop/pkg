@@ -32,10 +32,12 @@ type session struct {
 	// methods build (setRules/setRulesWithQueries's trial Compile,
 	// evaluate/evaluateSnapshot, runQuery's two stages). newMCPHandlers
 	// (mcp.go) sets it once at construction to
-	// []seminaive.Option{seminaive.WithFactLimit(factCap)} (sandbox.go), so
-	// every Transform this session ever runs — including both of a query's
-	// stages — halts mid-evaluation once it derives more than factCap new
-	// facts, rather than materializing an unbounded result first.
+	// []seminaive.Option{seminaive.WithFactLimit(maxFacts)} (sandbox.go) when
+	// the operator's --max-facts/-max-facts is > 0 (omitted entirely when it
+	// is 0, meaning no cap), so every Transform this session ever runs —
+	// including both of a query's stages — halts mid-evaluation once it
+	// derives more than that many new facts, rather than materializing an
+	// unbounded result first.
 	engineOpts []seminaive.Option
 
 	// Data source configured via setDataSource.
@@ -672,7 +674,8 @@ func (s *session) newEvalProvenance() *seminaive.Provenance {
 // fix for set_schema previously holding h.mu across a full data reload).
 // Run (rules_editor.go's handleRulesRun) is this pattern's other caller: it
 // previously held wb.h.mu across evaluate's entire Transform, freezing every
-// page load, SSE connect, and MCP call for up to evalTimeout. gen is
+// page load, SSE connect, and MCP call for up to the resolved --eval-timeout
+// (mcpHandlers.evalContext, sandbox.go). gen is
 // session.gen as of this snapshot; a caller that wants to write a freshly
 // computed result back into derivedDB should only do so if the session's
 // CURRENT gen still equals the gen returned here — otherwise a set_schema/
@@ -690,11 +693,12 @@ func (s *session) snapshotForEvaluate() (ruleset syntax.Ruleset, engineOpts []se
 
 // evaluateSnapshot is evaluate's lock-free half: Compile+Transform against
 // an already-captured snapshot (snapshotForEvaluate), safe to run with no
-// session lock held at all. engineOpts carries seminaive.WithFactLimit(factCap)
-// (set once in newMCPHandlers — see session.engineOpts), so Transform halts
-// mid-evaluation with a seminaive.FactLimitError if the ruleset derives too
-// many facts; translateFactLimit reworks that into checkFactCap's familiar
-// "rule too broad" wording before it reaches a caller.
+// session lock held at all. engineOpts carries seminaive.WithFactLimit(maxFacts)
+// when the operator's --max-facts is > 0 (set once in newMCPHandlers — see
+// session.engineOpts), so Transform halts mid-evaluation with a
+// seminaive.FactLimitError if the ruleset derives too many facts;
+// translateFactLimit reworks that into checkFactCap's familiar
+// capExceededMsg wording before it reaches a caller.
 //
 // prov, when non-nil (see newEvalProvenance), is threaded in as an extra
 // seminaive.WithProvenance option for THIS Transform only — engineOpts
@@ -837,13 +841,14 @@ func (s *session) runQuery(ctx context.Context, q *syntax.Query) (rows [][]datal
 // the pre-fix single-Transform cost exactly for that common case.
 //
 // Both stages' engine options come from qs.engineOpts, which carries
-// seminaive.WithFactLimit(factCap) by default (set once in newMCPHandlers —
-// see session.engineOpts' doc comment): each stage's own Transform halts
-// mid-evaluation with a seminaive.FactLimitError if IT derives too many new
-// facts, translated to the familiar "rule too broad" wording below. This
-// covers the synthetic _q_ stage too, which previously had no cap of its
-// own at all — a zero-rule session (stage one skipped, base = qs.db
-// verbatim) left the query's own cross product completely uncapped.
+// seminaive.WithFactLimit(maxFacts) when the operator's --max-facts is > 0
+// (set once in newMCPHandlers — see session.engineOpts' doc comment): each
+// stage's own Transform halts mid-evaluation with a seminaive.FactLimitError
+// if IT derives too many new facts, translated to the familiar
+// capExceededMsg wording below. This covers the synthetic _q_ stage too,
+// which previously had no cap of its own at all — a zero-rule session
+// (stage one skipped, base = qs.db verbatim) left the query's own cross
+// product completely uncapped.
 func (qs *querySnapshot) runQuery(ctx context.Context, q *syntax.Query) (rows [][]datalog.Constant, vars []string, stats []seminaive.StratumStats, err error) {
 	vars = extractNamedVars(q.Body)
 

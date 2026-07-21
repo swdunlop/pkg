@@ -27,7 +27,7 @@ func watchTestWorkbench(t *testing.T) (wb *workbench, schemaPath, rulesDir strin
 	mustWriteFile(t, filepath.Join(rulesDir, "busy_2.dl"),
 		"busy(H, P) :- event(H, P, ?).\n")
 
-	wb, closeFn, err := newWorkbench(dir, schemaPath, nil, rulesDir, "test-token", agentConfig{})
+	wb, closeFn, err := newWorkbench(dir, schemaPath, nil, rulesDir, "test-token", agentConfig{}, defaultMaxFacts, defaultEvalTimeout)
 	if err != nil {
 		t.Fatalf("newWorkbench: %v", err)
 	}

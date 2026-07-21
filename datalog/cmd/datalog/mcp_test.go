@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"iter"
@@ -72,7 +73,7 @@ func newMordorHandlers(t *testing.T) *mcpHandlers {
 	if _, err := os.Stat(zipPath); err != nil {
 		t.Fatalf("mordor zip not found at %s: %v", zipPath, err)
 	}
-	h, closeFn, err := newMCPHandlers(zipPath, "", nil, "", 5*time.Second)
+	h, closeFn, err := newMCPHandlers(zipPath, "", nil, "", 5*time.Second, defaultMaxFacts)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -317,7 +318,7 @@ func TestNewMCPHandlers_WarnsOnEmbeddedQueriesInRuleFiles(t *testing.T) {
 	origStderr := os.Stderr
 	os.Stderr = w
 
-	h, closeFn, err := newMCPHandlers(dir, "", []string{rulesPath}, "", 5*time.Second)
+	h, closeFn, err := newMCPHandlers(dir, "", []string{rulesPath}, "", 5*time.Second, defaultMaxFacts)
 
 	os.Stderr = origStderr
 	w.Close()
@@ -607,26 +608,37 @@ func TestQuery_DoesNotHoldLockDuringTransform(t *testing.T) {
 // -- fact cap: mid-evaluation WithFactLimit enforcement ---------------------
 //
 // These three tests build handlers through newMCPHandlers (not
-// newTestHandlers, which builds a bare &session{} with no engineOpts) so the
-// session carries newMCPHandlers' default engineOpts —
-// []seminaive.Option{seminaive.WithFactLimit(factCap)} — exactly like
-// `datalog mcp`/`datalog serve` do in production. That default is what
-// closes the hole below; a handler built the newTestHandlers way would not
-// exercise it at all.
+// newTestHandlers, which builds a bare &session{} with no engineOpts) with an
+// explicit small maxFacts (testFactCap, 1000 — the workbench's old hardcoded
+// default, still the natural size for a synthetic-data threshold test) so the
+// session carries newMCPHandlers' engineOpts —
+// []seminaive.Option{seminaive.WithFactLimit(testFactCap)} — exactly like
+// `datalog mcp`/`datalog serve` do in production when an operator configures
+// --max-facts/-max-facts to this value. That default is what closes the hole
+// below; a handler built the newTestHandlers way would not exercise it at
+// all.
+
+// testFactCap is the small --max-facts value these cap tests configure
+// explicitly (doc/features/workbench-scale.md work item 7: "the reworded cap
+// error fires at a configured low limit") — the production default is now
+// defaultMaxFacts (10,000,000), far too high to trip with these synthetic
+// datasets, so these tests configure their own low ceiling rather than
+// relying on any package-level constant.
+const testFactCap = 1000
 
 // TestQuery_ZeroRulesCrossProductExceedsFactCap is the adversarial
 // validation's exact repro: a session with NO rules skips runQuery's base-
 // ruleset stage entirely (session.go: "nothing to derive: the EDB snapshot
 // IS the whole fixpoint"), so the only Transform that ever runs is the
 // synthetic _q_ stage built from the query body itself — and, before every
-// session.engineOpts carried WithFactLimit(factCap) by default, nothing
-// capped that stage at all. A 3-way self-join over 15 facts derived
-// 15^3 = 3375 _q_ rows with no error. It must now halt with a "rule too
-// broad" error instead.
+// session.engineOpts carried WithFactLimit by default, nothing capped that
+// stage at all. A 3-way self-join over 15 facts derived 15^3 = 3375 _q_ rows
+// with no error. It must now halt with the "evaluation exceeded the
+// --max-facts limit" error instead.
 func TestQuery_ZeroRulesCrossProductExceedsFactCap(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 15)
-	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, testFactCap)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -642,8 +654,8 @@ func TestQuery_ZeroRulesCrossProductExceedsFactCap(t *testing.T) {
 	if err == nil {
 		t.Fatalf("query: expected a fact-cap error, got %d rows (want the 15^3=3375 cross product rejected)", out.Total)
 	}
-	if !strings.Contains(err.Error(), "rule too broad") {
-		t.Errorf("query: error %q does not use the familiar \"rule too broad\" wording", err.Error())
+	if !strings.Contains(err.Error(), "--max-facts") {
+		t.Errorf("query: error %q does not use the \"--max-facts\" wording", err.Error())
 	}
 }
 
@@ -656,8 +668,8 @@ func TestQuery_ZeroRulesCrossProductExceedsFactCap(t *testing.T) {
 // halts it mid-Transform instead.
 func TestQuery_RulesBaseStageExceedsFactCap(t *testing.T) {
 	dir := t.TempDir()
-	writeSyntheticData(t, dir, 40) // cross product: 40*40 = 1600 > factCap (1000)
-	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second)
+	writeSyntheticData(t, dir, 40) // cross product: 40*40 = 1600 > testFactCap (1000)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, testFactCap)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -674,19 +686,20 @@ func TestQuery_RulesBaseStageExceedsFactCap(t *testing.T) {
 	if err == nil {
 		t.Fatalf("query: expected a fact-cap error from the base ruleset stage, got %d rows", out.Total)
 	}
-	if !strings.Contains(err.Error(), "rule too broad") {
-		t.Errorf("query: error %q does not use the familiar \"rule too broad\" wording", err.Error())
+	if !strings.Contains(err.Error(), "--max-facts") {
+		t.Errorf("query: error %q does not use the \"--max-facts\" wording", err.Error())
 	}
 }
 
 // TestQuery_UnderCapStillSucceeds is the control: a query comfortably under
-// factCap must still return its full, correct result through a handler that
-// carries the same default WithFactLimit(factCap) the two tests above rely
-// on to fail — proving the cap's threshold, not just its existence.
+// testFactCap must still return its full, correct result through a handler
+// that carries the same configured WithFactLimit(testFactCap) the two tests
+// above rely on to fail — proving the cap's threshold, not just its
+// existence.
 func TestQuery_UnderCapStillSucceeds(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 5)
-	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, testFactCap)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -696,13 +709,185 @@ func TestQuery_UnderCapStillSucceeds(t *testing.T) {
 		t.Fatalf("set_schema: %v", err)
 	}
 
-	// 5*5 = 25 rows, well under factCap (1000).
+	// 5*5 = 25 rows, well under testFactCap (1000).
 	out, err := h.query(context.Background(), queryInput{Query: `event(A, B, C), event(D, E, F)?`})
 	if err != nil {
 		t.Fatalf("query: %v", err)
 	}
 	if out.Total != 25 {
 		t.Fatalf("query: total = %d, want 25", out.Total)
+	}
+}
+
+// -- workbench-scale.md work item 7: operator-configurable cap/timeout ------
+//
+// The four tests below pin doc/features/workbench-scale.md's work item 7:
+// a ruleset deriving more than the OLD hardcoded 1,000-fact cap must
+// complete under the new default (proving the old cap is gone); the
+// reworded cap error must fire at a configured low --max-facts and name the
+// limit; a run past a configured short --eval-timeout must report timeout
+// wording, not cap wording; and --eval-timeout 0 / --max-facts 0 must both
+// mean "unbounded" rather than an instantly-expired context or a
+// zero-tolerance cap.
+
+// TestQuery_DerivationAboveOldHardcodedCapSucceedsUnderNewDefault proves the
+// old factCap=1000 compile-time constant is gone: a ruleset whose base
+// stage derives comfortably more than 1,000 facts (60*60 = 3600, a plain
+// cross product with no rules of its own beyond the schema's raw facts)
+// must complete successfully through a handler built with the production
+// default (defaultMaxFacts, 10,000,000) — the exact ceiling `datalog serve`/
+// `datalog mcp` construct when an operator does not override --max-facts.
+func TestQuery_DerivationAboveOldHardcodedCapSucceedsUnderNewDefault(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 60) // cross product: 60*60 = 3600 > old factCap (1000)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, defaultMaxFacts)
+	if err != nil {
+		t.Fatalf("newMCPHandlers: %v", err)
+	}
+	defer closeFn()
+
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
+		t.Fatalf("set_schema: %v", err)
+	}
+
+	out, err := h.query(context.Background(), queryInput{
+		Query: `event(A, B, C), event(D, E, F)?`,
+		Limit: maxQueryLimit,
+	})
+	if err != nil {
+		t.Fatalf("query: unexpected error under the new default cap: %v", err)
+	}
+	if out.Total != 3600 {
+		t.Fatalf("query: total = %d, want 3600 (the old 1000-fact cap must no longer apply)", out.Total)
+	}
+}
+
+// TestQuery_CapErrorNamesConfiguredLimitAndFlag asserts the reworded cap
+// error's exact wording (doc/features/workbench-scale.md work item 3): it
+// must name the configured limit and tell the operator how to raise it,
+// replacing the old "rule too broad" phrasing that reads as "your rule is
+// malformed" even when the developer is legitimately deriving more than a
+// small configured ceiling.
+func TestQuery_CapErrorNamesConfiguredLimitAndFlag(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 40) // 40*40 = 1600 > testFactCap (1000)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, testFactCap)
+	if err != nil {
+		t.Fatalf("newMCPHandlers: %v", err)
+	}
+	defer closeFn()
+
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
+		t.Fatalf("set_schema: %v", err)
+	}
+
+	_, err = h.query(context.Background(), queryInput{
+		Query: `event(A, B, C), event(D, E, F)?`,
+	})
+	if err == nil {
+		t.Fatal("query: expected a cap error, got none")
+	}
+	wantSubstrs := []string{"--max-facts", "1000", "raise it"}
+	for _, sub := range wantSubstrs {
+		if !strings.Contains(err.Error(), sub) {
+			t.Errorf("query: error %q does not mention %q", err.Error(), sub)
+		}
+	}
+	if strings.Contains(err.Error(), "rule too broad") {
+		t.Errorf("query: error %q still uses the retired \"rule too broad\" wording", err.Error())
+	}
+}
+
+// TestQuery_TimeoutReportsTimeoutNotCapWording asserts a run that expires
+// past a configured short --eval-timeout reports timeout wording
+// (evalHaltStatus's "evaluation timed out" phrasing, rules_editor.go) rather
+// than being mistaken for a --max-facts cap error: the two mechanisms fail
+// for different reasons and must stay distinguishable to an operator reading
+// the message. A slow external predicate blocks past a 20ms timeout with
+// maxFacts left at the production default, so nothing but the timeout can
+// be responsible for the failure.
+func TestQuery_TimeoutReportsTimeoutNotCapWording(t *testing.T) {
+	h, done := newTestHandlers(t, t.TempDir())
+	defer done()
+	h.timeout = 20 * time.Millisecond
+	h.maxFacts = defaultMaxFacts
+
+	release := make(chan struct{})
+	defer close(release) // let the blocked goroutine finish so the test doesn't leak it
+	h.sess.engineOpts = []seminaive.Option{
+		seminaive.WithExternal("slow", 1, func(ctx context.Context, _ seminaive.Bindings) iter.Seq[[]any] {
+			return func(yield func([]any) bool) {
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+				yield([]any{"done"})
+			}
+		}),
+	}
+	if _, err := h.sess.setRules(`r(X) :- slow(X).` + "\n"); err != nil {
+		t.Fatalf("set_rules: %v", err)
+	}
+
+	_, err := h.query(context.Background(), queryInput{Query: `r(X)?`})
+	if err == nil {
+		t.Fatal("query: expected a timeout error, got none")
+	}
+	if strings.Contains(err.Error(), "--max-facts") {
+		t.Errorf("query: error %q wrongly uses cap wording for a timeout", err.Error())
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("query: error %q does not wrap context.DeadlineExceeded", err.Error())
+	}
+}
+
+// TestEvalContext_ZeroTimeoutNeverExpires asserts h.timeout <= 0 ("no
+// deadline — Stop is the only brake") produces a context that does not
+// pre-expire: evalContext must return WithCancel, never WithDeadline, for a
+// zero timeout, or every evaluation under a `--eval-timeout 0` session would
+// fail immediately instead of running unbounded.
+func TestEvalContext_ZeroTimeoutNeverExpires(t *testing.T) {
+	h := &mcpHandlers{timeout: 0}
+	ctx, cancel := h.evalContext(context.Background())
+	defer cancel()
+	if _, ok := ctx.Deadline(); ok {
+		t.Fatal("evalContext: h.timeout=0 produced a context with a deadline; want no deadline at all")
+	}
+	select {
+	case <-ctx.Done():
+		t.Fatal("evalContext: h.timeout=0 produced an already-done context")
+	default:
+	}
+}
+
+// TestCheckFactCap_ZeroMaxFactsNeverCaps asserts h.maxFacts <= 0 ("no cap,
+// rely on Stop + OOM") makes checkFactCap pass unconditionally, regardless
+// of how large db is.
+func TestCheckFactCap_ZeroMaxFactsNeverCaps(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 60) // 60*60 = 3600 facts once queried as a cross product
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, 0)
+	if err != nil {
+		t.Fatalf("newMCPHandlers: %v", err)
+	}
+	defer closeFn()
+
+	if err := h.sess.setSchema(syntheticSchemaYAML, "yaml", h.fsys, h.confine); err != nil {
+		t.Fatalf("set_schema: %v", err)
+	}
+
+	out, err := h.query(context.Background(), queryInput{
+		Query: `event(A, B, C), event(D, E, F)?`,
+		Limit: maxQueryLimit,
+	})
+	if err != nil {
+		t.Fatalf("query: unexpected error with --max-facts=0: %v", err)
+	}
+	if out.Total != 3600 {
+		t.Fatalf("query: total = %d, want 3600", out.Total)
+	}
+	if h.sess.derivedDB == nil {
+		t.Fatal("query: expected the write-back to cache derivedDB when maxFacts=0 (checkFactCap must always pass)")
 	}
 }
 
@@ -851,19 +1036,20 @@ func TestQuery_StaleWriteBackDropped(t *testing.T) {
 
 // TestQuery_CacheRefusesOverFactCapBase asserts checkFactCap's total-size
 // policy applies to the write-back exactly as it does to Run's
-// (rules_editor.go): a base fixpoint whose total fact count exceeds factCap
-// must not be cached, even though the query itself succeeds. Zero rules
-// (base stage skipped, base = the raw EDB snapshot verbatim) plus a large
-// already-loaded dataset is what forces this apart from WithFactLimit, which
-// only counts facts newly DERIVED during a Transform call and so never fires
-// here at all (see checkFactCap's doc comment in sandbox.go): the query
-// itself (`event("h7", Pid, Cmd)?`) derives exactly one _q_ fact, well under
-// factCap, so it succeeds — but the 1500-fact base it would otherwise cache
-// exceeds factCap on its own.
+// (rules_editor.go): a base fixpoint whose total fact count exceeds the
+// configured maxFacts must not be cached, even though the query itself
+// succeeds. Zero rules (base stage skipped, base = the raw EDB snapshot
+// verbatim) plus a large already-loaded dataset is what forces this apart
+// from WithFactLimit, which only counts facts newly DERIVED during a
+// Transform call and so never fires here at all (see checkFactCap's doc
+// comment in sandbox.go): the query itself (`event("h7", Pid, Cmd)?`)
+// derives exactly one _q_ fact, well under testFactCap, so it succeeds — but
+// the 1500-fact base it would otherwise cache exceeds testFactCap on its
+// own.
 func TestQuery_CacheRefusesOverFactCapBase(t *testing.T) {
 	dir := t.TempDir()
 	writeSyntheticData(t, dir, 1500)
-	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second)
+	h, closeFn, err := newMCPHandlers(dir, "", nil, "", 5*time.Second, testFactCap)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}

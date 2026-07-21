@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"sort"
@@ -145,7 +144,7 @@ func (wb *workbench) handleWhy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), evalTimeout)
+	ctx, cancel := wb.h.evalContext(r.Context())
 	defer cancel()
 
 	// Reuse mcpHandlers.explainDerivation wholesale — same

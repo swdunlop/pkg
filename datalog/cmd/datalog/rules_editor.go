@@ -13,7 +13,8 @@ import (
 
 // evalHaltStatus words the status line for an evaluation ctx that ended
 // early: a user Stop (context.Canceled via /cancel or a closed page) reads
-// differently from the evalTimeout deadline expiring. stopped is the
+// differently from the --eval-timeout deadline expiring (mcpHandlers.
+// evalContext, sandbox.go). stopped is the
 // surface-specific wording for the user-cancel case ("run stopped",
 // "query stopped", ...); the timeout wording is shared. This is the single
 // place that classifies ctx.Err() for user-facing halt messages -- new

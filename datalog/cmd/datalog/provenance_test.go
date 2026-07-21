@@ -349,7 +349,7 @@ func TestParseFactStatement(t *testing.T) {
 // newMCPHandlers) enables provenance by default — the library default
 // (seminaive's own, unchanged) stays off.
 func TestSessionPolicy_MCPHandlersEnableProvenanceByDefault(t *testing.T) {
-	h, closeFn, err := newMCPHandlers(t.TempDir(), "", nil, "", 5_000_000_000)
+	h, closeFn, err := newMCPHandlers(t.TempDir(), "", nil, "", 5_000_000_000, defaultMaxFacts)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -374,7 +374,7 @@ func TestSessionPolicy_REPLEnablesProvenanceByDefault(t *testing.T) {
 // evaluation: set rules, evaluate once, cache db+prov under the lock.
 func applyTestRules(t *testing.T, wb *workbench, rulesText string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), evalTimeout)
+	ctx, cancel := wb.h.evalContext(context.Background())
 	defer cancel()
 	wb.h.mu.Lock()
 	defer wb.h.mu.Unlock()

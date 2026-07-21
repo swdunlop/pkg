@@ -414,7 +414,7 @@ func (h *mcpHandlers) explainFact(ctx context.Context, in explainFactInput) (exp
 		return explainFactOutput{}, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, h.timeout)
+	ctx, cancel := h.evalContext(ctx)
 	defer cancel()
 
 	h.mu.Lock()
@@ -440,7 +440,7 @@ func (h *mcpHandlers) explainFact(ctx context.Context, in explainFactInput) (exp
 			return explainFactOutput{}, err
 		}
 		prov = fresh
-		if err := checkFactCap(out); err == nil {
+		if err := h.checkFactCap(out); err == nil {
 			h.mu.Lock()
 			if h.sess.gen == snapGen {
 				h.sess.derivedDB = out

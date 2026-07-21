@@ -405,12 +405,12 @@ risky(H) :- host(H).
 	}
 
 	dataDir := t.TempDir() // empty data root; rules provide all the facts
-	hFile, closeFile, err := newMCPHandlers(dataDir, "", []string{monolithPath}, "", 5*time.Second)
+	hFile, closeFile, err := newMCPHandlers(dataDir, "", []string{monolithPath}, "", 5*time.Second, defaultMaxFacts)
 	if err != nil {
 		t.Fatalf("newMCPHandlers (positional): %v", err)
 	}
 	defer closeFile()
-	hDir, closeDir, err := newMCPHandlers(dataDir, "", nil, rulesDir, 5*time.Second)
+	hDir, closeDir, err := newMCPHandlers(dataDir, "", nil, rulesDir, 5*time.Second, defaultMaxFacts)
 	if err != nil {
 		t.Fatalf("newMCPHandlers (--rules): %v", err)
 	}
@@ -599,14 +599,14 @@ func TestImportMordorExampleAndLoadViaRulesDir(t *testing.T) {
 	}
 
 	// Path 1: legacy positional rule file.
-	hFile, closeFile, err := newMCPHandlers(zipPath, schemaPath, []string{monolith}, "", 5*time.Second)
+	hFile, closeFile, err := newMCPHandlers(zipPath, schemaPath, []string{monolith}, "", 5*time.Second, defaultMaxFacts)
 	if err != nil {
 		t.Fatalf("newMCPHandlers (positional file): %v", err)
 	}
 	defer closeFile()
 
 	// Path 2: --rules directory.
-	hDir, closeDir, err := newMCPHandlers(zipPath, schemaPath, nil, rulesDir, 5*time.Second)
+	hDir, closeDir, err := newMCPHandlers(zipPath, schemaPath, nil, rulesDir, 5*time.Second, defaultMaxFacts)
 	if err != nil {
 		t.Fatalf("newMCPHandlers (--rules dir): %v", err)
 	}
