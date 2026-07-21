@@ -128,6 +128,16 @@ chain (child processes and remote-thread injection targets) so C2
 beaconing, payload drops, persistence, and shell activity are
 attributed by ancestry rather than per-event signatures.
 
+**RAM is the real ceiling.** `--max-facts` (default 10M) bounds what one
+evaluation may derive and `--eval-timeout` (default 5m) bounds how long
+it may run, but neither bounds the base load itself — the ~8.7 GB below
+is mostly interned base facts, and the only backstops past your RAM are
+Stop and the OS OOM killer. If memory is tight, `--provenance=false`
+drops the why? drawer's per-derived-fact bookkeeping for headroom.
+`datalog serve` starts its listener immediately and loads the dataset in
+the background — watch the console for "loading dataset…" and the
+"dataset loaded" notice (~6 minutes on the starter slice).
+
 On the starter slice (~6 minutes, ~8.7 GB peak RSS) the rules
 reconstruct the documented day-1 scenario: four stager launches as
 `zleazer`, 317 tainted processes, 2,331 C2 flows — all to the

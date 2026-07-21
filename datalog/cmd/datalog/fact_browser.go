@@ -69,15 +69,39 @@ func (wb *workbench) handleFacts(w http.ResponseWriter, r *http.Request) {
 	// on every click.
 	showWhy := derived && provOK
 
+	// total comes from PredicateCounts — O(#predicates), not a full fact
+	// scan — so paging deep into a 300k-fact predicate no longer re-counts
+	// every fact on every Load More (doc/features/workbench-scale.md design
+	// decision 5: "total is the cheap half"). The window walk below stays
+	// O(offset) — Load More is sequential, so amortized it is one scan; the
+	// early break at a full page keeps each request from scanning past its
+	// own window. countedTotal stays false only for a non-*memory.Database,
+	// which no session path produces (evaluatedDB's contract) — the full
+	// walk below then counts as it always did.
 	total := 0
+	countedTotal := false
+	if mdb, ok := db.(*memory.Database); ok {
+		for pa, n := range mdb.PredicateCounts() {
+			if pa.Name == name && pa.Arity == arity {
+				total = n
+				break
+			}
+		}
+		countedTotal = true
+	}
 	var page [][]html.Content
 	i := 0
 	for row := range db.Facts(name, arity) {
 		if i >= offset && len(page) < factsPageSize {
 			page = append(page, renderFactRow(name, arity, row, showWhy))
+			if countedTotal && len(page) == factsPageSize {
+				break
+			}
 		}
 		i++
-		total = i
+		if !countedTotal {
+			total = i
+		}
 	}
 	hasMore := offset+len(page) < total
 

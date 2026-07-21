@@ -34,7 +34,7 @@ func newSchemaCrudTestHandlers(t *testing.T, dataDir string, seedYAML string) (*
 	}
 	mustWriteFile(t, schemaPath, seedYAML)
 
-	h, closeFn, err := newMCPHandlers(dataDir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false)
+	h, closeFn, err := newMCPHandlers(dataDir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false, true)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -292,7 +292,7 @@ func TestNewMCPHandlers_RejectsDuplicateMatcherKey(t *testing.T) {
 	schemaPath := filepath.Join(dir, "schema.yaml")
 	mustWriteFile(t, schemaPath, duplicateMatcherKeySchemaYAML)
 
-	_, _, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false)
+	_, _, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false, true)
 	if err == nil {
 		t.Fatal("newMCPHandlers: expected an error for a config with two matchers sharing a CRUD key")
 	}
@@ -315,7 +315,7 @@ func TestPutMatcher_DuplicateKeySeedNeverReachesCorruption(t *testing.T) {
 	schemaPath := filepath.Join(dir, "schema.yaml")
 	mustWriteFile(t, schemaPath, duplicateMatcherKeySchemaYAML)
 
-	h, _, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false)
+	h, _, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false, true)
 	if err == nil {
 		// If construction ever stops erroring (a regression in the fix
 		// itself), demonstrate the corruption explicitly rather than passing
@@ -356,7 +356,7 @@ func TestNewMCPHandlers_RejectsDuplicateSourceKey(t *testing.T) {
 	schemaPath := filepath.Join(dir, "schema.yaml")
 	mustWriteFile(t, schemaPath, duplicateSourceKeySchemaYAML)
 
-	_, _, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false)
+	_, _, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false, true)
 	if err == nil {
 		t.Fatal("newMCPHandlers: expected an error for a config with two sources sharing a File key")
 	}
@@ -382,7 +382,7 @@ func TestNewMCPHandlers_RejectsDuplicateDeclarationKey(t *testing.T) {
 	schemaPath := filepath.Join(dir, "schema.yaml")
 	mustWriteFile(t, schemaPath, duplicateDeclarationKeySchemaYAML)
 
-	_, _, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false)
+	_, _, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false, true)
 	if err == nil {
 		t.Fatal("newMCPHandlers: expected an error for a config with two declarations sharing a (name, arity) key")
 	}
@@ -643,7 +643,7 @@ func TestPutMatcher_SurvivesReloadFromDisk(t *testing.T) {
 
 	// Simulate a process restart: build a fresh handlers value from the same
 	// schema file/data dir.
-	fresh, closeFn, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false)
+	fresh, closeFn, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false, true)
 	if err != nil {
 		t.Fatalf("newMCPHandlers (fresh): %v", err)
 	}
@@ -813,7 +813,7 @@ func TestSchemaWrite_PreservesFromIndirection(t *testing.T) {
 	// Restart from the written file: the indirection must still resolve and
 	// the matcher must produce the same facts as before the write.
 	dataDir := filepath.Dir(schemaPath)
-	fresh, closeFn, err := newMCPHandlers(dataDir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false)
+	fresh, closeFn, err := newMCPHandlers(dataDir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false, true)
 	if err != nil {
 		t.Fatalf("newMCPHandlers (fresh): %v", err)
 	}
@@ -966,7 +966,7 @@ func TestPutDeclaration_PreservesContainsFromOnDisk(t *testing.T) {
 
 	// A restart from the written file must still resolve iocs.txt and
 	// produce the same match facts as before the write.
-	fresh, closeFn, err := newMCPHandlers(filepath.Dir(schemaPath), schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false)
+	fresh, closeFn, err := newMCPHandlers(filepath.Dir(schemaPath), schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false, true)
 	if err != nil {
 		t.Fatalf("newMCPHandlers (fresh): %v", err)
 	}
@@ -1182,7 +1182,7 @@ func TestPredicateDeps_DerivedWithGroupAddress(t *testing.T) {
 		t.Fatalf("mkdir rules: %v", err)
 	}
 	mustWriteFile(t, filepath.Join(rulesDir, "b_1.dl"), "b(X) :- a(X).\n")
-	h, closeFn, err := newMCPHandlers(dataDir, "", nil, rulesDir, 5_000_000_000, defaultMaxFacts, false)
+	h, closeFn, err := newMCPHandlers(dataDir, "", nil, rulesDir, 5_000_000_000, defaultMaxFacts, false, true)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}
@@ -1225,7 +1225,7 @@ func TestExplainFact_DerivedOneStepWithAddress(t *testing.T) {
 	}
 	mustWriteFile(t, filepath.Join(rulesDir, "a_1.dl"), "a(\"x\").\n")
 	mustWriteFile(t, filepath.Join(rulesDir, "b_1.dl"), "b(X) :- a(X).\n")
-	h, closeFn, err := newMCPHandlers(dataDir, "", nil, rulesDir, 5_000_000_000, defaultMaxFacts, false)
+	h, closeFn, err := newMCPHandlers(dataDir, "", nil, rulesDir, 5_000_000_000, defaultMaxFacts, false, true)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}

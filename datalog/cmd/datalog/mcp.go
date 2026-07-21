@@ -42,6 +42,7 @@ func runMCP(args []string) {
 	rulesDir := flags.String("rules", "", "path to a rules/ directory store (one <head>_<arity>.dl file per rule group); mutually exclusive with positional rule files")
 	timeout := flags.Duration("timeout", 60*time.Second, "per-query evaluation timeout; 0 = no deadline, Stop is the only brake")
 	maxFacts := flags.Int("max-facts", defaultMaxFacts, "cap on total facts (base + derived) an evaluation may hold before it is refused as too large; 0 = no cap, rely on Stop + OOM (doc/features/workbench-scale.md); shares defaultMaxFacts with `datalog serve`'s --max-facts so both entrypoints are sized for real data")
+	provenance := flags.Bool("provenance", true, "record derivation provenance for every evaluation (the explain tool / why? drawer); costs roughly one map entry plus a []uint64 per derived fact, so turn it off for memory headroom on large datasets (doc/features/workbench-scale.md design decision 4)")
 	proxy := flags.String("proxy", "", "bridge stdio to a remote streamable-HTTP MCP endpoint (e.g. a running datalog serve's /mcp) instead of serving a local session; the bearer token comes from DATALOG_MCP_TOKEN, never a flag — argv is visible to every process listing")
 	if err := flags.Parse(args); err != nil {
 		// flag.ExitOnError already printed usage and exited on real errors;
@@ -68,7 +69,7 @@ func runMCP(args []string) {
 		os.Exit(1)
 	}
 
-	h, closeFn, err := newMCPHandlers(*dataDir, *configPath, flags.Args(), *rulesDir, *timeout, *maxFacts, false)
+	h, closeFn, err := newMCPHandlers(*dataDir, *configPath, flags.Args(), *rulesDir, *timeout, *maxFacts, false, *provenance)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "datalog mcp: %v\n", err)
 		os.Exit(1)
@@ -265,7 +266,7 @@ func (h *mcpHandlers) cacheDerivedQuery(base datalog.Database, prov *seminaive.P
 // like the base data corpus) and newWorkbench's callers (put_rule_group,
 // the Rules pane) assume h.sess.rules/aggRules are populated the moment the
 // handlers exist.
-func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir string, timeout time.Duration, maxFacts int, deferConfigLoad bool) (*mcpHandlers, func() error, error) {
+func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir string, timeout time.Duration, maxFacts int, deferConfigLoad, provenance bool) (*mcpHandlers, func() error, error) {
 	var (
 		fsys    fs.FS
 		confine confineRef
@@ -313,11 +314,15 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir str
 	// engineOpts entirely rather than passing it a non-positive limit, which
 	// would either panic or (worse) silently cap at zero depending on
 	// WithFactLimit's own validation.
-	// provenanceEnabled: true by default for every cmd/datalog session
-	// (doc/features/provenance.md "Session policy" — interactive scale, the
-	// memory cost is bounded per doc/features/provenance.md's Risks section).
-	// Both `datalog mcp` (runMCP) and `datalog serve` (newWorkbench) build
-	// their session through this constructor, so both get it; the library
+	// provenanceEnabled follows the --provenance / -provenance flag, default
+	// on for every cmd/datalog session (doc/features/provenance.md "Session
+	// policy"). That default was justified for a workload within the old
+	// 1,000-fact cap; at --max-facts scale provenance is ~1 map entry plus a
+	// []uint64 per derived fact on top of the base load, so
+	// doc/features/workbench-scale.md design decision 4 makes it an operator
+	// switch — trade the why? drawer for headroom. Both `datalog mcp`
+	// (runMCP) and `datalog serve` (newWorkbench) build their session
+	// through this constructor, so the flag covers both; the library
 	// default (seminaive.WithProvenance never used unless a caller opts in)
 	// is unchanged for callers outside cmd/datalog.
 	var engineOpts []seminaive.Option
@@ -326,7 +331,7 @@ func newMCPHandlers(dataDir, configPath string, ruleFiles []string, rulesDir str
 	}
 	sess := &session{
 		engineOpts:        engineOpts,
-		provenanceEnabled: true,
+		provenanceEnabled: provenance,
 	}
 
 	if configPath != "" && !deferConfigLoad {

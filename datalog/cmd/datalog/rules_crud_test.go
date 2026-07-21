@@ -32,7 +32,7 @@ func newCrudTestHandlers(t *testing.T, seed map[string]string) (*mcpHandlers, st
 	for name, text := range seed {
 		mustWriteFile(t, filepath.Join(rulesDir, name), text)
 	}
-	h, closeFn, err := newMCPHandlers(dataDir, "", nil, rulesDir, 5*time.Second, defaultMaxFacts, false)
+	h, closeFn, err := newMCPHandlers(dataDir, "", nil, rulesDir, 5*time.Second, defaultMaxFacts, false, true)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: %v", err)
 	}

@@ -39,7 +39,7 @@ func TestAsyncStartup_ListenerReachableBeforeLoadCompletes(t *testing.T) {
 	schemaPath := filepath.Join(dir, "schema.yaml")
 	mustWriteFile(t, schemaPath, syntheticSchemaYAML)
 
-	wb, closeFn, loadDone, err := newWorkbenchAsync(dir, schemaPath, nil, "", "test-token", agentConfig{}, defaultMaxFacts, defaultEvalTimeout)
+	wb, closeFn, loadDone, err := newWorkbenchAsync(dir, schemaPath, nil, "", "test-token", agentConfig{}, defaultMaxFacts, defaultEvalTimeout, true)
 	if err != nil {
 		t.Fatalf("newWorkbenchAsync: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestAsyncStartup_LoadingFlagClearsAndSessionPopulates(t *testing.T) {
 	schemaPath := filepath.Join(dir, "schema.yaml")
 	mustWriteFile(t, schemaPath, syntheticSchemaYAML)
 
-	wb, closeFn, loadDone, err := newWorkbenchAsync(dir, schemaPath, nil, "", "test-token", agentConfig{}, defaultMaxFacts, defaultEvalTimeout)
+	wb, closeFn, loadDone, err := newWorkbenchAsync(dir, schemaPath, nil, "", "test-token", agentConfig{}, defaultMaxFacts, defaultEvalTimeout, true)
 	if err != nil {
 		t.Fatalf("newWorkbenchAsync: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestAsyncStartup_LoadFailureSurfacesAndWorkbenchStaysUp(t *testing.T) {
 	schemaPath := filepath.Join(dir, "schema.yaml")
 	mustWriteFile(t, schemaPath, "not: [valid, yaml")
 
-	wb, closeFn, loadDone, err := newWorkbenchAsync(dir, schemaPath, nil, "", "test-token", agentConfig{}, defaultMaxFacts, defaultEvalTimeout)
+	wb, closeFn, loadDone, err := newWorkbenchAsync(dir, schemaPath, nil, "", "test-token", agentConfig{}, defaultMaxFacts, defaultEvalTimeout, true)
 	if err != nil {
 		t.Fatalf("newWorkbenchAsync: %v", err)
 	}

@@ -45,6 +45,7 @@ func runServe(args []string) {
 	agentCmd := flags.String("agent", "", "external ACP agent command, split shell-style (e.g. 'npx @agentclientprotocol/claude-agent-acp'); empty uses the embedded kit agent")
 	maxFacts := flags.Int("max-facts", defaultMaxFacts, "cap on total facts (base + derived) an evaluation may hold before it is refused as too large; 0 = no cap, rely on Stop + OOM (doc/features/workbench-scale.md)")
 	evalTimeout := flags.Duration("eval-timeout", defaultEvalTimeout, "deadline for Run/Apply/agent query/Fact Browser evaluations; 0 = no deadline, Stop is the only brake (doc/features/workbench-scale.md)")
+	provenance := flags.Bool("provenance", true, "record derivation provenance for every evaluation (the why? drawer / explain tool); costs roughly one map entry plus a []uint64 per derived fact, so turn it off for memory headroom on large datasets (doc/features/workbench-scale.md design decision 4)")
 	if err := flags.Parse(args); err != nil {
 		// flag.ExitOnError already printed usage and exited on real errors;
 		// this only returns for -h/-help.
@@ -85,7 +86,7 @@ func runServe(args []string) {
 			ProviderAPIKey: *providerKey,
 			AgentCommand:   *agentCmd,
 			MCPURL:         mcpURL(*listen),
-		}, *maxFacts, *evalTimeout)
+		}, *maxFacts, *evalTimeout, *provenance)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "datalog serve: %v\n", err)
 		os.Exit(1)
@@ -171,8 +172,8 @@ func runServe(args []string) {
 // NOT wait for a multi-minute load. See newWorkbenchAsync's doc comment for
 // the full picture of what "opens the data source, preloads schema/rules...”
 // covers and what got deferred to the background load job.
-func newWorkbench(dataDir, configPath string, ruleFiles []string, rulesDir string, tokenFlag string, agentCfg agentConfig, maxFacts int, evalTimeout time.Duration) (*workbench, func() error, error) {
-	wb, closeFn, done, err := newWorkbenchAsync(dataDir, configPath, ruleFiles, rulesDir, tokenFlag, agentCfg, maxFacts, evalTimeout)
+func newWorkbench(dataDir, configPath string, ruleFiles []string, rulesDir string, tokenFlag string, agentCfg agentConfig, maxFacts int, evalTimeout time.Duration, provenance bool) (*workbench, func() error, error) {
+	wb, closeFn, done, err := newWorkbenchAsync(dataDir, configPath, ruleFiles, rulesDir, tokenFlag, agentCfg, maxFacts, evalTimeout, provenance)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -206,13 +207,13 @@ const loadJobKey = "load"
 // When configPath == "", there is nothing to defer: the load job still runs
 // (for the initial rule evaluation, if any rules were given) but finishes
 // near-instantly, and wb.isLoading() is false from construction.
-func newWorkbenchAsync(dataDir, configPath string, ruleFiles []string, rulesDir string, tokenFlag string, agentCfg agentConfig, maxFacts int, evalTimeout time.Duration) (*workbench, func() error, <-chan struct{}, error) {
+func newWorkbenchAsync(dataDir, configPath string, ruleFiles []string, rulesDir string, tokenFlag string, agentCfg agentConfig, maxFacts int, evalTimeout time.Duration, provenance bool) (*workbench, func() error, <-chan struct{}, error) {
 	// deferConfigLoad is unconditional (even for configPath == ""): the one
 	// load-job code path below (runLoadJob) is shared regardless of whether
 	// there is an actual config load to perform, so there is no second
 	// "startup eval only, no deferred load" variant to keep in sync with the
 	// first (see runLoadJob's doc comment).
-	h, closeFn, err := newMCPHandlers(dataDir, configPath, ruleFiles, rulesDir, evalTimeout, maxFacts, true)
+	h, closeFn, err := newMCPHandlers(dataDir, configPath, ruleFiles, rulesDir, evalTimeout, maxFacts, true, provenance)
 	if err != nil {
 		return nil, nil, nil, err
 	}

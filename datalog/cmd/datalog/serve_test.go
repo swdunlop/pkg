@@ -28,7 +28,7 @@ import (
 // stderr.
 func newTestWorkbench(t *testing.T, dir, configPath string, ruleFiles []string, token string) *workbench {
 	t.Helper()
-	wb, closeFn, err := newWorkbench(dir, configPath, ruleFiles, "", token, agentConfig{}, defaultMaxFacts, defaultEvalTimeout)
+	wb, closeFn, err := newWorkbench(dir, configPath, ruleFiles, "", token, agentConfig{}, defaultMaxFacts, defaultEvalTimeout, true)
 	if err != nil {
 		t.Fatalf("newWorkbench: %v", err)
 	}
@@ -41,7 +41,7 @@ func newTestWorkbench(t *testing.T, dir, configPath string, ruleFiles []string, 
 // workbench constructor instead of the legacy positional-file(s) path.
 func newTestWorkbenchRulesDir(t *testing.T, dir, configPath, rulesDir, token string) *workbench {
 	t.Helper()
-	wb, closeFn, err := newWorkbench(dir, configPath, nil, rulesDir, token, agentConfig{}, defaultMaxFacts, defaultEvalTimeout)
+	wb, closeFn, err := newWorkbench(dir, configPath, nil, rulesDir, token, agentConfig{}, defaultMaxFacts, defaultEvalTimeout, true)
 	if err != nil {
 		t.Fatalf("newWorkbench: %v", err)
 	}

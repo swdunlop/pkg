@@ -29,7 +29,7 @@ func mustLoadConfig(t *testing.T, yamlText string) *mcpHandlers {
 	dir := t.TempDir()
 	schemaPath := filepath.Join(dir, "schema.yaml")
 	mustWriteFile(t, schemaPath, yamlText)
-	h, closeFn, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false)
+	h, closeFn, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false, true)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: config was wrongly rejected: %v\nconfig:\n%s", err, yamlText)
 	}
@@ -127,7 +127,7 @@ sources:
       - predicate: eventB
         args: ["value.host"]
 `)
-	_, closeFn, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false)
+	_, closeFn, err := newMCPHandlers(dir, schemaPath, nil, "", 5_000_000_000, defaultMaxFacts, false, true)
 	if err != nil {
 		t.Fatalf("newMCPHandlers: two sources with different files wrongly rejected: %v", err)
 	}
