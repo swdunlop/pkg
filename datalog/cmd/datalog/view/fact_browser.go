@@ -18,10 +18,23 @@ import (
 //
 //   - #predicates-{kind}    — predicate list, patched by the /events
 //     subscription and by GET /facts/{predicate}/{arity} row expansion
-func FactBrowser(kind, heading string) html.Content {
+//
+// predicates is the server-rendered initial #predicates-{kind} fragment (a
+// Predicates(...) call, which carries the div id itself). Shipping the real
+// initial state in the page HTML instead of an empty div matters most during
+// the background startup load (doc/features/workbench-scale.md design
+// decision 3): the loading tell must be visible on FIRST paint, not only
+// once the CDN script loads and the /events subscription connects — a
+// several-second blank window on exactly the page an operator opens to
+// check on a multi-minute load. nil falls back to the empty div for callers
+// with no session in hand.
+func FactBrowser(kind, heading string, predicates html.Content) html.Content {
+	if predicates == nil {
+		predicates = tag.New("div#" + predicatesID(kind))
+	}
 	return PaneSection.Set("id", "pane-fact-browser-"+kind).Add(
 		PaneHeading.Add(html.Text(heading)),
-		tag.New("div#"+predicatesID(kind)),
+		predicates,
 	)
 }
 

@@ -155,6 +155,43 @@ func TestLoadDeferredSchema_ConcurrentSchemaWriteWins(t *testing.T) {
 	}
 }
 
+// TestRootPage_ShowsLoadingTellOnFirstPaint pins the server-rendered load
+// indicator: while the background startup load is in flight, GET / must
+// carry the "loading dataset…" tell in the page HTML itself — not only in
+// the /events replay, which needs the CDN script loaded and the
+// subscription connected before anything shows (view.FactBrowser's doc
+// comment). Once loading clears, the tell must be gone from a fresh render.
+func TestRootPage_ShowsLoadingTellOnFirstPaint(t *testing.T) {
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 5)
+	wb := newTestWorkbench(t, dir, "", nil, "test-token")
+	srv := startTestServer(wb)
+	defer srv.Close()
+
+	get := func() string {
+		t.Helper()
+		resp, err := srv.Client().Get(srv.URL + "/")
+		if err != nil {
+			t.Fatalf("GET /: %v", err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /: status %d", resp.StatusCode)
+		}
+		return string(body)
+	}
+
+	wb.setLoading(true)
+	if body := get(); !strings.Contains(body, "loading dataset…") {
+		t.Fatal("GET / during load: page HTML lacks the loading tell; first paint would look like an empty dataset")
+	}
+	wb.setLoading(false)
+	if body := get(); strings.Contains(body, "loading dataset…") {
+		t.Fatal("GET / after load: loading tell still present")
+	}
+}
+
 // TestHandleFacts_TotalFromPredicateCountsAndPaging loads 120 base facts —
 // more than two pages — and asserts the Fact Browser's paging contract
 // survives the PredicateCounts total (design decision 5): the first page's

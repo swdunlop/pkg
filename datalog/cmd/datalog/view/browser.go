@@ -14,8 +14,12 @@ import (
 // The Schema and Rules panel contents are built by package main (phase 3's
 // structural renderings read engine state) and carry their own stable ids
 // (#schema-panel, #rules-panel) so publishSessionChanged can re-patch them
-// after agent CRUD or an fsnotify reload without a page load.
-func Browser(schema, rules html.Content) html.Content {
+// after agent CRUD or an fsnotify reload without a page load. baseFacts and
+// derivedFacts are likewise package main's initial #predicates-{base,derived}
+// fragments (renderPredicates), so the Facts tab — loading tell included —
+// is present on first paint rather than only after /events connects (see
+// FactBrowser's doc comment).
+func Browser(schema, rules, baseFacts, derivedFacts html.Content) html.Content {
 	return tag.New("section#browser").
 		Set("data-signals", `{_browserTab: 'data'}`).
 		Add(
@@ -23,7 +27,7 @@ func Browser(schema, rules html.Content) html.Content {
 			browserPanel("data", DataBrowser()),
 			browserPanel("schema", schema),
 			browserPanel("rules", rules),
-			browserPanel("facts", factsPanel()),
+			browserPanel("facts", factsPanel(baseFacts, derivedFacts)),
 		)
 }
 
@@ -52,11 +56,11 @@ func browserPanel(tabName string, content html.Content) html.Content {
 // factsPanel is the Facts tab: the v1 base and derived Fact Browser shells
 // stacked, plus the why? output surface (WhyOutput) their derived-fact
 // rows' why? buttons render into.
-func factsPanel() html.Content {
+func factsPanel(baseFacts, derivedFacts html.Content) html.Content {
 	return html.Group{
 		tag.New("div#why-output"),
-		FactBrowser("base", "Base Facts"),
-		FactBrowser("derived", "Derived Facts"),
+		FactBrowser("base", "Base Facts", baseFacts),
+		FactBrowser("derived", "Derived Facts", derivedFacts),
 	}
 }
 

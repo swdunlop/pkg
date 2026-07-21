@@ -58,6 +58,13 @@ func (wb *workbench) handleConversationPage(w http.ResponseWriter, r *http.Reque
 func (wb *workbench) renderConversationPage(w http.ResponseWriter, active *conversationInfo) {
 	wb.h.mu.Lock()
 	schemaPanel, rulesPanel := wb.renderBrowserPanels()
+	// The same initial-state fragments handleEvents emits on connect, but
+	// baked into the page HTML: during the background startup load this is
+	// what makes the "loading dataset…" tell visible on FIRST paint rather
+	// than only once the CDN script loads and /events connects
+	// (view.FactBrowser's doc comment). The /events replay then morphs the
+	// same ids, so the two sources converge within one bus event.
+	baseFacts, derivedFacts := renderPredicates(wb.h.sess, wb.isLoading())
 	wb.h.mu.Unlock()
 
 	var transcript, composer html.Content
@@ -72,7 +79,7 @@ func (wb *workbench) renderConversationPage(w http.ResponseWriter, active *conve
 	page := view.Page{
 		Title: "Datalog Workbench",
 		Left:  view.ConversationPane(wb.renderRail(active), transcript, composer),
-		Right: view.Browser(schemaPanel, rulesPanel),
+		Right: view.Browser(schemaPanel, rulesPanel, baseFacts, derivedFacts),
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	buf := html.Append(nil, page)
