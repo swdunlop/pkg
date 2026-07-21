@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"io"
 	"net/http"
 	"net/url"
@@ -182,6 +184,75 @@ declarations:
 	}
 	if strings.Contains(joined, "data-error") && strings.Contains(joined, "li") {
 		t.Fatalf("subdirectory file selection produced an error fragment:\n%s", joined)
+	}
+}
+
+// TestHTTP_DataBrowserGzipSourceShowsRecordText pins jsonfacts.OpenSource as
+// the Data Browser's read chokepoint: a .gz source (how OpTC eCAR ships)
+// must render its decompressed record text, not raw gzip bytes — the
+// mojibake observed on the first OpTC run. Covers both the chunk listing
+// (readDataChunk) and the selection detail (readDataLine).
+func TestHTTP_DataBrowserGzipSourceShowsRecordText(t *testing.T) {
+	dir := t.TempDir()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	if _, err := gz.Write([]byte(`{"host": "h0", "pid": 0, "cmd": "cmd0"}` + "\n" +
+		`{"host": "h1", "pid": 1, "cmd": "cmd1"}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "events.jsonl.gz"), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	wb := newTestWorkbench(t, dir, "", nil, "test-token")
+	srv := startTestServer(wb)
+	defer srv.Close()
+
+	const schemaYAML = `
+sources:
+  - file: events.jsonl.gz
+    mappings:
+      - predicate: event
+        args: ["value.host", "value.pid", "value.cmd"]
+declarations:
+  - name: event
+    use: "a process execution event"
+`
+	applyTestSchema(t, wb, schemaYAML)
+
+	get := func(path string) string {
+		t.Helper()
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: status = %d, want 200", path, resp.StatusCode)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		return string(body)
+	}
+
+	rows := get("/data/" + url.PathEscape("events.jsonl.gz"))
+	if !strings.Contains(rows, "h1") {
+		t.Fatalf("gz source rows lack decompressed record text (mojibake regression):\n%s", rows)
+	}
+	detail := get("/data/select/" + url.PathEscape("events.jsonl.gz") + "/1")
+	if !strings.Contains(detail, "h1") {
+		t.Fatalf("gz source detail pane lacks decompressed record text:\n%s", detail)
+	}
+
+	// The agent-facing sample_input tool reads through the same chokepoint.
+	out, err := wb.h.sampleInput(sampleInputInput{File: "events.jsonl.gz", Limit: 2})
+	if err != nil {
+		t.Fatalf("sample_input on gz source: %v", err)
+	}
+	if len(out.Lines) != 2 || !strings.Contains(out.Lines[0], "h0") {
+		t.Fatalf("sample_input on gz source returned %#v, want decompressed record lines", out.Lines)
 	}
 }
 

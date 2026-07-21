@@ -13,6 +13,7 @@ import (
 	"github.com/swdunlop/html-go/datastar"
 	"github.com/swdunlop/html-go/tag"
 	"swdunlop.dev/pkg/datalog/cmd/datalog/view"
+	"swdunlop.dev/pkg/datalog/jsonfacts"
 )
 
 // dataPageSize is the number of raw records served per Data Browser chunk
@@ -129,7 +130,9 @@ func (wb *workbench) emitDataFile(stream datastar.Stream, file string, offset in
 // position in the file — the index is the selection key /data/select
 // resolves, so it must never renumber under a filter.
 func readDataChunk(wb *workbench, ref string, offset, limit int, filter string) ([]view.DataRowInfo, bool, error) {
-	f, err := wb.h.fsys.Open(path.Clean(ref))
+	// jsonfacts.OpenSource, not fsys.Open: .gz sources must decompress here
+	// exactly as the loader reads them, or the browser shows gzip bytes.
+	f, err := jsonfacts.OpenSource(wb.h.fsys, path.Clean(ref))
 	if err != nil {
 		return nil, false, fmt.Errorf("opening %s: %w", ref, err)
 	}
@@ -243,7 +246,7 @@ func renderRecordDetail(raw string) html.Content {
 // readDataLine opens ref (already confined) and returns the row-th
 // non-blank line (0-based), or an error if the file has fewer rows.
 func readDataLine(wb *workbench, ref string, row int) (string, error) {
-	f, err := wb.h.fsys.Open(path.Clean(ref))
+	f, err := jsonfacts.OpenSource(wb.h.fsys, path.Clean(ref))
 	if err != nil {
 		return "", fmt.Errorf("opening %s: %w", ref, err)
 	}

@@ -1399,7 +1399,10 @@ func (h *mcpHandlers) sampleInput(in sampleInputInput) (sampleInputOutput, error
 		return sampleInputOutput{}, err
 	}
 
-	f, err := h.fsys.Open(path.Clean(ref))
+	// jsonfacts.OpenSource, not fsys.Open: an agent sampling a .gz source
+	// must see record text, not compressed bytes (same chokepoint the
+	// loader and the Data Browser read through).
+	f, err := jsonfacts.OpenSource(h.fsys, path.Clean(ref))
 	if err != nil {
 		return sampleInputOutput{}, err
 	}

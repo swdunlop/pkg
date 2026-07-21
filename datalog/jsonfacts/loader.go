@@ -150,6 +150,49 @@ type compiledMapping struct {
 //     "optional field" mechanism; see doc.go), but is now reported since it
 //     is otherwise indistinguishable from a genuine field-name typo.
 
+// OpenSource opens a source file from fsys the way the loader reads it:
+// a name ending in .gz is decompressed transparently, so large datasets
+// (e.g. the OpTC eCAR release, which expands ~10x) can stay compressed on
+// disk. Extension-based rather than sniffed: a mis-named file should fail
+// loudly here, not read as JSONL whose first line is gzip bytes. This is
+// the ONE place source bytes become record text — any surface that shows
+// or scans a source file (the workbench's Data Browser, sample_input, the
+// loader itself) must open through it, or a .gz source renders as raw
+// compressed bytes on that surface. Errors are returned unwrapped; callers
+// add their own "opening <file>" context.
+func OpenSource(fsys fs.FS, name string) (io.ReadCloser, error) {
+	f, err := fsys.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasSuffix(name, ".gz") {
+		return f, nil
+	}
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &gzSourceReader{gz: gz, f: f}, nil
+}
+
+// gzSourceReader pairs a gzip.Reader with the underlying file so Close
+// releases both (gzip.Reader.Close does not close its source).
+type gzSourceReader struct {
+	gz *gzip.Reader
+	f  fs.File
+}
+
+func (g *gzSourceReader) Read(p []byte) (int, error) { return g.gz.Read(p) }
+
+func (g *gzSourceReader) Close() error {
+	gzErr := g.gz.Close()
+	if fErr := g.f.Close(); gzErr == nil {
+		return fErr
+	}
+	return gzErr
+}
+
 func loadSource(src Source, fsys fs.FS, counter *idCounter, onMappingError func(error)) ([]datalog.Fact, error) {
 	var facts []datalog.Fact
 
@@ -166,27 +209,13 @@ func loadSource(src Source, fsys fs.FS, counter *idCounter, onMappingError func(
 		return nil, err
 	}
 
-	f, err := fsys.Open(src.File)
+	f, err := OpenSource(fsys, src.File)
 	if err != nil {
 		return nil, fmt.Errorf("opening %s: %w", src.File, err)
 	}
 	defer f.Close()
 
-	// A .gz source is decompressed transparently, so large datasets (e.g.
-	// the OpTC eCAR release, which expands ~10x) can stay compressed on
-	// disk. Extension-based rather than sniffed: a mis-named file should
-	// fail loudly here, not load as JSONL whose first line is gzip bytes.
-	var r io.Reader = f
-	if strings.HasSuffix(src.File, ".gz") {
-		gz, err := gzip.NewReader(f)
-		if err != nil {
-			return nil, fmt.Errorf("opening %s: %w", src.File, err)
-		}
-		defer gz.Close()
-		r = gz
-	}
-
-	scanner := bufio.NewScanner(r)
+	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 10*1024*1024)
 	lineNum := 0
 
