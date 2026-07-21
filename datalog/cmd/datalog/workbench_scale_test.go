@@ -3,9 +3,14 @@ package main
 import (
 	"context"
 	"io"
+	"io/fs"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // This file pins doc/features/workbench-scale.md work items 5 and 6:
@@ -32,6 +37,121 @@ func TestProvenanceFlagOffDisablesExplain(t *testing.T) {
 	_, err = h.explainDerivation(context.Background(), explainInput{Fact: "x(1)"})
 	if err == nil || !strings.Contains(err.Error(), "provenance") {
 		t.Fatalf("explain on a provenance-off session: err = %v, want the provenance-disabled refusal", err)
+	}
+}
+
+// gateFS wraps a fs.FS so a test can hold prepareSchema's data load open at
+// its first file access: entered closes when the load reaches Open, and Open
+// then blocks until the test closes release. This is how the tests below get
+// a deterministic "load in flight" window without a multi-gigabyte dataset.
+type gateFS struct {
+	fs.FS
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (g *gateFS) Open(name string) (fs.File, error) {
+	g.once.Do(func() { close(g.entered) })
+	<-g.release
+	return g.FS.Open(name)
+}
+
+// newGatedDeferredHandlers builds deferred-load handlers over a synthetic
+// dataset and swaps a gateFS under them, returning the gate alongside.
+func newGatedDeferredHandlers(t *testing.T) (*mcpHandlers, *gateFS) {
+	t.Helper()
+	dir := t.TempDir()
+	writeSyntheticData(t, dir, 5)
+	cfgPath := filepath.Join(dir, "schema.yaml")
+	if err := os.WriteFile(cfgPath, []byte(syntheticSchemaYAML), 0o644); err != nil {
+		t.Fatalf("writing schema: %v", err)
+	}
+	h, closeFn, err := newMCPHandlers(dir, cfgPath, nil, "", time.Minute, defaultMaxFacts, true, true)
+	if err != nil {
+		t.Fatalf("newMCPHandlers: %v", err)
+	}
+	t.Cleanup(func() { closeFn() })
+	g := &gateFS{FS: h.fsys, entered: make(chan struct{}), release: make(chan struct{})}
+	h.fsys = g
+	return h, g
+}
+
+// TestLoadDeferredSchema_PrepareRunsWithoutHoldingLock pins THE property the
+// background startup load exists for (workbench-scale.md design decision 3):
+// h.mu stays acquirable while the multi-minute dataset load runs, because
+// every pane render and tool call takes h.mu — a load that held it would
+// leave the listener accepting connections whose responses never come, the
+// exact dead-workbench symptom observed on the first real OpTC run.
+func TestLoadDeferredSchema_PrepareRunsWithoutHoldingLock(t *testing.T) {
+	h, g := newGatedDeferredHandlers(t)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- h.loadDeferredSchema() }()
+
+	select {
+	case <-g.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("load never reached the data read")
+	}
+
+	locked := make(chan struct{})
+	go func() {
+		h.mu.Lock()
+		h.mu.Unlock() //nolint:staticcheck // probing acquirability, not guarding state
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("h.mu is held across the deferred load's data read; panes would hang for the whole load")
+	}
+
+	close(g.release)
+	if err := <-errCh; err != nil {
+		t.Fatalf("loadDeferredSchema: %v", err)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.sess.schemaText == "" || h.sess.dataDB == nil {
+		t.Fatal("deferred load did not commit the schema after release")
+	}
+}
+
+// TestLoadDeferredSchema_ConcurrentSchemaWriteWins pins the stale-swap guard:
+// the listener is up during the load, so a schema write can land in the
+// lock-free window; the deferred load's older snapshot must be discarded
+// rather than clobbering it (the same posture reloadSchema takes for a save
+// landing during its prepare).
+func TestLoadDeferredSchema_ConcurrentSchemaWriteWins(t *testing.T) {
+	h, g := newGatedDeferredHandlers(t)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- h.loadDeferredSchema() }()
+	select {
+	case <-g.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("load never reached the data read")
+	}
+
+	const concurrent = "declarations: []\n"
+	h.mu.Lock()
+	h.sess.schemaText = concurrent
+	h.sess.gen++
+	genAfterWrite := h.sess.gen
+	h.mu.Unlock()
+
+	close(g.release)
+	if err := <-errCh; err != nil {
+		t.Fatalf("loadDeferredSchema: %v", err)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.sess.schemaText != concurrent {
+		t.Fatalf("deferred load clobbered a concurrent schema write: schemaText = %q", h.sess.schemaText)
+	}
+	if h.sess.gen != genAfterWrite {
+		t.Fatalf("deferred load bumped gen (%d -> %d) despite discarding its snapshot", genAfterWrite, h.sess.gen)
 	}
 }
 

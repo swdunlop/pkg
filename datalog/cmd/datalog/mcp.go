@@ -443,38 +443,51 @@ func loadConfigSchema(sess *session, configPath string, fsys fs.FS, confine conf
 
 // loadDeferredSchema performs the configPath load newMCPHandlers skipped
 // when constructed with deferConfigLoad (h.configPath is set either way, so
-// this reads the exact same file). It takes h.mu around the whole
-// read-parse-load-and-swap, matching setSchema's atomic-replacement contract
-// (session.setSchema's doc comment: "the session is left exactly as it was
-// before the call... either fully replaces the old one or not at all") — a
-// query or workbench pane racing this load sees either the pre-load empty
-// session or the fully loaded one, never a partial swap. On success it
-// rebuilds h.schemaRev from the freshly loaded sess.authoringCfg (the
-// construction-time value was necessarily built from an empty config, since
-// the real one had not loaded yet) and fires h.onChange under the same lock,
-// exactly like applySchemaLocked does for every other schema write, so the
-// workbench's patch-back (publishSessionChanged) sees the new state. Callers
-// (newWorkbench's background load job) must NOT hold h.mu when calling this
-// — it manages its own locking so the load itself (prepareSchema's file
-// walk, potentially minutes on a real dataset) never blocks every other tool
-// call or pane for its whole duration... except that setSchema's signature
-// leaves no lock-free window (see setSchema's own doc comment steering
-// lock-free callers to prepareSchema directly instead) — this method
-// accepts holding h.mu for the full load rather than adding a second
-// lock-free variant, because the very first load has no prior state for a
-// concurrent reader to see anyway (every read path already treats a nil/
-// empty session as "nothing loaded yet, show a loading state" per the
-// workbench-scale.md background-load design) and the alternative (a
-// prepareSchema-then-relock dance) would be new machinery duplicating
-// reloadSchema's (watch.go) already-careful TOCTOU handling for a case that
-// does not need it: nothing else can have mutated schemaText before the
-// first load ever completes.
+// this reads the exact same file). The expensive part — prepareSchema's
+// full data-corpus load, potentially minutes on a real dataset — runs
+// WITHOUT h.mu, exactly like reloadSchema (watch.go) and the schema editor's
+// Apply path: the whole point of deferring the load (workbench-scale.md
+// design decision 3) is that panes and tool calls stay responsive while it
+// runs, and every render path takes h.mu, so holding the lock across the
+// load would leave the listener accepting connections that never get a
+// response — indistinguishable from a hung server. Only the field swap
+// happens under the lock, so a racing reader sees either the pre-load empty
+// session or the fully loaded one, never a partial swap.
+//
+// The lock-free window admits one race: the listener is up, so an agent's
+// schema CRUD write (or the schema editor's Apply) can land while this load
+// runs. That write went through the same prepareSchema pipeline against the
+// CURRENT disk state, so if schemaText is no longer empty at commit time
+// this load's older snapshot is simply discarded rather than clobbering it
+// — the same stale-swap posture reloadSchema takes.
+//
+// On commit it rebuilds h.schemaRev from the freshly loaded authoring config
+// (the construction-time value was necessarily built from an empty config)
+// and fires h.onChange under the same lock, exactly like applySchemaLocked
+// does for every other schema write. Callers must NOT hold h.mu.
 func (h *mcpHandlers) loadDeferredSchema() error {
+	data, err := os.ReadFile(h.configPath)
+	if err != nil {
+		return fmt.Errorf("reading config %s: %w", h.configPath, err)
+	}
+	text := string(data)
+	format := "yaml"
+	if filepath.Ext(h.configPath) == ".json" {
+		format = "json"
+	}
+	authoring, runtime, db, err := prepareSchema(text, format, h.fsys, h.confine)
+	if err != nil {
+		return fmt.Errorf("loading config %s: %w", h.configPath, err)
+	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if err := loadConfigSchema(h.sess, h.configPath, h.fsys, h.confine); err != nil {
-		return err
+	if h.sess.schemaText != "" {
+		// A schema write landed during the lock-free load; committing this
+		// older snapshot would revert it. Discard ours — see doc comment.
+		return nil
 	}
+	h.commitSchemaLocked(text, authoring, runtime, db)
 	h.schemaRev = newSchemaRevisions(h.sess.authoringCfg)
 	if h.onChange != nil {
 		h.onChange()
@@ -823,6 +836,23 @@ type setSchemaOutput struct {
 	Warnings   []string         `json:"warnings,omitempty"`
 }
 
+// commitSchemaLocked is the one field-level swap every mcpHandlers-side
+// schema replacement goes through (applySchemaLocked for CRUD/editor/watch
+// writes, loadDeferredSchema for the startup load) — the session-level twin
+// of session.setSchema's commit, kept as a single method so a new schema
+// path can never forget a field or the derivedDB/derivedProv invalidation
+// pairing (session.derivedProv's doc comment). Callers must hold h.mu, and
+// authoring/runtime/db must come from the SAME prepareSchema call.
+func (h *mcpHandlers) commitSchemaLocked(schemaText string, authoring, runtime jsonfacts.Config, db *memory.Database) {
+	h.sess.cfg = runtime
+	h.sess.authoringCfg = authoring
+	h.sess.schemaText = schemaText
+	h.sess.dataDB = db
+	h.sess.derivedDB = nil
+	h.sess.derivedProv = nil
+	h.sess.gen++
+}
+
 // applySchemaLocked swaps a prepareSchema result into the session and fires
 // onChange. Callers must hold h.mu; the schema editor's Apply path takes the
 // lock itself so it can check its context for a Stop between acquiring the
@@ -831,13 +861,7 @@ type setSchemaOutput struct {
 // from the SAME prepareSchema call as db, so the session's schema-derived
 // fields never mix generations.
 func (h *mcpHandlers) applySchemaLocked(schemaText string, authoring, runtime jsonfacts.Config, db *memory.Database) (setSchemaOutput, error) {
-	h.sess.cfg = runtime
-	h.sess.authoringCfg = authoring
-	h.sess.schemaText = schemaText
-	h.sess.dataDB = db
-	h.sess.derivedDB = nil
-	h.sess.derivedProv = nil // keep paired with derivedDB, per session.derivedProv's doc comment (mirrors loadRuleStore/setSchema/loadProgram)
-	h.sess.gen++
+	h.commitSchemaLocked(schemaText, authoring, runtime, db)
 	full, err := h.sess.buildDB()
 	if err != nil {
 		return setSchemaOutput{}, err

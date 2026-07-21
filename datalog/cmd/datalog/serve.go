@@ -19,6 +19,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 	html "github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/datastar"
+	"swdunlop.dev/pkg/datalog"
 	"swdunlop.dev/pkg/datalog/cmd/datalog/view"
 	"swdunlop.dev/pkg/datalog/memory"
 )
@@ -326,10 +327,11 @@ func (wb *workbench) isLoading() bool {
 
 // runLoadJob is the background startup-load job newWorkbenchAsync launches:
 // it loads configPath's dataset (if any — h.configPath is empty when serve
-// was started with no -c) via h.loadDeferredSchema, the SAME setSchema
-// chokepoint every other schema write goes through (loadConfigSchema's doc
-// comment), then runs the initial rule evaluation exactly as newWorkbench
-// used to do inline before this feature. It rides the established job/
+// was started with no -c) via h.loadDeferredSchema — prepareSchema plus the
+// SAME commitSchemaLocked swap every other schema write goes through, with
+// the load itself lock-free (loadDeferredSchema's doc comment) — then runs
+// the initial rule evaluation exactly as newWorkbench used to do inline
+// before this feature. It rides the established job/
 // busy/console plumbing (wb.jobs.Begin + wb.publishBusy + runRecovered is
 // "the established pattern," per this task's brief, matching
 // autoReevaluate's shape in watch.go) rather than inventing new machinery:
@@ -392,28 +394,40 @@ func (wb *workbench) runLoadJob(done chan<- struct{}) {
 		wb.h.mu.Unlock()
 	}
 	if haveRules {
+		// Mirrors autoReevaluate (watch.go): h.mu is held only to snapshot
+		// and to commit — the Transform itself runs lock-free. Holding h.mu
+		// across a multi-minute evaluation would block every pane render and
+		// tool call for the duration, exactly the dead-listener symptom the
+		// background load exists to prevent. The write-back is gen-guarded
+		// like Run's: if anything mutated the session while the Transform
+		// ran (the listener is up — an agent write can land), the result is
+		// discarded and the mutator's own invalidation stands.
 		ctx, cancel := wb.h.evalContext(jobCtx)
-		evalErr := <-runRecovered(func() error {
+		wb.h.mu.Lock()
+		ruleset, engineOpts, db, snapGen, buildErr := wb.h.sess.snapshotForEvaluate()
+		prov := wb.h.sess.newEvalProvenance()
+		wb.h.mu.Unlock()
+
+		var evaluated datalog.Database
+		evalErr := buildErr
+		if buildErr == nil {
+			evalErr = <-runRecovered(func() error {
+				var err error
+				evaluated, err = evaluateSnapshot(ctx, ruleset, engineOpts, db, prov)
+				return err
+			})
+		}
+		if evalErr == nil {
+			evalErr = wb.h.checkFactCap(evaluated)
+		}
+		if evalErr == nil {
 			wb.h.mu.Lock()
-			defer wb.h.mu.Unlock()
-			db, prov, err := wb.h.sess.evaluate(ctx)
-			if err != nil {
-				return err
+			if ctx.Err() == nil && wb.h.sess.gen == snapGen {
+				wb.h.sess.derivedDB = evaluated
+				wb.h.sess.derivedProv = prov
 			}
-			if err := wb.h.checkFactCap(db); err != nil {
-				return err
-			}
-			// prov rides beside db under the same generation guard every
-			// other derivedDB writer uses (doc/features/provenance.md
-			// "Session cache interaction") — unconditional here (no
-			// concurrent mutation is possible: h.mu has been held since
-			// before evaluate started, and this is the first evaluation
-			// this session has ever run), unlike Run/query's
-			// snapGen-checked writes.
-			wb.h.sess.derivedDB = db
-			wb.h.sess.derivedProv = prov
-			return nil
-		})
+			wb.h.mu.Unlock()
+		}
 		cancel()
 		loadErr = evalErr
 	}
