@@ -10,7 +10,7 @@ import (
 
 // Example shows a host wiring the scripted agent: TestMain calls acptest.Main
 // first, so a re-exec'd child becomes the agent instead of re-running the suite,
-// then a test registers a profile whose Command re-execs this same binary and
+// then a test registers an agent whose command re-execs this same binary and
 // replays a Script.  A real host mounts the returned component in an
 // httptest.Server and drives its HTTP routes.
 func Example() {
@@ -21,15 +21,13 @@ func Example() {
 	//		os.Exit(m.Run())    // the parent runs the suite as usual
 	//	}
 	//
-	// In a test, build a profile that replays a two-step script:
+	// In a test, build an agent that replays a two-step script:
 	var t *testing.T // provided by the test
 	script := acptest.Script{Steps: []acptest.Step{
 		{Kind: acptest.StepThought, Text: "considering"},
 		{Kind: acptest.StepMessage, Text: "hello from the scripted agent"},
 	}}
-	profile := acptest.Profile(t, "demo", "", script, chat.MCPConfig{})
-
-	component, err := chat.New(chat.Profile(profile))
+	component, err := chat.New(chat.Agent(acptest.Agent(t, "demo", "", script)...))
 	if err != nil {
 		panic(err)
 	}

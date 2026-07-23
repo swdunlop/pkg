@@ -33,7 +33,7 @@ type ConversationStore interface {
 type ConversationMeta struct {
 	ID      string    `json:"id"`
 	Title   string    `json:"title"`
-	Profile string    `json:"profile"` // name of the AgentProfile the conversation was created with
+	Profile string    `json:"profile"` // name of the registered agent (see chat.Agent) the conversation was created with
 	Created time.Time `json:"created"`
 
 	// Ext carries host-defined metadata (datalog would keep its conversation mode here).

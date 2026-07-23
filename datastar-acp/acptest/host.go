@@ -4,10 +4,10 @@ import (
 	"os"
 	"testing"
 
-	chat "swdunlop.dev/pkg/datastar-acp"
+	"swdunlop.dev/pkg/datastar-acp/agent"
 )
 
-// Command builds the (command, args) a chat.AgentProfile needs to re-exec the
+// Command builds the (command, args) an agent config needs to re-exec the
 // running test binary into Main as the scripted agent — the reusable form of
 // datalog's fakeACPAgentCommand.  The returned command is os.Executable(),
 // pinned with -test.run to a helper test that only calls Main, and -test.v=false
@@ -31,11 +31,12 @@ func Command(t *testing.T, helperTest string) (string, []string) {
 	return self, args
 }
 
-// Env builds the environment entries a chat.AgentProfile must carry so a
+// Env builds the environment entries an agent config must carry so a
 // re-exec'd child runs script as the scripted agent: the activate marker plus
 // the JSON-encoded script.  These append to the child's inherited environment
-// (chat spawns with the parent environment plus the profile's Env), so the
-// child sees both.  A bad script fails the test here rather than in the child.
+// (chat spawns with the parent environment plus the agent's Env entries), so
+// the child sees both.  A bad script fails the test here rather than in the
+// child.
 func Env(t *testing.T, script Script) []string {
 	t.Helper()
 	encoded, err := script.Encode()
@@ -45,19 +46,19 @@ func Env(t *testing.T, script Script) []string {
 	return []string{activateEnv + "=1", ScriptEnv + "=" + encoded}
 }
 
-// Profile builds a chat.AgentProfile named name that spawns the running test
-// binary as the scripted agent replaying script, with mcp attached.  It is the
-// one call a host needs to dogfood a scenario through the real chat HTTP surface:
-// pass the result to chat.Profile.  helperTest is the -test.run pin (see
-// Command); pass "" when Main runs from TestMain.
-func Profile(t *testing.T, name, helperTest string, script Script, mcp chat.MCPConfig) chat.AgentProfile {
+// Agent builds the agent options that register the running test binary as the
+// scripted agent named name, replaying script.  It is the one call a host
+// needs to dogfood a scenario through the real chat HTTP surface: pass the
+// result to chat.Agent, appending extra options (agent.Instructions,
+// agent.MCPHandler, ...) as the scenario demands.  helperTest is the
+// -test.run pin (see Command); pass "" when Main runs from TestMain.
+func Agent(t *testing.T, name, helperTest string, script Script, extra ...agent.Option) []agent.Option {
 	t.Helper()
-	cmd, args := Command(t, helperTest)
-	return chat.AgentProfile{
-		Name:    name,
-		Command: cmd,
-		Args:    args,
-		Env:     Env(t, script),
-		MCP:     mcp,
+	command, args := Command(t, helperTest)
+	options := []agent.Option{
+		agent.Name(name),
+		agent.Command(command, args...),
+		agent.Env(Env(t, script)...),
 	}
+	return append(options, extra...)
 }

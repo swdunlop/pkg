@@ -20,6 +20,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/swdunlop/html-go"
+
+	"swdunlop.dev/pkg/datastar-acp/agent"
 )
 
 // runtime implements Interface.
@@ -55,7 +57,7 @@ type runtime struct {
 	// element ids across a live turn.
 	seq map[string]int
 
-	// spawnPreambleSent records, per driver spawn, whether the profile
+	// spawnPreambleSent records, per driver spawn, whether the agent's
 	// Instructions preamble has already been prepended to a prompt (design
 	// decision: per-driver-spawn, not per-conversation).  Reset whenever a
 	// driver is dropped/respawned.
@@ -66,7 +68,7 @@ type runtime struct {
 	// newDriver overrides the driver factory (tests inject a scripted fake);
 	// nil uses newACPDriver.  Set only at construction, before any goroutine
 	// reads it, so it needs no mutex.
-	newDriver func(profile AgentProfile, mcp mcpEndpoint) (driver, error)
+	newDriver func(profile agent.Config, mcp mcpEndpoint) (driver, error)
 }
 
 // pendingPerm is one live permission card awaiting an answer.
@@ -76,7 +78,7 @@ type pendingPerm struct {
 	event  Event
 }
 
-// mcpMount is one profile's resolved reference MCP mount.
+// mcpMount is one agent's resolved reference MCP mount.
 type mcpMount struct {
 	handler http.Handler
 	token   string
@@ -90,24 +92,25 @@ func newRuntime(cfg *config) (*runtime, error) {
 		pending: map[string]pendingPerm{},
 		seq:     map[string]int{},
 	}
-	// Resolve reference MCP mounts: each profile with a handler gets a random
+	// Resolve reference MCP mounts: each agent with a handler gets a random
 	// bearer token and a mount path.  This is the chokepoint that keeps a host
 	// from forgetting the token or handshake wiring (design decision 6).
-	for _, p := range cfg.profiles {
-		if p.MCP.handler == nil {
+	for _, a := range cfg.agents {
+		handler := a.MCPHandler()
+		if handler == nil {
 			continue
 		}
 		var tok [24]byte
 		if _, err := rand.Read(tok[:]); err != nil {
-			return nil, fmt.Errorf("chat: generating MCP token for profile %q: %w", p.Name, err)
+			return nil, fmt.Errorf("chat: generating MCP token for agent %q: %w", a.Name(), err)
 		}
 		if cfg.mcp == nil {
 			cfg.mcp = map[string]*mcpMount{}
 		}
-		cfg.mcp[p.Name] = &mcpMount{
-			handler: p.MCP.handler,
+		cfg.mcp[a.Name()] = &mcpMount{
+			handler: handler,
 			token:   hex.EncodeToString(tok[:]),
-			path:    "mcp/" + url.PathEscape(p.Name),
+			path:    "mcp/" + url.PathEscape(a.Name()),
 		}
 	}
 	return rt, nil
@@ -181,14 +184,14 @@ func truncateTitle(text string, max int) string {
 
 const titleMaxLen = 60
 
-// profileByName finds a registered profile.
-func (rt *runtime) profileByName(name string) (AgentProfile, bool) {
-	for _, p := range rt.cfg.profiles {
-		if p.Name == name {
-			return p, true
+// agentByName finds a registered agent.
+func (rt *runtime) agentByName(name string) (agent.Config, bool) {
+	for _, a := range rt.cfg.agents {
+		if a.Name() == name {
+			return a, true
 		}
 	}
-	return AgentProfile{}, false
+	return agent.Config{}, false
 }
 
 // queryEscape escapes a value for a hand-built query string.
@@ -223,7 +226,7 @@ func bearerMatch(auth, token string) bool {
 		subtle.ConstantTimeCompare([]byte(auth[len(prefix):]), []byte(token)) == 1
 }
 
-// mcpURLFor builds the loopback MCP URL the agent dials for a profile's mount.
+// mcpURLFor builds the loopback MCP URL the agent dials for its mount.
 //
 // The component does not run the listener itself, so it cannot know its own
 // port the way datalog's serve.go does (datalog derives the URL from its own

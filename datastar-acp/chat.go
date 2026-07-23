@@ -5,6 +5,8 @@ import (
 	"net/http"
 
 	"github.com/swdunlop/html-go"
+
+	"swdunlop.dev/pkg/datastar-acp/agent"
 )
 
 func New(options ...Option) (Interface, error) {
@@ -40,8 +42,8 @@ type config struct {
 	// basePath is the path prefix for the HTTP handler, defaults to /agent
 	basePath string
 
-	// profiles are the registered agent profiles; at least one is required.
-	profiles []AgentProfile
+	// agents are the registered agent configs; at least one is required.
+	agents []agent.Config
 
 	// store persists conversations; nil means an in-memory store lost on shutdown.
 	store ConversationStore
@@ -59,8 +61,8 @@ type config struct {
 	// signals names the datastar signals the component binds.
 	signals SignalNames
 
-	// mcp maps profile name → resolved MCP mount info (token, mount path) for
-	// profiles whose MCPConfig carries a handler; populated by newRuntime.
+	// mcp maps agent name → resolved MCP mount info (token, mount path) for
+	// agents configured with agent.MCPHandler; populated by newRuntime.
 	mcp map[string]*mcpMount
 
 	// listenAddr, when set via ListenAddr, is the host:port the host serves the
@@ -74,8 +76,8 @@ type config struct {
 
 // validate checks the configuration for errors and applies defaults that require construction.
 func (cfg *config) validate() error {
-	if len(cfg.profiles) == 0 {
-		return fmt.Errorf(`chat: at least one agent profile is required; see chat.Profile`)
+	if len(cfg.agents) == 0 {
+		return fmt.Errorf(`chat: at least one agent is required; see chat.Agent`)
 	}
 	if cfg.bus == nil {
 		cfg.bus, cfg.ownBus = NewBus(), true

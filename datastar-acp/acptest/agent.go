@@ -45,7 +45,7 @@ func Main() {
 // agent implements acp.Agent (the agent side of the connection, distinct from
 // the chat package's driver, which is the client side).  It records the
 // handshake for its own MCP callbacks and replays one Script per session/prompt.
-type agent struct {
+type scriptedAgent struct {
 	// conn is set by setConn after NewAgentSideConnection returns; ready closes
 	// then, establishing a happens-before edge for the connection's receive
 	// goroutine (which reads conn only in a script replay, well after ready) so
@@ -66,17 +66,17 @@ type agent struct {
 	cancelled chan struct{}
 }
 
-func newAgent(script Script) *agent {
-	return &agent{script: script, ready: make(chan struct{}), cancelled: make(chan struct{}, 1)}
+func newAgent(script Script) *scriptedAgent {
+	return &scriptedAgent{script: script, ready: make(chan struct{}), cancelled: make(chan struct{}, 1)}
 }
 
 // setConn stores the connection and unblocks any callback waiting on it.
-func (a *agent) setConn(conn *acp.AgentSideConnection) {
+func (a *scriptedAgent) setConn(conn *acp.AgentSideConnection) {
 	a.conn = conn
 	close(a.ready)
 }
 
-func (a *agent) Initialize(ctx context.Context, params acp.InitializeRequest) (acp.InitializeResponse, error) {
+func (a *scriptedAgent) Initialize(ctx context.Context, params acp.InitializeRequest) (acp.InitializeResponse, error) {
 	return acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentCapabilities: acp.AgentCapabilities{
@@ -89,7 +89,7 @@ func (a *agent) Initialize(ctx context.Context, params acp.InitializeRequest) (a
 	}, nil
 }
 
-func (a *agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
+func (a *scriptedAgent) NewSession(ctx context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
 	for _, srv := range params.McpServers {
 		if srv.Http == nil {
 			continue
@@ -106,13 +106,13 @@ func (a *agent) NewSession(ctx context.Context, params acp.NewSessionRequest) (a
 
 // Prompt replays the Script.  runScript walks the steps in order; StepExit and
 // StepRPCError short-circuit it.
-func (a *agent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
+func (a *scriptedAgent) Prompt(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
 	return a.runScript(ctx, params)
 }
 
 // Cancel implements session/cancel, unblocking StepBlockUntilCancel.  The
 // buffered channel absorbs a cancel that races ahead of the wait.
-func (a *agent) Cancel(ctx context.Context, params acp.CancelNotification) error {
+func (a *scriptedAgent) Cancel(ctx context.Context, params acp.CancelNotification) error {
 	select {
 	case a.cancelled <- struct{}{}:
 	default:
@@ -123,7 +123,7 @@ func (a *agent) Cancel(ctx context.Context, params acp.CancelNotification) error
 // runScript executes the script's steps in order against one prompt turn.  It
 // returns the turn's stop reason and error; the default terminal state is
 // end_turn.
-func (a *agent) runScript(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
+func (a *scriptedAgent) runScript(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error) {
 	<-a.ready // a.conn is set (happens-before the connection's receive goroutine)
 	sid := params.SessionId
 	vars := map[string]string{} // branch outcomes recorded by earlier steps
@@ -195,13 +195,13 @@ func (a *agent) runScript(ctx context.Context, params acp.PromptRequest) (acp.Pr
 	return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
 }
 
-func (a *agent) emitMessage(ctx context.Context, sid acp.SessionId, text string) error {
+func (a *scriptedAgent) emitMessage(ctx context.Context, sid acp.SessionId, text string) error {
 	return a.conn.SessionUpdate(ctx, acp.SessionNotification{
 		SessionId: sid, Update: acp.UpdateAgentMessageText(text),
 	})
 }
 
-func (a *agent) emitPlan(ctx context.Context, sid acp.SessionId, entries []PlanEntry) error {
+func (a *scriptedAgent) emitPlan(ctx context.Context, sid acp.SessionId, entries []PlanEntry) error {
 	planned := make([]acp.PlanEntry, len(entries))
 	for i, e := range entries {
 		planned[i] = acp.PlanEntry{
@@ -218,7 +218,7 @@ func (a *agent) emitPlan(ctx context.Context, sid acp.SessionId, entries []PlanE
 // emitToolResult sends a tool_call_update.  A sparse result carries only
 // status+content, reproducing the real adapter's terminal update shape; a
 // non-sparse result also restates title and rawInput.
-func (a *agent) emitToolResult(ctx context.Context, sid acp.SessionId, step Step) error {
+func (a *scriptedAgent) emitToolResult(ctx context.Context, sid acp.SessionId, step Step) error {
 	status := acp.ToolCallStatusCompleted
 	if step.Status == "failed" {
 		status = acp.ToolCallStatusFailed
@@ -242,7 +242,7 @@ func (a *agent) emitToolResult(ctx context.Context, sid acp.SessionId, step Step
 
 // doPermission issues a request_permission and records the chosen option under
 // the step's branch key, so a later message can echo it.
-func (a *agent) doPermission(ctx context.Context, sid acp.SessionId, step Step, vars map[string]string) error {
+func (a *scriptedAgent) doPermission(ctx context.Context, sid acp.SessionId, step Step, vars map[string]string) error {
 	opts := make([]acp.PermissionOption, len(step.Options))
 	for i, o := range step.Options {
 		opts[i] = acp.PermissionOption{
@@ -275,7 +275,7 @@ func (a *agent) doPermission(ctx context.Context, sid acp.SessionId, step Step, 
 // calls step.Tool, and emits the joined result as a tool_call_update.  A
 // missing/wrong token surfaces as this call's own error (rendered as a failed
 // tool result), which is exactly the plumbing this step verifies.
-func (a *agent) doMCPCall(ctx context.Context, sid acp.SessionId, step Step, vars map[string]string) error {
+func (a *scriptedAgent) doMCPCall(ctx context.Context, sid acp.SessionId, step Step, vars map[string]string) error {
 	result, callErr := a.callMCP(ctx, step.Tool, rawAny(step.RawInput))
 	failStep := step
 	if callErr != nil {
@@ -297,7 +297,7 @@ func (a *agent) doMCPCall(ctx context.Context, sid acp.SessionId, step Step, var
 // callMCP is the agent's MCP client leg: a streamable-HTTP mcp-go client with
 // the Authorization header session/new handed it, calling one tool and joining
 // its text content.
-func (a *agent) callMCP(ctx context.Context, tool string, args any) (string, error) {
+func (a *scriptedAgent) callMCP(ctx context.Context, tool string, args any) (string, error) {
 	if a.mcpURL == "" {
 		return "", fmt.Errorf("no MCP endpoint was offered at session/new")
 	}
@@ -341,29 +341,29 @@ func (a *agent) callMCP(ctx context.Context, tool string, args any) (string, err
 // resumes a session, so these are unreachable in practice; each returns a plain
 // error rather than panicking.
 
-func (a *agent) Authenticate(ctx context.Context, params acp.AuthenticateRequest) (acp.AuthenticateResponse, error) {
+func (a *scriptedAgent) Authenticate(ctx context.Context, params acp.AuthenticateRequest) (acp.AuthenticateResponse, error) {
 	return acp.AuthenticateResponse{}, fmt.Errorf("acptest: authenticate not implemented")
 }
-func (a *agent) Logout(ctx context.Context, params acp.LogoutRequest) (acp.LogoutResponse, error) {
+func (a *scriptedAgent) Logout(ctx context.Context, params acp.LogoutRequest) (acp.LogoutResponse, error) {
 	return acp.LogoutResponse{}, fmt.Errorf("acptest: logout not implemented")
 }
-func (a *agent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
+func (a *scriptedAgent) CloseSession(ctx context.Context, params acp.CloseSessionRequest) (acp.CloseSessionResponse, error) {
 	return acp.CloseSessionResponse{}, nil
 }
-func (a *agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
+func (a *scriptedAgent) ListSessions(ctx context.Context, params acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
 	return acp.ListSessionsResponse{}, fmt.Errorf("acptest: listSessions not implemented")
 }
-func (a *agent) ResumeSession(ctx context.Context, params acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
+func (a *scriptedAgent) ResumeSession(ctx context.Context, params acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
 	return acp.ResumeSessionResponse{}, fmt.Errorf("acptest: resumeSession not implemented")
 }
-func (a *agent) SetSessionConfigOption(ctx context.Context, params acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
+func (a *scriptedAgent) SetSessionConfigOption(ctx context.Context, params acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
 	return acp.SetSessionConfigOptionResponse{}, fmt.Errorf("acptest: setSessionConfigOption not implemented")
 }
-func (a *agent) SetSessionMode(ctx context.Context, params acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
+func (a *scriptedAgent) SetSessionMode(ctx context.Context, params acp.SetSessionModeRequest) (acp.SetSessionModeResponse, error) {
 	return acp.SetSessionModeResponse{}, fmt.Errorf("acptest: setSessionMode not implemented")
 }
 
-var _ acp.Agent = (*agent)(nil)
+var _ acp.Agent = (*scriptedAgent)(nil)
 
 // --- small helpers ---------------------------------------------------------
 

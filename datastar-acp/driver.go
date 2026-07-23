@@ -16,6 +16,8 @@ import (
 	"time"
 
 	acp "github.com/coder/acp-go-sdk"
+
+	"swdunlop.dev/pkg/datastar-acp/agent"
 )
 
 // driver abstracts one conversational agent behind the chat pane.  There is
@@ -118,37 +120,38 @@ type toolCallState struct {
 
 // mcpEndpoint is the already-resolved MCP server the component hands the
 // driver for session/new: either an HTTP endpoint (url + bearer token, from
-// the reference mount or MCPEndpoint) or a stdio command the agent spawns
-// itself (from MCPCommand).  The zero value means no MCP server is offered.
-// Resolution happens in conversationDriver — the driver never touches
-// MCPConfig's mount side or generates a token.
+// the reference mount or agent.MCPEndpoint) or a stdio command the agent
+// spawns itself (from agent.MCPCommand).  The zero value means no MCP server
+// is offered.  Resolution happens in conversationDriver — the driver never
+// touches the reference mount or generates a token.
 type mcpEndpoint struct {
 	name    string
 	url     string // HTTP transport when non-empty
 	token   string
 	command string // stdio transport when non-empty (and url is empty)
 	args    []string
-	env     []string // "KEY=VALUE" entries, AgentProfile.Env's form
+	env     []string // "KEY=VALUE" entries, agent.Env's form
 }
 
 // configured reports whether any MCP server was resolved at all.
 func (e mcpEndpoint) configured() bool { return e.url != "" || e.command != "" }
 
-// newACPDriver spawns the profile's agent subprocess and performs the ACP
+// newACPDriver spawns the configured agent subprocess and performs the ACP
 // handshake: initialize with fs/terminal capabilities declined (the agent's
 // only lever on the workspace is the MCP tools), recording the agent's
 // capabilities for the session/new call that Prompt makes lazily on first use.
 // mcp is the already-resolved MCP endpoint the component hands the agent at
 // session/new; its zero value means no MCP server is offered.
-func newACPDriver(profile AgentProfile, mcp mcpEndpoint) (*acpDriver, error) {
-	if profile.Command == "" {
-		return nil, fmt.Errorf("chat: agent profile %q has no command", profile.Name)
+func newACPDriver(profile agent.Config, mcp mcpEndpoint) (*acpDriver, error) {
+	command, args := profile.Command()
+	if command == "" {
+		return nil, fmt.Errorf("chat: agent %q has no command", profile.Name())
 	}
 
-	cmd := exec.Command(profile.Command, profile.Args...)
-	cmd.Dir = profile.Dir
-	if len(profile.Env) > 0 {
-		cmd.Env = append(os.Environ(), profile.Env...)
+	cmd := exec.Command(command, args...)
+	cmd.Dir = profile.Dir()
+	if env := profile.Env(); len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
 	}
 	cmd.Stderr = os.Stderr // visible diagnostics, never swallowed
 
@@ -161,7 +164,7 @@ func newACPDriver(profile AgentProfile, mcp mcpEndpoint) (*acpDriver, error) {
 		return nil, fmt.Errorf("agent stdout pipe: %w", err)
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("starting agent %q: %w", profile.Command, err)
+		return nil, fmt.Errorf("starting agent %q: %w", command, err)
 	}
 
 	d := &acpDriver{

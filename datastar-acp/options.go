@@ -4,6 +4,8 @@ import (
 	"fmt"
 
 	"github.com/swdunlop/html-go"
+
+	"swdunlop.dev/pkg/datastar-acp/agent"
 )
 
 // BasePath overrides the path prefix the HTTP handler serves under, defaults to /agent.
@@ -24,21 +26,23 @@ func Bus(bus EventBus) Option {
 	return func(cfg *config) { cfg.bus = bus }
 }
 
-// Profile registers a named agent profile; at least one is required.  The new-conversation UI offers one choice
-// per registered profile.
-func Profile(profile AgentProfile) Option {
+// Agent registers a named agent built from the agent subpackage's options; at least one is required.  The
+// new-conversation UI offers one choice per registered agent, and each conversation records the name of the
+// agent it was created with.
+func Agent(options ...agent.Option) Option {
 	return func(cfg *config) {
-		if profile.Name == `` {
-			cfg.err = fmt.Errorf(`chat: agent profile requires a name`)
+		a, err := agent.New(options...)
+		if err != nil {
+			cfg.err = err
 			return
 		}
-		for _, other := range cfg.profiles {
-			if other.Name == profile.Name {
-				cfg.err = fmt.Errorf(`chat: duplicate agent profile %q`, profile.Name)
+		for _, other := range cfg.agents {
+			if other.Name() == a.Name() {
+				cfg.err = fmt.Errorf(`chat: duplicate agent %q`, a.Name())
 				return
 			}
 		}
-		cfg.profiles = append(cfg.profiles, profile)
+		cfg.agents = append(cfg.agents, a)
 	}
 }
 

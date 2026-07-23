@@ -163,14 +163,14 @@ component, err := chat.New(
     chat.BasePath("/agent"),                 // default shown
     chat.Store(store),                       // default: chat.DirStore(dir)
     chat.Bus(bus),                           // default: internal bus + SSE mount
-    chat.Profile(chat.AgentProfile{
-        Name:         "triage",
-        Command:      "claude-agent-acp",
-        Env:          []string{"CLAUDE_CODE_EXECUTABLE=..."},
-        Dir:          workDir,
-        Instructions: preamble,              // framed into the first prompt
-        MCP:          chat.MCPServer(srv),   // or chat.MCPEndpoint(url, token)
-    }),
+    chat.Agent(                              // options from the agent subpackage
+        agent.Name("triage"),
+        agent.Command("claude-agent-acp"),
+        agent.Env("CLAUDE_CODE_EXECUTABLE=..."),
+        agent.Dir(workDir),
+        agent.Instructions(preamble),        // framed into the first prompt
+        agent.MCPHandler(srv),               // or agent.MCPEndpoint(url, token)
+    ),
     chat.PermissionRenderer(renderDiffCard), // optional
     chat.Signals(chat.SignalNames{...}),     // optional, datalog defaults
 )

@@ -1,6 +1,6 @@
 // Package acptest is a public, reusable scripted ACP agent for exercising a
 // chat embedding end to end.  A host wires it once from TestMain (see Example)
-// and then registers a chat.AgentProfile whose Command re-execs the test binary
+// and then registers agent options whose command re-execs the test binary
 // into Main; the agent speaks real ACP JSON-RPC over its stdio, replaying a
 // caller-supplied Script.  The whole scenario travels in one environment
 // variable — the JSON-encoded Script — so a host composes new scenarios without
@@ -8,7 +8,7 @@
 // editing the agent to add a case).
 //
 // The core (Main, Script, and the agent) never imports testing; the *testing.T
-// conveniences live in the small wrappers Profile, Command, and Env.
+// conveniences live in the small wrappers Agent, Command, and Env.
 package acptest
 
 import "encoding/json"

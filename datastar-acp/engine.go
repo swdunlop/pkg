@@ -19,6 +19,8 @@ import (
 	"github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/datastar"
 	"github.com/swdunlop/html-go/tag"
+
+	"swdunlop.dev/pkg/datastar-acp/agent"
 )
 
 // ServeHTTP routes the component's HTTP surface under basePath.  The base
@@ -84,8 +86,8 @@ func (rt *runtime) serveMCP(w http.ResponseWriter, r *http.Request, rel string) 
 
 // --- conversation CRUD ----------------------------------------------------
 
-// handleCreate creates a conversation for the posted profile (default = first
-// profile) and selects it, publishing the new rail + a blank transcript.
+// handleCreate creates a conversation for the posted agent (default = first
+// registered) and selects it, publishing the new rail + a blank transcript.
 func (rt *runtime) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// Read form fields BEFORE starting the SSE stream: RequestStream commits the
 	// response, after which reading the request body (r.FormValue → ParseForm)
@@ -97,9 +99,9 @@ func (rt *runtime) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if profileName == "" {
-		profileName = rt.cfg.profiles[0].Name
+		profileName = rt.cfg.agents[0].Name()
 	}
-	if _, ok := rt.profileByName(profileName); !ok {
+	if _, ok := rt.agentByName(profileName); !ok {
 		_ = stream.Emit(datastar.Elements(rt.rail(rt.currentActive())))
 		return
 	}
@@ -336,11 +338,11 @@ func (rt *runtime) endTurn() {
 	rt.mu.Unlock()
 }
 
-// frameWire builds the wire text for a prompt, prepending the profile
+// frameWire builds the wire text for a prompt, prepending the agent's
 // Instructions preamble on the first prompt of a fresh driver spawn.
 func (rt *runtime) frameWire(convID, profileName, text string) string {
-	p, ok := rt.profileByName(profileName)
-	if !ok || p.Instructions == "" {
+	a, ok := rt.agentByName(profileName)
+	if !ok || a.Instructions() == "" {
 		return text
 	}
 	rt.mu.Lock()
@@ -350,7 +352,7 @@ func (rt *runtime) frameWire(convID, profileName, text string) string {
 	if !first {
 		return text
 	}
-	return p.Instructions + "\n\n" + text
+	return a.Instructions() + "\n\n" + text
 }
 
 // runTurn drives one turn's sink events into transcript patches + store
@@ -659,21 +661,21 @@ func (rt *runtime) conversationDriver(id, reqHost string) (driver, error) {
 	if err != nil {
 		return nil, err
 	}
-	profile, ok := rt.profileByName(meta.Profile)
+	a, ok := rt.agentByName(meta.Profile)
 	if !ok {
-		return nil, fmt.Errorf("chat: unknown profile %q", meta.Profile)
+		return nil, fmt.Errorf("chat: unknown agent %q", meta.Profile)
 	}
 
 	var mcp mcpEndpoint
-	if mount, ok := rt.cfg.mcp[profile.Name]; ok {
-		mcp = mcpEndpoint{name: profile.Name, url: rt.mcpURLFor(mount, reqHost), token: mount.token}
-	} else if profile.MCP.external {
-		mcp = mcpEndpoint{name: profile.Name, url: profile.MCP.url, token: profile.MCP.token}
-	} else if profile.MCP.command != "" {
-		mcp = mcpEndpoint{name: profile.Name, command: profile.MCP.command, args: profile.MCP.args, env: profile.MCP.env}
+	if mount, ok := rt.cfg.mcp[a.Name()]; ok {
+		mcp = mcpEndpoint{name: a.Name(), url: rt.mcpURLFor(mount, reqHost), token: mount.token}
+	} else if url, token, ok := a.MCPEndpoint(); ok {
+		mcp = mcpEndpoint{name: a.Name(), url: url, token: token}
+	} else if command, args, env, ok := a.MCPCommand(); ok {
+		mcp = mcpEndpoint{name: a.Name(), command: command, args: args, env: env}
 	}
 
-	d, err := rt.spawn(profile, mcp)
+	d, err := rt.spawn(a, mcp)
 	if err != nil {
 		return nil, err
 	}
@@ -685,7 +687,7 @@ func (rt *runtime) conversationDriver(id, reqHost string) (driver, error) {
 }
 
 // spawn is the driver factory, overridable in tests via rt.newDriver.
-func (rt *runtime) spawn(profile AgentProfile, mcp mcpEndpoint) (driver, error) {
+func (rt *runtime) spawn(profile agent.Config, mcp mcpEndpoint) (driver, error) {
 	if rt.newDriver != nil {
 		return rt.newDriver(profile, mcp)
 	}

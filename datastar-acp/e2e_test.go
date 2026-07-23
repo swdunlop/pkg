@@ -1,7 +1,7 @@
 package chat_test
 
-// e2e_test.go drives the real chat component — chat.New with a profile whose
-// Command spawns the acptest scripted agent as a re-exec'd subprocess — through
+// e2e_test.go drives the real chat component — chat.New with an agent whose
+// command spawns the acptest scripted agent as a re-exec'd subprocess — through
 // its HTTP routes exactly as a browser would, dogfooding acptest as a host.
 // Unlike engine_test.go, nothing here injects a fake driver: the ACP subprocess
 // is spawned for real, so these tests exercise the wire protocol (driver.go)
@@ -25,6 +25,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 	chat "swdunlop.dev/pkg/datastar-acp"
 	"swdunlop.dev/pkg/datastar-acp/acptest"
+	"swdunlop.dev/pkg/datastar-acp/agent"
 )
 
 // TestMain makes this test binary able to re-exec itself as the scripted agent:
@@ -50,17 +51,18 @@ type harness struct {
 	base  string
 }
 
-// newHarness builds a component from profiles over a temp DirStore, mounts it,
+// newHarness builds a component from per-agent option lists over a temp
+// DirStore, mounts it,
 // and starts draining its SSE feed so no patch is missed.  ListenAddr is left
 // empty so the component captures its address from the first request's Host
 // header (the host-side fallback the design supports) — the MCP round-trip test
 // asserts the agent still received a loopback URL that way.
-func newHarness(t *testing.T, profiles ...chat.AgentProfile) *harness {
+func newHarness(t *testing.T, agents ...[]agent.Option) *harness {
 	t.Helper()
 	store := chat.DirStore(t.TempDir())
 	opts := []chat.Option{chat.Store(store)}
-	for _, p := range profiles {
-		opts = append(opts, chat.Profile(p))
+	for _, a := range agents {
+		opts = append(opts, chat.Agent(a...))
 	}
 	comp, err := chat.New(opts...)
 	if err != nil {
@@ -273,7 +275,7 @@ func TestE2E_FullTurn(t *testing.T) {
 		{Kind: acptest.StepToolResult, ToolCallID: "t1", Sparse: true, Text: "found 3 widgets"},
 		{Kind: acptest.StepMessage, Text: "done searching"},
 	}}
-	h := newHarness(t, acptest.Profile(t, "triage", "", script, chat.MCPConfig{}))
+	h := newHarness(t, acptest.Agent(t, "triage", "", script))
 	convID := h.createConversation("triage")
 
 	h.post("send", `{"prompt":"find widgets"}`)
@@ -331,7 +333,7 @@ func TestE2E_Permission(t *testing.T) {
 			}},
 		{Kind: acptest.StepMessage, Text: "you chose {{choice}}"},
 	}}
-	h := newHarness(t, acptest.Profile(t, "triage", "", script, chat.MCPConfig{}))
+	h := newHarness(t, acptest.Agent(t, "triage", "", script))
 	convID := h.createConversation("triage")
 
 	h.post("send", `{"prompt":"write the file"}`)
@@ -371,7 +373,7 @@ func TestE2E_CancelMidTurn(t *testing.T) {
 		{Kind: acptest.StepMessage, Text: "starting a slow turn"},
 		{Kind: acptest.StepBlockUntilCancel},
 	}}
-	h := newHarness(t, acptest.Profile(t, "triage", "", script, chat.MCPConfig{}))
+	h := newHarness(t, acptest.Agent(t, "triage", "", script))
 	convID := h.createConversation("triage")
 
 	h.post("send", `{"prompt":"do something slow"}`)
@@ -409,7 +411,7 @@ func TestE2E_CancelMidTurn(t *testing.T) {
 func TestE2E_AgentExitMidTurn(t *testing.T) {
 	t.Parallel()
 	script := acptest.Script{Steps: []acptest.Step{{Kind: acptest.StepExit, Code: 3}}}
-	h := newHarness(t, acptest.Profile(t, "triage", "", script, chat.MCPConfig{}))
+	h := newHarness(t, acptest.Agent(t, "triage", "", script))
 	convID := h.createConversation("triage")
 
 	h.post("send", `{"prompt":"crash please"}`)
@@ -436,9 +438,7 @@ func TestE2E_PreambleReSentPerSpawn(t *testing.T) {
 		EchoPrompt: "ECHO:",
 		Steps:      []acptest.Step{{Kind: acptest.StepMessage, Text: "ack"}},
 	}
-	profile := acptest.Profile(t, "triage", "", script, chat.MCPConfig{})
-	profile.Instructions = "PREAMBLE-XYZ"
-	h := newHarness(t, profile)
+	h := newHarness(t, acptest.Agent(t, "triage", "", script, agent.Instructions("PREAMBLE-XYZ")))
 	convID := h.createConversation("triage")
 
 	// The preamble count is read from the FINALIZED store (the echoed message
@@ -500,7 +500,7 @@ func TestE2E_MCPRoundTrip(t *testing.T) {
 		{Kind: acptest.StepMCPCall, ToolCallID: "t1", Tool: "ping"},
 		{Kind: acptest.StepMessage, Text: "called the tool"},
 	}}
-	h := newHarness(t, acptest.Profile(t, "triage", "", script, chat.MCPHandler(rec)))
+	h := newHarness(t, acptest.Agent(t, "triage", "", script, agent.MCPHandler(rec)))
 	convID := h.createConversation("triage")
 
 	h.post("send", `{"prompt":"ping the tool"}`)
@@ -540,7 +540,7 @@ func TestE2E_RPCError(t *testing.T) {
 	script := acptest.Script{Steps: []acptest.Step{
 		{Kind: acptest.StepRPCError, Text: "bad prompt on purpose"},
 	}}
-	h := newHarness(t, acptest.Profile(t, "triage", "", script, chat.MCPConfig{}))
+	h := newHarness(t, acptest.Agent(t, "triage", "", script))
 	convID := h.createConversation("triage")
 
 	h.post("send", `{"prompt":"this fails"}`)

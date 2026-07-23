@@ -64,23 +64,3 @@ func TestMCPServerConfigHTTP(t *testing.T) {
 		t.Fatal("expected error for HTTP endpoint against stdio-only agent")
 	}
 }
-
-// TestMCPCommandEnv verifies the MCPCommand/Env constructor chain carries
-// through and Env does not mutate its receiver's backing array.
-func TestMCPCommandEnv(t *testing.T) {
-	base := MCPCommand("tool", "a").Env("X=1")
-	other := base.Env("Y=2")
-	third := base.Env("Z=3")
-	if len(base.env) != 1 || base.env[0] != "X=1" {
-		t.Errorf("base env = %v", base.env)
-	}
-	if len(other.env) != 2 || other.env[1] != "Y=2" {
-		t.Errorf("other env = %v", other.env)
-	}
-	if len(third.env) != 2 || third.env[1] != "Z=3" {
-		t.Errorf("third env = %v (clobbered by sibling append?)", third.env)
-	}
-	if base.command != "tool" || len(base.args) != 1 || base.args[0] != "a" {
-		t.Errorf("command/args = %q/%v", base.command, base.args)
-	}
-}

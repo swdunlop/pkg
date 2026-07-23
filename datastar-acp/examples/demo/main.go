@@ -1,5 +1,5 @@
 // Command demo serves the datastar-acp chat component on 127.0.0.1 with two
-// agent profiles wrapping an operator-supplied ACP agent: "plain" runs it
+// registered agents wrapping an operator-supplied ACP agent: "plain" runs it
 // bare, and "kv" runs it behind a toy key-value MCP tool the agent is
 // instructed to use.  It is intentionally small — it is documentation for how
 // a host embeds the component.
@@ -27,6 +27,7 @@ import (
 	"github.com/swdunlop/html-go"
 	"github.com/swdunlop/html-go/tag"
 	chat "swdunlop.dev/pkg/datastar-acp"
+	"swdunlop.dev/pkg/datastar-acp/agent"
 )
 
 // listenAddr is where the demo serves; loopback only, since the component
@@ -51,7 +52,7 @@ func main() {
 func run(agentCommand string, agentArgs []string) error {
 	store := chat.DirStore(conversationsDir())
 
-	// The toy MCP server: one profile hands the agent a scratch key-value store
+	// The toy MCP server: one registered agent gets a scratch key-value store
 	// over the component's reference mount.  MCPHandler is the chokepoint — the
 	// component mints the bearer token, enforces loopback, and hands the URL +
 	// token to the agent at session/new; the demo never touches the token.
@@ -62,19 +63,17 @@ func run(agentCommand string, agentArgs []string) error {
 		// agent without waiting for a first request's Host header.
 		chat.ListenAddr(listenAddr),
 		chat.Store(store),
-		chat.Profile(chat.AgentProfile{
-			Name:         "plain",
-			Command:      agentCommand,
-			Args:         agentArgs,
-			Instructions: "You are a helpful assistant embedded in a demo app.",
-		}),
-		chat.Profile(chat.AgentProfile{
-			Name:         "kv",
-			Command:      agentCommand,
-			Args:         agentArgs,
-			Instructions: "You have a key-value store MCP tool. Use kv_set to store values and kv_get to retrieve them when the user asks.",
-			MCP:          chat.MCPHandler(kv),
-		}),
+		chat.Agent(
+			agent.Name("plain"),
+			agent.Command(agentCommand, agentArgs...),
+			agent.Instructions("You are a helpful assistant embedded in a demo app."),
+		),
+		chat.Agent(
+			agent.Name("kv"),
+			agent.Command(agentCommand, agentArgs...),
+			agent.Instructions("You have a key-value store MCP tool. Use kv_set to store values and kv_get to retrieve them when the user asks."),
+			agent.MCPHandler(kv),
+		),
 	)
 	if err != nil {
 		return fmt.Errorf("building chat component: %w", err)

@@ -67,7 +67,7 @@ func (rt *runtime) composerRegion(active string) html.Content {
 }
 
 // rail renders the conversation list plus a New-conversation control per
-// registered profile (design decision 7: one button per profile).  Every rail
+// registered agent (design decision 7: one button per agent).  Every rail
 // control is a datastar @post action, never a native form: the component has
 // no pages of its own, so a browser navigation would land on the raw SSE
 // response instead of letting the patches update this page.
@@ -75,12 +75,12 @@ func (rt *runtime) rail(active string) html.Content {
 	newRow := tag.New("div.chat-new").
 		Set("id", rt.elemID("new")).
 		Add(tag.New("span.chat-new-label", html.Text("New:")))
-	for _, p := range rt.cfg.profiles {
+	for _, a := range rt.cfg.agents {
 		newRow = newRow.Add(
 			tag.New("button.chat-new-profile").
 				Set("data-on:click",
-					"@post('"+rt.path("conversations")+"?profile="+queryEscape(p.Name)+"')").
-				Add(html.Text(p.Name)),
+					"@post('"+rt.path("conversations")+"?profile="+queryEscape(a.Name())+"')").
+				Add(html.Text(a.Name())),
 		)
 	}
 
