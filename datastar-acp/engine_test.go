@@ -16,7 +16,7 @@ import (
 	"swdunlop.dev/pkg/datastar-acp/agent"
 )
 
-// fakeDriver is a scripted in-package implementation of the unexported driver
+// fakeDriver is a scripted in-package implementation of the unexported Driver
 // interface for the turn engine test.  Its Prompt runs a caller-supplied
 // script over the sink; Answer signals a channel a script step can wait on;
 // cancellation is observed via ctx.
@@ -107,7 +107,7 @@ func (c *capture) waitFor(t *testing.T, substr string) {
 
 // newTestRuntime builds a runtime with an in-memory store and an injected
 // driver factory.
-func newTestRuntime(t *testing.T, factory func(agent.Config, mcpEndpoint) (driver, error)) *runtime {
+func newTestRuntime(t *testing.T, factory func(agent.Config, mcpEndpoint) (Driver, error)) *runtime {
 	iface, err := New(Agent(agent.Name("triage"), agent.Command("x"), agent.Instructions("PREAMBLE")))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -147,7 +147,7 @@ func TestTurnEngineHappyPath(t *testing.T) {
 		sink(Event{Kind: EventMessage, Text: "the answer is 42"})
 		return "end_turn", nil
 	})
-	rt := newTestRuntime(t, func(agent.Config, mcpEndpoint) (driver, error) { return fake, nil })
+	rt := newTestRuntime(t, func(agent.Config, mcpEndpoint) (Driver, error) { return fake, nil })
 	defer rt.Shutdown()
 	cap := newCapture(t, rt)
 
@@ -227,7 +227,7 @@ func TestTurnEnginePermissionAnswered(t *testing.T) {
 			return "", ctx.Err()
 		}
 	})
-	rt := newTestRuntime(t, func(agent.Config, mcpEndpoint) (driver, error) { return fake, nil })
+	rt := newTestRuntime(t, func(agent.Config, mcpEndpoint) (Driver, error) { return fake, nil })
 	defer rt.Shutdown()
 	cap := newCapture(t, rt)
 
@@ -276,7 +276,7 @@ func TestTurnEngineCancel(t *testing.T) {
 		<-ctx.Done()
 		return "", ctx.Err()
 	})
-	rt := newTestRuntime(t, func(agent.Config, mcpEndpoint) (driver, error) { return fake, nil })
+	rt := newTestRuntime(t, func(agent.Config, mcpEndpoint) (Driver, error) { return fake, nil })
 	defer rt.Shutdown()
 	cap := newCapture(t, rt)
 
@@ -339,7 +339,7 @@ func firstEvent(entries []Entry, kind EventKind) *Event {
 func runFakeTurn(t *testing.T, script func(context.Context, string, func(Event), *fakeDriver) (string, error)) (*runtime, string, *capture) {
 	t.Helper()
 	fake := newFakeDriver(script)
-	rt := newTestRuntime(t, func(agent.Config, mcpEndpoint) (driver, error) { return fake, nil })
+	rt := newTestRuntime(t, func(agent.Config, mcpEndpoint) (Driver, error) { return fake, nil })
 	t.Cleanup(rt.Shutdown)
 	cap := newCapture(t, rt)
 	postForm(rt, "/agent/conversations", url.Values{"profile": {"triage"}})
@@ -466,7 +466,7 @@ func TestMidTurnReselectPermission(t *testing.T) {
 			return "", ctx.Err()
 		}
 	})
-	rt := newTestRuntime(t, func(agent.Config, mcpEndpoint) (driver, error) { return fake, nil })
+	rt := newTestRuntime(t, func(agent.Config, mcpEndpoint) (Driver, error) { return fake, nil })
 	defer rt.Shutdown()
 	cap := newCapture(t, rt)
 
@@ -507,7 +507,7 @@ func TestRenamedPromptSignal(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 	rt := iface.(*runtime)
-	rt.newDriver = func(agent.Config, mcpEndpoint) (driver, error) { return fake, nil }
+	rt.newDriver = func(agent.Config, mcpEndpoint) (Driver, error) { return fake, nil }
 	defer rt.Shutdown()
 	cap := newCapture(t, rt)
 
@@ -529,7 +529,7 @@ func TestGateBusyVisibleError(t *testing.T) {
 		sink(Event{Kind: EventMessage, Text: "finally"})
 		return "end_turn", nil
 	})
-	rt := newTestRuntime(t, func(agent.Config, mcpEndpoint) (driver, error) { return fake, nil })
+	rt := newTestRuntime(t, func(agent.Config, mcpEndpoint) (Driver, error) { return fake, nil })
 	defer rt.Shutdown()
 	cap := newCapture(t, rt)
 
@@ -564,7 +564,7 @@ func TestStaleAnswerVisibleError(t *testing.T) {
 		sink(Event{Kind: EventMessage, Text: "hi"})
 		return "end_turn", nil
 	})
-	rt := newTestRuntime(t, func(agent.Config, mcpEndpoint) (driver, error) { return fake, nil })
+	rt := newTestRuntime(t, func(agent.Config, mcpEndpoint) (Driver, error) { return fake, nil })
 	defer rt.Shutdown()
 	cap := newCapture(t, rt)
 

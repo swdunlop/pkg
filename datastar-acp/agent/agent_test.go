@@ -14,7 +14,7 @@ func TestNewValidation(t *testing.T) {
 		wantErr string
 	}{
 		{"missing name", []Option{Command("x")}, "name is required"},
-		{"missing command", []Option{Name("triage")}, "no command"},
+		{"command optional here; chat.New enforces it", []Option{Name("triage")}, ""},
 		{"two mcp variants", []Option{Name("triage"), Command("x"),
 			MCPEndpoint("http://127.0.0.1:1/mcp", "tok"), MCPCommand("tool")}, "more than one MCP server"},
 		{"mcp env without command", []Option{Name("triage"), Command("x"),

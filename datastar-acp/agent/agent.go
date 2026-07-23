@@ -34,8 +34,11 @@ type Config struct {
 // Option configures one aspect of an agent Config; see New.
 type Option func(*Config)
 
-// New builds a validated Config: Name and Command are required, and at most
-// one of MCPHandler, MCPEndpoint, or MCPCommand may be given.
+// New builds a validated Config: Name is required, and at most one of
+// MCPHandler, MCPEndpoint, or MCPCommand may be given.  Command is required
+// to spawn a subprocess but not checked here — chat.New enforces it for
+// exactly the agents that spawn one, since an agent registered with a
+// host-supplied driver (chat.AgentDriver) legitimately has none.
 func New(options ...Option) (Config, error) {
 	var cfg Config
 	for _, opt := range options {
@@ -43,9 +46,6 @@ func New(options ...Option) (Config, error) {
 	}
 	if cfg.name == `` {
 		return Config{}, fmt.Errorf(`agent: a name is required; see agent.Name`)
-	}
-	if cfg.command == `` {
-		return Config{}, fmt.Errorf(`agent: agent %q has no command; see agent.Command`, cfg.name)
 	}
 	variants := 0
 	for _, set := range []bool{cfg.mcpHandler != nil, cfg.mcpURL != ``, cfg.mcpCommand != ``} {

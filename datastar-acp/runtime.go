@@ -38,7 +38,7 @@ type runtime struct {
 
 	// live is the single live driver (design decision 14: one live subprocess).
 	// liveID names the conversation it serves.
-	live   driver
+	live   Driver
 	liveID string
 
 	// turnOwner / turnOwnerName record the conversation currently holding the
@@ -68,7 +68,7 @@ type runtime struct {
 	// newDriver overrides the driver factory (tests inject a scripted fake);
 	// nil uses newACPDriver.  Set only at construction, before any goroutine
 	// reads it, so it needs no mutex.
-	newDriver func(profile agent.Config, mcp mcpEndpoint) (driver, error)
+	newDriver func(profile agent.Config, mcp mcpEndpoint) (Driver, error)
 }
 
 // pendingPerm is one live permission card awaiting an answer.

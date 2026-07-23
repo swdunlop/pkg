@@ -38,6 +38,17 @@ outside if datalog wants to keep it after migrating). Dropping kit also
 drops kit session files: this package owns its conversation
 persistence (decision 8).
 
+*Amended for milestone 2:* the driver seam is exported — `chat.Driver`
+plus the `chat.AgentDriver(name, factory, ...)` option — so a host can
+register an in-process agent behind the same pane, transcript, and
+turn engine. The component still links no LLM library and ships only
+the ACP subprocess implementation; datalog's `kitDriver` implements
+`chat.Driver` from outside. Driver-backed agents reject
+`agent.Command` and every MCP option (the host wires its tools in
+process), and the command-required check moved from `agent.New` to
+`chat.New`, the one place that knows whether a factory backs the
+agent.
+
 **3. Copy now, migrate datalog later.** The extraction copies and
 adapts datalog's code; datalog keeps its inline version until the API
 stabilizes against the example app. This deliberately violates the
@@ -229,7 +240,9 @@ inline behind datalog's own driver seam or be retired.
 
 ## Out of scope
 
-- In-process (kit) agents, and any LLM API access of our own.
+- Shipping any in-process agent (kit) or LLM API access of our own —
+  hosts may bring one via the exported `chat.Driver` seam (decision 2,
+  as amended).
 - ACP `session/load` resume; digest-into-prompt resume.
 - Parallel turns, multi-user, non-loopback deployment.
 - Raw ACP wire logging.

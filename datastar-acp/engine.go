@@ -176,7 +176,7 @@ func (rt *runtime) handleDelete(w http.ResponseWriter, r *http.Request) {
 	if rt.turnRunning && rt.turnOwner == id && rt.turnCancel != nil {
 		rt.turnCancel()
 	}
-	var toClose driver
+	var toClose Driver
 	if rt.liveID == id {
 		toClose, rt.live, rt.liveID = rt.live, nil, ""
 		rt.preambleSent = false
@@ -371,7 +371,7 @@ func (rt *runtime) frameWire(convID, profileName, text string) string {
 // breaks the accumulators; events that morph in place (tool-result, a later
 // plan update) do not.  A message chunk resets the thought accumulator and vice
 // versa: each kind's entry ends when a DIFFERENT kind appends.
-func (rt *runtime) runTurn(ctx context.Context, d driver, wire, convID, name string) {
+func (rt *runtime) runTurn(ctx context.Context, d Driver, wire, convID, name string) {
 	var (
 		// sinkMu orders accumulator mutations: a real ACP driver invokes the sink
 		// from its own notification-pump goroutine, concurrently with the
@@ -643,7 +643,7 @@ func (rt *runtime) publishRail() {
 // on first use and closing an idle driver bound to a different conversation
 // (design decision 14: one live subprocess).  reqHost carries the request Host
 // so the MCP URL can be built when the ListenAddr option is unset.
-func (rt *runtime) conversationDriver(id, reqHost string) (driver, error) {
+func (rt *runtime) conversationDriver(id, reqHost string) (Driver, error) {
 	rt.mu.Lock()
 	if rt.live != nil && rt.liveID == id {
 		d := rt.live
@@ -687,16 +687,26 @@ func (rt *runtime) conversationDriver(id, reqHost string) (driver, error) {
 }
 
 // spawn is the driver factory, overridable in tests via rt.newDriver.
-func (rt *runtime) spawn(profile agent.Config, mcp mcpEndpoint) (driver, error) {
+func (rt *runtime) spawn(profile agent.Config, mcp mcpEndpoint) (Driver, error) {
 	if rt.newDriver != nil {
 		return rt.newDriver(profile, mcp)
+	}
+	if factory, ok := rt.cfg.drivers[profile.Name()]; ok {
+		// Host-supplied driver (chat.AgentDriver): no subprocess, and mcp is
+		// always the zero value — AgentDriver rejects MCP options at
+		// construction, since the factory wires the agent's tools in process.
+		d, err := factory()
+		if err != nil {
+			return nil, fmt.Errorf("chat: agent %q driver factory: %w", profile.Name(), err)
+		}
+		return d, nil
 	}
 	return newACPDriver(profile, mcp)
 }
 
 // dropDriver discards the live driver after a fatal turn error so the next
 // send respawns.
-func (rt *runtime) dropDriver(d driver) {
+func (rt *runtime) dropDriver(d Driver) {
 	rt.mu.Lock()
 	if rt.live == d {
 		rt.live, rt.liveID = nil, ""

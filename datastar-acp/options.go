@@ -46,6 +46,47 @@ func Agent(options ...agent.Option) Option {
 	}
 }
 
+// AgentDriver registers a named agent served by a host-supplied Driver
+// factory instead of a spawned ACP subprocess — the seam for embedding an
+// in-process agent (an LLM library wired straight to the host's tools) behind
+// the same pane, transcript, and turn engine as an ACP agent.  The factory is
+// called lazily on the first prompt, and again after any fatal turn error or
+// conversation switch (the component keeps one live Driver and rebuilds on
+// demand; see Driver's contract).
+//
+// options may add Instructions; agent.Command and the MCP options do not
+// apply — the host wires the driver's tools itself, in process — and setting
+// any of them is a configuration error.
+func AgentDriver(name string, factory func() (Driver, error), options ...agent.Option) Option {
+	return func(cfg *config) {
+		if factory == nil {
+			cfg.err = fmt.Errorf(`chat: agent %q has a nil Driver factory`, name)
+			return
+		}
+		Agent(append([]agent.Option{agent.Name(name)}, options...)...)(cfg)
+		if cfg.err != nil {
+			return
+		}
+		a := cfg.agents[len(cfg.agents)-1]
+		command, _ := a.Command()
+		_, _, hasEndpoint := a.MCPEndpoint()
+		_, _, _, hasCommand := a.MCPCommand()
+		switch {
+		case command != ``:
+			cfg.err = fmt.Errorf(`chat: agent %q sets both a Driver factory and agent.Command; use one`, name)
+		case a.MCPHandler() != nil || hasEndpoint || hasCommand:
+			cfg.err = fmt.Errorf(`chat: agent %q sets both a Driver factory and an MCP option; a Driver wires its own tools`, name)
+		}
+		if cfg.err != nil {
+			return
+		}
+		if cfg.drivers == nil {
+			cfg.drivers = map[string]func() (Driver, error){}
+		}
+		cfg.drivers[name] = factory
+	}
+}
+
 // ListenAddr tells the component the host:port the host serves it on, so it
 // can build the loopback MCP URL it hands the agent at session/new.  The
 // component does not run the listener itself (unlike datalog's serve, which
