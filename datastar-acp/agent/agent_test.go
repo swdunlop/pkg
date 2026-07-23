@@ -5,21 +5,30 @@ import (
 	"testing"
 )
 
-// TestNewValidation covers the invariants New enforces: required name and
-// command, a single MCP variant, and MCPEnv only alongside MCPCommand.
+// TestNewValidation covers the invariants New enforces: required name,
+// exactly one of Command or DriverFactory, a single MCP variant, MCPEnv only
+// alongside MCPCommand, and no MCP option alongside DriverFactory.
 func TestNewValidation(t *testing.T) {
+	factory := func() (Driver, error) { return nil, nil }
 	cases := []struct {
 		name    string
 		options []Option
 		wantErr string
 	}{
 		{"missing name", []Option{Command("x")}, "name is required"},
-		{"command optional here; chat.New enforces it", []Option{Name("triage")}, ""},
+		{"missing command", []Option{Name("triage")}, "no command"},
 		{"two mcp variants", []Option{Name("triage"), Command("x"),
 			MCPEndpoint("http://127.0.0.1:1/mcp", "tok"), MCPCommand("tool")}, "more than one MCP server"},
 		{"mcp env without command", []Option{Name("triage"), Command("x"),
 			MCPEnv("X=1")}, "MCPEnv without MCPCommand"},
 		{"minimal ok", []Option{Name("triage"), Command("x")}, ""},
+		{"driver ok", []Option{Name("triage"), DriverFactory(factory)}, ""},
+		{"driver plus command", []Option{Name("triage"), DriverFactory(factory),
+			Command("x")}, "both DriverFactory and Command"},
+		{"driver plus mcp endpoint", []Option{Name("triage"), DriverFactory(factory),
+			MCPEndpoint("http://127.0.0.1:1/mcp", "tok")}, "both DriverFactory and an MCP option"},
+		{"driver plus mcp command", []Option{Name("triage"), DriverFactory(factory),
+			MCPCommand("tool")}, "both DriverFactory and an MCP option"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

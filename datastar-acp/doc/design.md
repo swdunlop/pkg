@@ -38,16 +38,17 @@ outside if datalog wants to keep it after migrating). Dropping kit also
 drops kit session files: this package owns its conversation
 persistence (decision 8).
 
-*Amended for milestone 2:* the driver seam is exported — `chat.Driver`
-plus the `chat.AgentDriver(name, factory, ...)` option — so a host can
+*Amended for milestone 2:* the driver seam is exported so a host can
 register an in-process agent behind the same pane, transcript, and
-turn engine. The component still links no LLM library and ships only
-the ACP subprocess implementation; datalog's `kitDriver` implements
-`chat.Driver` from outside. Driver-backed agents reject
-`agent.Command` and every MCP option (the host wires its tools in
-process), and the command-required check moved from `agent.New` to
-`chat.New`, the one place that knows whether a factory backs the
-agent.
+turn engine. The `Driver` contract and the `Event` vocabulary live in
+the agent subpackage (aliased in `chat`, whose API is unchanged) so
+the factory is an ordinary composable option, not a parallel
+constructor: `chat.Agent(agent.Name(…), agent.DriverFactory(f), …)`.
+The component still links no LLM library and ships only the ACP
+subprocess implementation; datalog's `kitDriver` implements the
+`Driver` contract from outside. `agent.New` enforces exactly one of
+`Command` or `DriverFactory` and rejects MCP options alongside a
+factory (the host wires its tools in process).
 
 **3. Copy now, migrate datalog later.** The extraction copies and
 adapts datalog's code; datalog keeps its inline version until the API

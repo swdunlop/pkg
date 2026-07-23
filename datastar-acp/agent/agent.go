@@ -1,8 +1,10 @@
-// Package agent describes how the chat component spawns and frames one ACP
-// agent: the subprocess command, its environment and working directory, the
-// instructions preamble, and the MCP server handed to it at session/new.
-// Hosts build a Config with New (usually indirectly, via chat.Agent) from the
-// functional options here; the zero Config is not usable.
+// Package agent describes one conversational agent behind the chat pane: the
+// recipe for spawning it (the subprocess command, its environment and working
+// directory, the instructions preamble, and the MCP server handed to it at
+// session/new), the Driver contract an in-process agent implements instead,
+// and the Event vocabulary a turn emits.  Hosts build a Config with New
+// (usually indirectly, via chat.Agent) from the functional options here; the
+// zero Config is not usable.
 package agent
 
 import (
@@ -22,6 +24,7 @@ type Config struct {
 	env          []string
 	dir          string
 	instructions string
+	driver       func() (Driver, error)
 
 	mcpHandler http.Handler
 	mcpURL     string
@@ -34,11 +37,10 @@ type Config struct {
 // Option configures one aspect of an agent Config; see New.
 type Option func(*Config)
 
-// New builds a validated Config: Name is required, and at most one of
-// MCPHandler, MCPEndpoint, or MCPCommand may be given.  Command is required
-// to spawn a subprocess but not checked here — chat.New enforces it for
-// exactly the agents that spawn one, since an agent registered with a
-// host-supplied driver (chat.AgentDriver) legitimately has none.
+// New builds a validated Config: Name is required, exactly one of Command or
+// DriverFactory must be given, and at most one of MCPHandler, MCPEndpoint, or
+// MCPCommand may be given — none of them alongside DriverFactory, since an
+// in-process driver wires its own tools.
 func New(options ...Option) (Config, error) {
 	var cfg Config
 	for _, opt := range options {
@@ -55,6 +57,14 @@ func New(options ...Option) (Config, error) {
 	}
 	if variants > 1 {
 		return Config{}, fmt.Errorf(`agent: agent %q has more than one MCP server; use one of MCPHandler, MCPEndpoint, or MCPCommand`, cfg.name)
+	}
+	switch {
+	case cfg.driver == nil && cfg.command == ``:
+		return Config{}, fmt.Errorf(`agent: agent %q has no command; see agent.Command (or agent.DriverFactory for in-process agents)`, cfg.name)
+	case cfg.driver != nil && cfg.command != ``:
+		return Config{}, fmt.Errorf(`agent: agent %q sets both DriverFactory and Command; use one`, cfg.name)
+	case cfg.driver != nil && variants > 0:
+		return Config{}, fmt.Errorf(`agent: agent %q sets both DriverFactory and an MCP option; a driver wires its own tools in process`, cfg.name)
 	}
 	if len(cfg.mcpEnv) > 0 && cfg.mcpCommand == `` {
 		return Config{}, fmt.Errorf(`agent: agent %q sets MCPEnv without MCPCommand`, cfg.name)
@@ -73,6 +83,18 @@ func Name(name string) Option {
 // its stdio; required.
 func Command(command string, args ...string) Option {
 	return func(cfg *Config) { cfg.command, cfg.args = command, args }
+}
+
+// DriverFactory serves the agent with a host-supplied in-process Driver
+// instead of a spawned ACP subprocess — the seam for embedding an LLM library
+// wired straight to the host's tools behind the same pane, transcript, and
+// turn engine.  The factory is called lazily on the first prompt, and again
+// after any fatal turn error or conversation switch (the component keeps one
+// live Driver and rebuilds on demand; see Driver's contract).  It replaces
+// Command, and the MCP options do not apply — the host wires the driver's
+// tools itself, in process.
+func DriverFactory(factory func() (Driver, error)) Option {
+	return func(cfg *Config) { cfg.driver = factory }
 }
 
 // Env appends "KEY=VALUE" entries to the parent environment for the spawned
@@ -137,6 +159,10 @@ func (c Config) Name() string { return c.name }
 
 // Command returns the subprocess command and arguments.
 func (c Config) Command() (command string, args []string) { return c.command, c.args }
+
+// DriverFactory returns the host-supplied in-process driver factory, nil for
+// an agent served by a spawned subprocess.
+func (c Config) DriverFactory() func() (Driver, error) { return c.driver }
 
 // Env returns the "KEY=VALUE" entries appended to the subprocess environment.
 func (c Config) Env() []string { return c.env }

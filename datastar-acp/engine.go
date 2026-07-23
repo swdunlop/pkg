@@ -691,10 +691,10 @@ func (rt *runtime) spawn(profile agent.Config, mcp mcpEndpoint) (Driver, error) 
 	if rt.newDriver != nil {
 		return rt.newDriver(profile, mcp)
 	}
-	if factory, ok := rt.cfg.drivers[profile.Name()]; ok {
-		// Host-supplied driver (chat.AgentDriver): no subprocess, and mcp is
-		// always the zero value — AgentDriver rejects MCP options at
-		// construction, since the factory wires the agent's tools in process.
+	if factory := profile.DriverFactory(); factory != nil {
+		// Host-supplied driver (agent.DriverFactory): no subprocess, and mcp
+		// is always the zero value — agent.New rejects MCP options alongside
+		// a factory, since the factory wires the agent's tools in process.
 		d, err := factory()
 		if err != nil {
 			return nil, fmt.Errorf("chat: agent %q driver factory: %w", profile.Name(), err)

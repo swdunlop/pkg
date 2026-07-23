@@ -45,11 +45,6 @@ type config struct {
 	// agents are the registered agent configs; at least one is required.
 	agents []agent.Config
 
-	// drivers maps agent name → host-supplied Driver factory for agents
-	// registered via AgentDriver; agents absent from this map spawn ACP
-	// subprocesses.
-	drivers map[string]func() (Driver, error)
-
 	// store persists conversations; nil means an in-memory store lost on shutdown.
 	store ConversationStore
 
@@ -83,17 +78,6 @@ type config struct {
 func (cfg *config) validate() error {
 	if len(cfg.agents) == 0 {
 		return fmt.Errorf(`chat: at least one agent is required; see chat.Agent`)
-	}
-	// Command is validated here rather than in agent.New because only this
-	// config knows whether a Driver factory backs the agent (chat.AgentDriver)
-	// — the one case where a command is legitimately absent.
-	for _, a := range cfg.agents {
-		if _, ok := cfg.drivers[a.Name()]; ok {
-			continue
-		}
-		if command, _ := a.Command(); command == `` {
-			return fmt.Errorf(`chat: agent %q has no command; see agent.Command (or chat.AgentDriver for in-process agents)`, a.Name())
-		}
 	}
 	if cfg.bus == nil {
 		cfg.bus, cfg.ownBus = NewBus(), true
