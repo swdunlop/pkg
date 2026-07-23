@@ -40,3 +40,9 @@ notes
 CLAUDE.md
 CLAUDE.local.md
 datalog/cmd/datalog/datalog
+
+# Claude Code session artifacts
+.claude/
+
+# datastar-acp runtime event stores (JSONL conversations from demo runs)
+datastar-acp/conversations/
