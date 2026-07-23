@@ -75,8 +75,12 @@ generation, constant-time comparison, loopback enforcement, and the
 `session/new` handshake that hands the URL + token to the agent via
 `mcpServers`. The host registers a configured `mcp-go` server with it.
 A profile may instead name any externally hosted MCP URL + token, which
-is passed through the same handshake. The handshake is the chokepoint:
-no host can forget the token or the mount wiring.
+is passed through the same handshake, or a local command (`MCPCommand`)
+the agent spawns itself and speaks to over stdio — ACP's baseline
+transport, so it works even with agents that never declared the HTTP
+capability; there is no bearer token on that path because process
+spawning is the trust boundary. The handshake is the chokepoint: no
+host can forget the token or the mount wiring.
 
 **7. Named agent profiles carry the specialization.** A profile is the
 unit of "agent with specialized tools and instructions":

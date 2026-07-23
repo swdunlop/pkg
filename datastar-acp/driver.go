@@ -60,9 +60,7 @@ type acpDriver struct {
 	exitErr  error
 	exitCode int
 
-	mcpName  string
-	mcpURL   string
-	mcpToken string
+	mcp mcpEndpoint
 
 	mu        sync.Mutex
 	sessionID acp.SessionId
@@ -118,14 +116,31 @@ type toolCallState struct {
 	args  json.RawMessage // marshalled RawInput, nil if never supplied
 }
 
+// mcpEndpoint is the already-resolved MCP server the component hands the
+// driver for session/new: either an HTTP endpoint (url + bearer token, from
+// the reference mount or MCPEndpoint) or a stdio command the agent spawns
+// itself (from MCPCommand).  The zero value means no MCP server is offered.
+// Resolution happens in conversationDriver — the driver never touches
+// MCPConfig's mount side or generates a token.
+type mcpEndpoint struct {
+	name    string
+	url     string // HTTP transport when non-empty
+	token   string
+	command string // stdio transport when non-empty (and url is empty)
+	args    []string
+	env     []string // "KEY=VALUE" entries, AgentProfile.Env's form
+}
+
+// configured reports whether any MCP server was resolved at all.
+func (e mcpEndpoint) configured() bool { return e.url != "" || e.command != "" }
+
 // newACPDriver spawns the profile's agent subprocess and performs the ACP
 // handshake: initialize with fs/terminal capabilities declined (the agent's
 // only lever on the workspace is the MCP tools), recording the agent's
 // capabilities for the session/new call that Prompt makes lazily on first use.
-// mcpName/mcpURL/mcpToken are the already-resolved MCP endpoint the component
-// hands the agent at session/new; the driver never touches MCPConfig's mount
-// side or generates a token.  A nil mcpURL means no MCP server is offered.
-func newACPDriver(profile AgentProfile, mcpName, mcpURL, mcpToken string) (*acpDriver, error) {
+// mcp is the already-resolved MCP endpoint the component hands the agent at
+// session/new; its zero value means no MCP server is offered.
+func newACPDriver(profile AgentProfile, mcp mcpEndpoint) (*acpDriver, error) {
 	if profile.Command == "" {
 		return nil, fmt.Errorf("chat: agent profile %q has no command", profile.Name)
 	}
@@ -152,9 +167,7 @@ func newACPDriver(profile AgentProfile, mcpName, mcpURL, mcpToken string) (*acpD
 	d := &acpDriver{
 		cmd:       cmd,
 		exited:    make(chan struct{}),
-		mcpName:   mcpName,
-		mcpURL:    mcpURL,
-		mcpToken:  mcpToken,
+		mcp:       mcp,
 		pending:   map[string]chan acp.RequestPermissionOutcome{},
 		toolState: map[acp.ToolCallId]toolCallState{},
 	}
@@ -218,7 +231,7 @@ func (d *acpDriver) ensureSession(ctx context.Context) error {
 	// an empty slice rather than leaving it nil — nil marshals to "mcpServers":
 	// null and the agent rejects the request as "mcpServers is required".
 	req := acp.NewSessionRequest{Cwd: cwd, McpServers: []acp.McpServer{}}
-	if d.mcpURL != "" {
+	if d.mcp.configured() {
 		mcpServer, err := d.mcpServerConfig()
 		if err != nil {
 			return err
@@ -235,24 +248,37 @@ func (d *acpDriver) ensureSession(ctx context.Context) error {
 }
 
 // mcpServerConfig builds the one mcpServers entry session/new gets, passing the
-// already-resolved MCP endpoint through the handshake: the HTTP mount when the
-// agent declared mcpCapabilities.http at initialize, otherwise the baseline
-// stdio transport ACP requires of every agent.  The bearer token travels off
-// of argv — an HTTP header, never a command-line flag.  When the agent lacks
-// the HTTP capability there is no stdio proxy shim to fall back to (that shim
-// was datalog-specific), so an HTTP-only endpoint against a stdio-only agent
-// is reported as an error rather than silently dropping the tools.
+// already-resolved MCP endpoint through the handshake.  A stdio command uses
+// the baseline transport ACP requires of every agent; an HTTP endpoint needs
+// the agent to have declared mcpCapabilities.http at initialize, and its bearer
+// token travels off of argv — an HTTP header, never a command-line flag.  When
+// an HTTP-only endpoint meets a stdio-only agent there is no proxy shim to fall
+// back to (that shim was datalog-specific), so it is reported as an error
+// rather than silently dropping the tools.
 func (d *acpDriver) mcpServerConfig() (acp.McpServer, error) {
-	name := d.mcpName
+	name := d.mcp.name
 	if name == "" {
 		name = "mcp"
+	}
+	if d.mcp.command != "" {
+		env := make([]acp.EnvVariable, len(d.mcp.env))
+		for i, kv := range d.mcp.env {
+			k, v, _ := strings.Cut(kv, "=")
+			env[i] = acp.EnvVariable{Name: k, Value: v}
+		}
+		return acp.McpServer{Stdio: &acp.McpServerStdio{
+			Name:    name,
+			Command: d.mcp.command,
+			Args:    append([]string{}, d.mcp.args...),
+			Env:     env,
+		}}, nil
 	}
 	if d.agentCaps.McpCapabilities.Http {
 		return acp.McpServer{Http: &acp.McpServerHttpInline{
 			Name: name,
-			Url:  d.mcpURL,
+			Url:  d.mcp.url,
 			Headers: []acp.HttpHeader{
-				{Name: "Authorization", Value: "Bearer " + d.mcpToken},
+				{Name: "Authorization", Value: "Bearer " + d.mcp.token},
 			},
 		}}, nil
 	}

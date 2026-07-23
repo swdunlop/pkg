@@ -24,17 +24,21 @@ type AgentProfile struct {
 	// persisted conversation resumes cold after a restart.
 	Instructions string
 
-	// MCP names the tool server handed to the agent at session/new; see MCPHandler and MCPEndpoint.  Empty
-	// means the agent gets no MCP server.
+	// MCP names the tool server handed to the agent at session/new; see MCPHandler, MCPEndpoint, and
+	// MCPCommand.  Empty means the agent gets no MCP server.
 	MCP MCPConfig
 }
 
-// MCPConfig describes the MCP server a profile hands its agent; construct with MCPHandler or MCPEndpoint.
+// MCPConfig describes the MCP server a profile hands its agent; construct with MCPHandler, MCPEndpoint, or
+// MCPCommand.
 type MCPConfig struct {
 	handler  http.Handler
 	url      string
 	token    string
 	external bool
+	command  string
+	args     []string
+	env      []string
 }
 
 // MCPHandler mounts h (typically an mcp-go streamable HTTP server) under the component's base path as the
@@ -49,4 +53,21 @@ func MCPHandler(h http.Handler) MCPConfig {
 // already mount and guard their own endpoint.
 func MCPEndpoint(url, token string) MCPConfig {
 	return MCPConfig{url: url, token: token, external: true}
+}
+
+// MCPCommand hands the agent a local MCP server it spawns itself and speaks to over stdio — ACP's baseline
+// transport, which every agent must support (unlike HTTP, which is capability-gated).  The command is not run
+// by this component: it travels through session/new and the agent launches it in its own working directory,
+// so command should be an absolute path or on the agent's PATH.  There is no bearer token — process spawning
+// is the trust boundary.
+func MCPCommand(command string, args ...string) MCPConfig {
+	return MCPConfig{command: command, args: args}
+}
+
+// Env returns a copy of the config with "KEY=VALUE" environment entries set for the spawned MCP server —
+// meaningful only for MCPCommand configs, mirroring AgentProfile.Env's form.  Entries without '=' get an
+// empty value.
+func (c MCPConfig) Env(env ...string) MCPConfig {
+	c.env = append(c.env[:len(c.env):len(c.env)], env...)
+	return c
 }

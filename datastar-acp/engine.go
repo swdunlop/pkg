@@ -664,15 +664,16 @@ func (rt *runtime) conversationDriver(id, reqHost string) (driver, error) {
 		return nil, fmt.Errorf("chat: unknown profile %q", meta.Profile)
 	}
 
-	mcpName, mcpURL, mcpToken := "", "", ""
+	var mcp mcpEndpoint
 	if mount, ok := rt.cfg.mcp[profile.Name]; ok {
-		mcpName, mcpToken = profile.Name, mount.token
-		mcpURL = rt.mcpURLFor(mount, reqHost)
+		mcp = mcpEndpoint{name: profile.Name, url: rt.mcpURLFor(mount, reqHost), token: mount.token}
 	} else if profile.MCP.external {
-		mcpName, mcpURL, mcpToken = profile.Name, profile.MCP.url, profile.MCP.token
+		mcp = mcpEndpoint{name: profile.Name, url: profile.MCP.url, token: profile.MCP.token}
+	} else if profile.MCP.command != "" {
+		mcp = mcpEndpoint{name: profile.Name, command: profile.MCP.command, args: profile.MCP.args, env: profile.MCP.env}
 	}
 
-	d, err := rt.spawn(profile, mcpName, mcpURL, mcpToken)
+	d, err := rt.spawn(profile, mcp)
 	if err != nil {
 		return nil, err
 	}
@@ -684,11 +685,11 @@ func (rt *runtime) conversationDriver(id, reqHost string) (driver, error) {
 }
 
 // spawn is the driver factory, overridable in tests via rt.newDriver.
-func (rt *runtime) spawn(profile AgentProfile, mcpName, mcpURL, mcpToken string) (driver, error) {
+func (rt *runtime) spawn(profile AgentProfile, mcp mcpEndpoint) (driver, error) {
 	if rt.newDriver != nil {
-		return rt.newDriver(profile, mcpName, mcpURL, mcpToken)
+		return rt.newDriver(profile, mcp)
 	}
-	return newACPDriver(profile, mcpName, mcpURL, mcpToken)
+	return newACPDriver(profile, mcp)
 }
 
 // dropDriver discards the live driver after a fatal turn error so the next

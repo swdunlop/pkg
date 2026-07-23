@@ -66,7 +66,7 @@ type runtime struct {
 	// newDriver overrides the driver factory (tests inject a scripted fake);
 	// nil uses newACPDriver.  Set only at construction, before any goroutine
 	// reads it, so it needs no mutex.
-	newDriver func(profile AgentProfile, mcpName, mcpURL, mcpToken string) (driver, error)
+	newDriver func(profile AgentProfile, mcp mcpEndpoint) (driver, error)
 }
 
 // pendingPerm is one live permission card awaiting an answer.
