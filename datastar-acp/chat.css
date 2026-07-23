@@ -1,0 +1,479 @@
+/* chat.css — the component's optional stylesheet (design decision 12).
+ *
+ * Everything is scoped under the .chat root class the component emits, so
+ * mounting this file never fights a host stylesheet; a host that wants its
+ * own look simply doesn't serve it.  Colors ride --chat-* custom properties
+ * with light-dark() values, so a host themes by overriding the variables on
+ * .chat (or forcing `color-scheme: dark` on an ancestor), not by out-
+ * specifying selectors.
+ *
+ * The palette is darkberg (iceberg-derived, near-black dark side) and
+ * darkberg-light — deliberately higher-contrast than Nord while keeping the
+ * same cool restraint.  Layout idioms mirror the datalog workbench: rail
+ * beside transcript, transcript grows and scrolls with short logs pinned to
+ * the bottom terminal-style, and the round send/stop button sits inside the
+ * prompt box's corner.
+ */
+
+.chat {
+  color-scheme: light dark;
+
+  /* darkberg-light / darkberg */
+  --chat-bg: light-dark(#e9e9ed, #020202);
+  --chat-surface: light-dark(#dddfe9, #0b0c13); /* rail, disclosure bodies */
+  --chat-raised: light-dark(#cccfe0, #141723); /* hover, <pre> blocks */
+  --chat-active: light-dark(#cacdd8, #292c3c); /* selected rail item */
+  --chat-border: light-dark(#bec0ca, #2b2f3f);
+  --chat-fg: light-dark(#33374d, #c7c9d1);
+  --chat-fg-dim: light-dark(#757da3, #828597); /* secondary text */
+  --chat-fg-faint: light-dark(#8489a4, #6c7189); /* hints, badges */
+  --chat-accent: light-dark(#253b68, #85a0c7);
+  --chat-on-accent: light-dark(#e9e9ed, #020202);
+  --chat-danger: light-dark(#63273b, #e27878);
+  --chat-on-danger: light-dark(#e9e9ed, #020202);
+  --chat-input-bg: light-dark(#ffffff, #0b0c13);
+
+  --chat-font:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  --chat-font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --chat-radius: 6px;
+  --chat-rail-width: 15rem;
+
+  /* Two columns: rail beside the transcript+composer stack.  The host sizes
+   * the .chat element (the demo gives it the rest of the page); everything
+   * inside scrolls in its own region rather than growing the page. */
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  background: var(--chat-bg);
+  color: var(--chat-fg);
+  font-family: var(--chat-font);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+/* Buttons inherit the component's type instead of UA chrome; each concrete
+ * button below adds its own affordance. */
+.chat button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+/* --- rail ------------------------------------------------------------- */
+
+.chat-rail {
+  flex: none;
+  width: var(--chat-rail-width);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--chat-surface);
+  border-right: 1px solid var(--chat-border);
+}
+
+.chat-new {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.625rem 0.75rem;
+  border-bottom: 1px solid var(--chat-border);
+}
+.chat-new-label {
+  color: var(--chat-fg-faint);
+}
+.chat-new-profile {
+  padding: 0.125rem 0.625rem;
+  border: 1px solid var(--chat-accent);
+  border-radius: 999px;
+  color: var(--chat-accent);
+}
+.chat-new-profile:hover {
+  background: var(--chat-accent);
+  color: var(--chat-on-accent);
+}
+
+.chat-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0.25rem 0;
+}
+.chat-item {
+  display: flex;
+  align-items: stretch;
+}
+.chat-item.active {
+  background: var(--chat-active);
+}
+.chat-link {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.375rem 0.25rem 0.375rem 0.75rem;
+  text-align: left;
+}
+.chat-item:not(.active) .chat-link:hover {
+  background: var(--chat-raised);
+}
+.chat-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-badge {
+  flex: none;
+  font-size: 0.6875rem;
+  color: var(--chat-fg-faint);
+}
+.chat-delete {
+  flex: none;
+  padding: 0 0.625rem;
+  color: var(--chat-fg-faint);
+  /* only readable on the row under the pointer — the rail stays quiet */
+  visibility: hidden;
+}
+.chat-item:hover .chat-delete {
+  visibility: visible;
+}
+.chat-delete:hover {
+  color: var(--chat-danger);
+}
+
+/* --- main column: transcript over composer ----------------------------- */
+
+.chat-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0.75rem;
+}
+
+.chat-transcript {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+.chat-log {
+  display: flex;
+  flex-direction: column;
+  margin-top: auto; /* short logs pin to the bottom, like a terminal */
+}
+.chat-hint {
+  margin: auto;
+  color: var(--chat-fg-faint);
+  font-style: italic;
+}
+
+/* --- transcript entries ------------------------------------------------ */
+
+.chat-entry {
+  padding: 0.375rem 0.5rem;
+  border-bottom: 1px solid var(--chat-border);
+}
+.chat-entry:last-child {
+  border-bottom: none;
+}
+.chat-entry p {
+  margin: 0;
+}
+.chat-entry.user .chat-user {
+  color: var(--chat-accent);
+  white-space: pre-wrap;
+}
+/* Agent messages are goldmark-rendered markdown (hard wraps carry the
+ * newlines, so no pre-wrap): tighten the generated elements to log-line
+ * rhythm — a chat message is not page prose. */
+.chat-agent {
+  overflow-wrap: anywhere;
+}
+.chat-agent > :first-child {
+  margin-top: 0;
+}
+.chat-agent > :last-child {
+  margin-bottom: 0;
+}
+.chat-agent p,
+.chat-agent ul,
+.chat-agent ol,
+.chat-agent table {
+  margin: 0.375rem 0;
+}
+.chat-agent ul,
+.chat-agent ol {
+  padding-left: 1.25rem;
+}
+.chat-agent h1,
+.chat-agent h2,
+.chat-agent h3,
+.chat-agent h4,
+.chat-agent h5,
+.chat-agent h6 {
+  font-size: 0.9375rem;
+  margin: 0.625rem 0 0.25rem;
+}
+.chat-agent code {
+  font-family: var(--chat-font-mono);
+  font-size: 0.8125rem;
+  background: var(--chat-raised);
+  border-radius: 3px;
+  padding: 0.0625rem 0.25rem;
+}
+.chat-agent pre code {
+  background: none;
+  padding: 0;
+}
+.chat-agent a {
+  color: var(--chat-accent);
+}
+.chat-agent blockquote {
+  margin: 0.375rem 0;
+  padding-left: 0.75rem;
+  border-left: 2px solid var(--chat-border);
+  color: var(--chat-fg-dim);
+}
+.chat-agent table {
+  border-collapse: collapse;
+}
+.chat-agent th,
+.chat-agent td {
+  border: 1px solid var(--chat-border);
+  padding: 0.25rem 0.5rem;
+}
+.chat-agent hr {
+  border: none;
+  border-top: 1px solid var(--chat-border);
+  margin: 0.5rem 0;
+}
+.chat-entry.note {
+  color: var(--chat-fg-dim);
+}
+.chat-entry.error .chat-error {
+  background: rgb(from var(--chat-danger) r g b / 0.15);
+  color: var(--chat-danger);
+  border-radius: var(--chat-radius);
+  padding: 0.5rem 0.75rem;
+  white-space: pre-wrap;
+}
+
+/* Disclosures (thoughts and tool calls): a quiet summary row with a
+ * trailing chevron, the body inset on the surface tint. */
+.chat-entry summary {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--chat-fg-dim);
+  cursor: pointer;
+  list-style: none; /* the ::after chevron replaces the UA marker */
+}
+.chat-entry summary::-webkit-details-marker {
+  display: none;
+}
+.chat-entry summary::after {
+  content: '▸';
+  flex: none;
+  color: var(--chat-fg-faint);
+}
+.chat-entry details[open] > summary::after {
+  content: '▾';
+}
+.chat-entry details > *:not(summary) {
+  margin: 0.375rem 0 0.125rem 0.75rem;
+}
+.chat-entry pre {
+  max-height: 12rem;
+  overflow: auto;
+  background: var(--chat-raised);
+  border-radius: var(--chat-radius);
+  padding: 0.5rem;
+  font-family: var(--chat-font-mono);
+  font-size: 0.8125rem;
+}
+.chat-tool-line code {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--chat-font-mono);
+  font-size: 0.8125rem;
+}
+/* Status is an icon, not a word: a red ✕ badge on error, nothing otherwise
+ * (the activity line is the pane's one running indicator). */
+.chat-tool-status.error::before {
+  content: '✕';
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 999px;
+  background: var(--chat-danger);
+  color: var(--chat-on-danger);
+  font-size: 0.7rem;
+  line-height: 1;
+}
+.chat-tool-error {
+  margin: 0;
+  padding-left: 1.25rem;
+  color: var(--chat-danger);
+}
+
+/* Plan checklist: a status glyph stands in for a native checkbox. */
+.chat-plan {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.chat-plan-line {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+.chat-plan-line.completed {
+  color: var(--chat-fg-dim);
+  text-decoration: line-through;
+}
+.chat-plan-line.in-progress .chat-plan-mark {
+  color: var(--chat-accent);
+}
+
+/* Permission cards: the line reads like the tool summary it echoes;
+ * allow/reject buttons carry the semantic colors. */
+.chat-permission-line {
+  margin: 0 0 0.375rem;
+  color: var(--chat-fg-dim);
+}
+.chat-permission-options {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.chat-permission-option {
+  padding: 0.125rem 0.75rem;
+  border: 1px solid var(--chat-border);
+  border-radius: var(--chat-radius);
+}
+.chat-permission-option.allow {
+  border-color: var(--chat-accent);
+  color: var(--chat-accent);
+}
+.chat-permission-option.allow:hover {
+  background: var(--chat-accent);
+  color: var(--chat-on-accent);
+}
+.chat-permission-option.reject {
+  border-color: var(--chat-danger);
+  color: var(--chat-danger);
+}
+.chat-permission-option.reject:hover {
+  background: var(--chat-danger);
+  color: var(--chat-on-danger);
+}
+
+/* --- composer ----------------------------------------------------------- */
+
+.chat-composer {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+/* The one running indicator: a spun ring beside the activity text, accent
+ * to match the send button it sits above. */
+.chat-activity {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--chat-accent);
+}
+.chat-activity::before {
+  content: '';
+  flex: none;
+  width: 0.875rem;
+  height: 0.875rem;
+  border: 2px solid rgb(from currentColor r g b / 0.25);
+  border-top-color: currentColor;
+  border-radius: 999px;
+  animation: chat-spin 0.8s linear infinite;
+}
+@keyframes chat-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.chat-turn-elsewhere {
+  margin: 0;
+  color: var(--chat-fg-faint);
+  font-style: italic;
+}
+
+/* Chat-idiom prompt box: the round send/stop button sits inside the
+ * textarea's bottom-right corner, and the textarea reserves padding so text
+ * never runs underneath it. */
+.chat-prompt-box {
+  position: relative;
+  display: flex;
+}
+.chat-input {
+  flex: 1 1 auto;
+  resize: none;
+  padding: 0.5rem;
+  padding-inline-end: 2.75rem;
+  background: var(--chat-input-bg);
+  color: var(--chat-fg);
+  border: 1px solid var(--chat-border);
+  border-radius: var(--chat-radius);
+  font-family: var(--chat-font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+.chat-input:focus {
+  outline: none;
+  border-color: var(--chat-accent);
+}
+.chat-input::placeholder {
+  color: var(--chat-fg-faint);
+}
+.chat-send {
+  position: absolute;
+  right: 0.5rem;
+  bottom: 0.5rem;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 999px;
+  background: var(--chat-accent);
+  color: var(--chat-on-accent);
+  font-size: 1rem;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.chat-send:hover:not(:disabled) {
+  background: rgb(from var(--chat-accent) r g b / 0.85);
+}
+.chat-send:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

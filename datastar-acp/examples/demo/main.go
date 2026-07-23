@@ -16,6 +16,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -82,6 +83,10 @@ func run(agentCommand string, agentArgs []string) error {
 
 	mux := http.NewServeMux()
 	mux.Handle("/agent/", component) // the component's HTTP surface
+	mux.HandleFunc("/chat.css", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		io.WriteString(w, chat.CSS)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -109,6 +114,11 @@ func page(component chat.Interface) html.Content {
 				// need it to drive the SSE feed and signals.
 				tag.New("script[type=module]").Set("src",
 					"https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0/bundles/datastar.js"),
+				// The component's optional stylesheet (chat.CSS), plus the one
+				// obligation it leaves the page: give .chat a bounded height so
+				// the transcript scrolls instead of growing the page.
+				tag.New("link[rel=stylesheet][href=/chat.css]"),
+				tag.New("style", html.Text(shellCSS)),
 			),
 			tag.New("body").Add(
 				tag.New("h1", html.Text("datastar-acp demo")),
@@ -117,6 +127,22 @@ func page(component chat.Interface) html.Content {
 		),
 	}
 }
+
+// shellCSS is the page's own (tiny) stylesheet: fill the viewport, hand the
+// chat pane the height left under the heading, and match the page chrome to
+// the component's darkberg tokens so the frame doesn't clash with the pane.
+const shellCSS = `
+html, body { height: 100%; margin: 0; }
+body {
+	display: flex; flex-direction: column;
+	color-scheme: light dark;
+	background: light-dark(#e9e9ed, #020202);
+	color: light-dark(#33374d, #c7c9d1);
+	font-family: system-ui, sans-serif;
+}
+h1 { flex: none; margin: 0; padding: 0.5rem 1rem; font-size: 1rem; }
+.chat { flex: 1 1 auto; min-height: 0; border-top: 1px solid light-dark(#bec0ca, #2b2f3f); }
+`
 
 // --- toy key-value MCP server ----------------------------------------------
 

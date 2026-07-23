@@ -206,7 +206,7 @@ func promptEntry(elemID, text string) html.Content {
 func (rt *runtime) eventEntry(convID, elemID string, ev *Event, answerable bool) html.Content {
 	switch ev.Kind {
 	case EventMessage:
-		return entryTag(elemID, "agent", tag.New("div.chat-agent", html.Text(ev.Text)))
+		return entryTag(elemID, "agent", markdownBody(ev.Text))
 	case EventThought:
 		return entryTag(elemID, "thought", thoughtBody(ev.Text))
 	case EventToolCall:
