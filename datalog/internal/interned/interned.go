@@ -381,7 +381,14 @@ func UnifyV(ca CompiledAtom, fact *InternedFact, sub *VarSub) bool {
 		return false
 	}
 
-	// Pass 1: check compatibility and count new bindings.
+	// Check compatibility, staging new bindings in sub.Vals. A slot's value
+	// is meaningless until its Mask bit is set, so staging is invisible to
+	// callers until the Mask is committed below; on failure the Mask is
+	// untouched, which rolls the staged values back.
+	//
+	// A variable unbound on entry may occur more than once in this atom
+	// (p(X, X)): its first occurrence stages a value in newMask, and every
+	// later occurrence must equal it.
 	var newMask uint16
 	for i := range ca.Arity {
 		val := fact.Values[i]
@@ -390,28 +397,19 @@ func UnifyV(ca CompiledAtom, fact *InternedFact, sub *VarSub) bool {
 			if t.ConstID != val {
 				return false
 			}
+			continue
+		}
+		bit := uint16(1) << uint(t.VarIdx)
+		if (sub.Mask|newMask)&bit != 0 {
+			if sub.Vals[t.VarIdx] != val {
+				return false
+			}
 		} else {
-			bit := uint16(1) << uint(t.VarIdx)
-			if sub.Mask&bit != 0 {
-				if sub.Vals[t.VarIdx] != val {
-					return false
-				}
-			} else {
-				newMask |= bit
-			}
+			newMask |= bit
+			sub.Vals[t.VarIdx] = val
 		}
 	}
-
-	// Pass 2: apply new bindings (only reached on success).
-	if newMask != 0 {
-		sub.Mask |= newMask
-		for i := range ca.Arity {
-			t := ca.Terms[i]
-			if t.VarIdx >= 0 && newMask>>uint(t.VarIdx)&1 != 0 {
-				sub.Vals[t.VarIdx] = fact.Values[i]
-			}
-		}
-	}
+	sub.Mask |= newMask
 	return true
 }
 
